@@ -1,0 +1,12 @@
+% 付録B — モジュール地図
+\chapter{モジュール地図}\label{app:modules}
+
+各 Stage のモジュール対応を機械可読な一覧として \texttt{book/code-map.toml} に収録しています。本付録では実行環境と役割の関係を示します。
+
+\begin{description}
+  \item[Stage 01: \texttt{src/stages/01\_mpp/}] MPP による現象論モデルです。\texttt{surface\_patch.py} と \texttt{clifford\_ft\_full.py} がパッチ・論理 Clifford を扱い、\texttt{geom\_lattice\_surgery.py}、\texttt{lattice\_surgery.py}、\texttt{ls\_handoff\_shells.py} が論理格子手術を構成します。\texttt{t\_gate.py} と \texttt{qpd\_backend.py} は蒸留模型と QPD を担います。
+  \item[Stage 02: \texttt{src/stages/02\_circuit\_level/}] ancilla によるシンドローム抽出と回路レベル誤りを扱います。\texttt{circuit\_level\_merge.py} が merge 回路、\texttt{ls\_cnot\_ft.py} が論理 CNOT と T teleportation shell、\texttt{ls\_handoff\_shells.py} が検出器付き handoff 回路を構築します。
+  \item[Stage 03: \texttt{src/ftqc/}] Stage 01・02 の要素を距離 $d=3$ のランタイムに統合します。ルートの \texttt{tests/} と \texttt{examples/} がこの環境に対応します。
+\end{description}
+
+Stage 01 と Stage 02 の各プロジェクトは独立した \texttt{src/ftqc}、\texttt{tests/}、\texttt{examples/}、\texttt{pyproject.toml} を持ちます。Stage 03 の正本はルートです。古いディレクトリ名や開発時の設計資料を参照せず、本書に同梱した対応表とソースを使ってください。

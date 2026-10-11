@@ -1,0 +1,172 @@
+% Stage: —（理論）／ 説明用コード: —
+\chapter{量子コンピュータ概要}\label{ch:overview}
+
+\begin{chaptergoal}
+  \begin{itemize}
+  \item 量子ビット・重ね合わせ・量子もつれ・測定という基本概念を整理します。
+  \item 量子ゲートと量子回路の記法を確認し、後章で使う $H,S,T,\mathrm{CNOT}$ を押さえる。
+  \item NISQ と FTQC のギャップを理解し、本書が作るハイブリッドシミュレータの位置づけを掴む。
+  \end{itemize}
+\end{chaptergoal}
+
+本書は、Stim（高速スタビライザ／QEC サンプリング）と状態ベクトル（非クリフォード）、ソフトウェア上のフレーム追跡を組み合わせた\textbf{ハイブリッド型 FTQC シミュレータ}を、段階的にゼロから組み上げる実装書です。
+その出発点として、本章では実装に必要な最小限の量子計算の基礎を整理します。
+すでに量子計算の入門を終えている読者は、本章をざっと眺めて第2章へ進んでかまいません。
+
+\begin{notebox}
+  本章は理論の章です。実行コードは出さず、記法と語彙を揃えることに集中します。
+  実装は第~II~部以降（まず Stim、続いて \codepath{src/stages/01_mpp/src/ftqc/} など）で扱います。
+\end{notebox}
+
+\section{量子ビット・重ね合わせ・量子もつれ・測定}\label{sec:qubit}
+
+\subsection{古典ビットと量子ビット}
+
+古典ビットは $0$ か $1$ のいずれか一方の値だけを持ちます。
+これに対し\textbf{量子ビット}は、計算基底 $\ket{0},\ket{1}$ の\textbf{重ね合わせ}を許す二準位系です。
+一般の純状態は
+\begin{equation}
+  \ket{\psi}
+  = \alpha\ket{0} + \beta\ket{1},
+  \qquad
+  |\alpha|^2 + |\beta|^2 = 1
+\end{equation}
+と書けます。複素係数 $\alpha,\beta$ を\textbf{確率振幅}と呼びます。
+全体にかかるグローバル位相 $\ee^{\ii\phi}$ は観測に影響しないため、状態は実質ブロッホ球上の一点として描けます（幾何の詳細は本書では深入りしません）。
+
+\subsection{測定と射影}
+
+計算基底での\textbf{測定}は、確率 $|\alpha|^2$ で結果 $0$、$|\beta|^2$ で結果 $1$ を返し、測定後の状態は対応する基底 $\ket{0}$ または $\ket{1}$ に\textbf{射影}されます。
+つまり測定は重ね合わせを\textbf{壊します}。
+古典情報のように「見ても壊さないコピー」が取れないことが、誤り訂正を古典とは根本的に変えます（第3章）。
+
+\subsection{多量子ビットと量子もつれ}
+
+$n$ 量子ビットの計算基底は $\ket{x}$（$x\in\{0,1\}^n$）で、$2^n$ 次元の複素ヒルベルト空間に住みます。
+特に重要なのが、積状態 $\ket{\psi}\otimes\ket{\phi}$ に分解できない\textbf{量子もつれ}です。
+代表例がベル状態
+\begin{equation}
+  \ket{\Phi^+}
+  = \frac{1}{\sqrt{2}}\bigl(\ket{00}+\ket{11}\bigr)
+\end{equation}
+です。一方を測ると他方の結果が即座に確定しますが、情報は光速を超えて送れません。
+格子手術や論理 CNOT の理解でも、「相関したパリティ」という形でもつれが現れます。
+
+\begin{notebox}
+  用語について。本書では entanglement を\textbf{量子もつれ}と呼びます。
+  また量子ビット・重ね合わせなどの英語を括弧で繰り返すことはしません。
+\end{notebox}
+
+\section{量子ゲートと量子回路}\label{sec:gates}
+
+量子計算の基本は、初期状態（多くは $\ket{0}^{\otimes n}$）に\textbf{ユニタリゲート}を順に施し、最後に測定する、という流れです。
+ユニタリ $U$ は $U^\dagger U = I$ を満たし、確率の総和を保ちます。
+回路図では、各横線が 1 量子ビットの時間発展、箱がゲート、メーターが測定を表します。
+
+\subsection{1 量子ビットゲート}
+
+本書で繰り返し使う 1 量子ビットゲートを行列で固定します（計算基底 $\ket{0},\ket{1}$）。
+
+\begin{align}
+  X &= \begin{pmatrix} 0 & 1 \\ 1 & 0 \end{pmatrix},
+  &
+  Y &= \begin{pmatrix} 0 & -\ii \\ \ii & 0 \end{pmatrix},
+  &
+  Z &= \begin{pmatrix} 1 & 0 \\ 0 & -1 \end{pmatrix},
+  \label{eq:pauli}
+\end{align}
+\begin{align}
+  H &= \frac{1}{\sqrt{2}}\begin{pmatrix} 1 & 1 \\ 1 & -1 \end{pmatrix},
+  &
+  S &= \begin{pmatrix} 1 & 0 \\ 0 & \ii \end{pmatrix},
+  &
+  T &= \begin{pmatrix} 1 & 0 \\ 0 & \ee^{\ii\pi/4} \end{pmatrix}.
+  \label{eq:hst}
+\end{align}
+
+\begin{itemize}
+  \item パウリ $X,Y,Z$：$X$ はビット反転、$Z$ は位相反転、$Y=\ii XZ$ です。
+  \item アダマール $H$：$\ket{0}\mapsto\ket{+}=\frac{1}{\sqrt{2}}(\ket{0}+\ket{1})$、$\ket{1}\mapsto\ket{-}$。基底の入れ替えに使います。
+  \item 位相ゲート $S$ とその「平方根」$T$：$S^2=Z$、$T^2=S$ です。
+\end{itemize}
+
+\subsection{CNOT とクリフォード／非クリフォード}
+
+2 量子ビットの代表が \textbf{CNOT}（制御 $X$）です。制御が $\ket{1}$ のとき標的に $X$ を掛けます。
+\begin{equation}
+  \mathrm{CNOT}
+  =
+  \begin{pmatrix}
+    1 & 0 & 0 & 0 \\
+    0 & 1 & 0 & 0 \\
+    0 & 0 & 0 & 1 \\
+    0 & 0 & 1 & 0
+  \end{pmatrix}
+  \qquad
+  (\text{基底順 }\ket{00},\ket{01},\ket{10},\ket{11}).
+\end{equation}
+
+図~\ref{fig:bell_circuit} は、$\ket{00}$ からベル状態 $\ket{\Phi^+}$ を作る標準回路です。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{quantikz}
+    \lstick{$\ket{0}$} & \gate{H} & \ctrl{1} & \qw \\
+    \lstick{$\ket{0}$} & \qw      & \targ{}  & \qw
+  \end{quantikz}
+  \caption{ベル状態 $\ket{\Phi^+}$ を生成する回路}
+  \label{fig:bell_circuit}
+\end{figure}
+
+ゲート集合 $\{H,S,\mathrm{CNOT}\}$（およびパウリ）は\textbf{クリフォード}群を生成します。
+クリフォードだけでも強力ですが、万能量子計算にはなりません。
+万能性には非クリフォードな $T$ が必要です。
+この区別は本書全体を貫きます。クリフォードはスタビライザ形式と相性がよく Stim で効率よく扱え、非クリフォード（特に $T$）は魔法状態や状態ベクトル／準確率分解の経路を要します（第5章、第12章以降）。
+
+\begin{notebox}
+  クリフォード $C$ はパウリ群を共役でパウリ群に写します（$C P C^\dagger$ が再びパウリ）。
+  そのため誤りを「パウリフレーム」として古典的に追跡しやすい、という性質が後章のアーキテクチャの根拠になります。
+\end{notebox}
+
+\section{NISQ と FTQC のギャップ}\label{sec:nisq_ftqc}
+
+現実の物理量子ビットはノイズを免れません。
+ゲート誤り、測定誤り、緩和（$T_1$）や位相緩和（$T_2$）などが積み重なり、深い回路ほど信頼性が落ちます。
+誤り訂正を前提とせず、ノイズの多い中規模デバイスをそのまま使う段階は \textbf{NISQ} と呼ばれ、回路の幅と深さがノイズに強く制限されます。
+
+一方 \textbf{FTQC}（誤り耐性量子計算）では、多数の物理量子ビットを束ねて 1 つの\textbf{論理量子ビット}を作り、シンドローム測定と復号を繰り返しながら計算を進めます\cite{suzuki2026ftqc}。
+物理エラー率がしきい値以下であれば、符号距離 $d$ を上げることで論理エラー率を任意に小さくできる、というのが誤り耐性の約束です（符号と距離は第4章、しきい値の直感は第8章）。
+代償は、論理 1 量子ビットあたりの物理資源と、デコード遅延・魔法状態供給といったシステム上のボトルネックです（第2章）。
+
+本書が作るのは、実機そのものではなく、\textbf{古典コンピュータ上の FTQC シミュレータ}です。
+主エンジンは次のハイブリッドです。
+
+\begin{itemize}
+  \item \textbf{Stim}：スタビライザ回路と QEC サンプリング（クリフォード層・シンドローム）。
+  \item \textbf{状態ベクトル}（NumPy または qulacs 等）：$T$ など非クリフォードの論理層。
+  \item \textbf{ソフトウェアのフレーム追跡}：論理残差やパウリフレームを古典側で合成。
+\end{itemize}
+
+これにより、無限のコヒーレンス時間や任意の物理エラー率、蒸留をバイパスした「理想に近い $T$」といった、実機では難しい評価が可能になります。
+目的は「NISQ の制約を外したうえで、誤り耐性の論理が正しく・再現可能に動くか」を、合否基準（第8章）付きで確かめることです。
+
+実装は一度に全部を目指さず、現象論 MPP（Stage~A）、回路レベル格子手術（Stage~B）、$d=3$ 統合（Stage~C）、残差モデルの完全化と発展トピック（Stage~D 以降）と段階的に進めます。
+次章では、FTQC の目的・制約・ボトルネックをアーキテクチャの視点から整理します。
+
+\section{まとめ}\label{sec:overview_summary}
+
+\begin{itemize}
+  \item 量子ビットは重ね合わせを持ち、測定は状態を射影して壊します。多量子ビットには量子もつれがあり得ます。
+  \item 計算はユニタリゲートの列と測定で進みます。後章の主役は $H,S,T,\mathrm{CNOT}$ です。
+  \item $\{H,S,\mathrm{CNOT}\}$ はクリフォード、$T$ は非クリフォードで、万能性に必要です。
+  \item NISQ はノイズに縛られた段階、FTQC は論理量子ビットと誤り耐性でその壁を超える段階です。
+  \item 本書は Stim + 状態ベクトル + フレーム追跡のハイブリッドシミュレータを段階的に実装します。
+\end{itemize}
+
+\begin{exercise}
+  \begin{enumerate}
+    \item $H\ket{0}=\ket{+}$ を行列計算で確かめ、$\ket{+}$ を計算基底で測ると $0$ と $1$ が等確率になることを示しなさい。
+    \item 図~\ref{fig:bell_circuit} の回路を $\ket{00}$ に適用した結果が $\ket{\Phi^+}$ になることを、状態ベクトルの計算で確かめなさい。
+    \item $S^2=Z$ および $T^2=S$ を行列の積で確かめなさい。
+  \end{enumerate}
+\end{exercise}

@@ -1,0 +1,311 @@
+% Stage: 02 ／ 説明用コード: src/stages/02\_circuit\_level/src/ftqc
+\chapter{ケーススタディ：距離2バグを距離3に直す}\label{ch:distance_debug}
+
+\begin{chaptergoal}
+  \begin{itemize}
+  \item gauge 検出器がゼロ（決定論的）であることと、符号距離が正しいことは別問題だと理解します。
+  \item \texttt{shortest\_graphlike\_error} が返す誤りの物理的な位置を読み、症状から真因へ絞り込む診断の手順を身につけます。
+  \item hook 誤り・論理演算子の代表元・幾何配置という、もっともらしいが誤った仮説を棄却する論理を追います。
+  \item merge から split へ戻る際に seam のスタビライザが分裂して生じる保存量と、それを閉じる後ろ向き閉包検出器の役割を理解します。
+  \item 「フラグで隠さない」という本書の方法論上の教訓を、\texttt{allow\_gauge\_detectors} の誤用例を通じて確認します。
+  \end{itemize}
+\end{chaptergoal}
+
+第16章では \codepath{src/stages/02_circuit_level/src/ftqc/ls_cnot_ft.py} の \texttt{LSCnotFT} を用いて、格子手術による回路レベル CNOT を完成させました。
+gauge 検出器はゼロ、計算基底の真理値表も一致し、\texttt{shortest\_graphlike\_error} は $3$ でした。
+本章では、その「完成品」に至る直前に実際に踏んだ回り道を、ケーススタディとして辿り直します。
+症状は単純です──gauge 検出器はゼロなのに、符号距離だけがどうしても $2$ に張り付く。
+gauge がゼロなら回路は決定論的に正しく動いているはずなのに、なぜ距離だけが足りないのか。
+この一見矛盾した症状を診断し、いくつかの誤った仮説を検討・棄却し、真因（merge から split へ戻るときに seam のスタビライザが分裂して生まれる保存量の欠落）に辿り着き、後ろ向き閉包検出器という一般的な解決に至る過程を追います。
+本書の方法論、すなわち「合否基準を機械的に確認し、症状から仮説を立てて棄却し、フラグで症状を隠さない」という姿勢が最も試される山場です。
+
+\begin{notebox}
+  Stage: \textbf{02}。
+  説明用コードは主に \codepath{src/stages/02_circuit_level/src/ftqc/ls_cnot_ft.py} を用います。
+  比較対象として、退役済みの \codepath{src/stages/02_circuit_level/src/ftqc/circuit_level_ls.py} にも触れます。
+\end{notebox}
+
+\section{症状}\label{sec:symptom}
+
+第15章・第16章で確認したとおり、回路レベル格子手術の合否基準は次の2点でした。
+
+\begin{itemize}
+  \item ノイズなしで gauge 検出器（ノイズがないのに非決定論的に発火する検出器）がゼロであること。
+  \item graphlike な検出器誤りモデルに対して \texttt{shortest\_graphlike\_error} が符号距離 $d$（ここでは $3$）と一致すること。
+\end{itemize}
+
+\texttt{LSCnotFT} の CNOT は、制御パッチ $C$（上）・アンシラパッチ $A$（$C$ の下、$M_{ZZ}$ で融合）・標的パッチ $T$（$A$ の右、$M_{XX}$ で融合）という L 字レイアウトを取ります（\codepath{src/stages/02_circuit_level/src/ftqc/ls_cnot_ft.py} の \texttt{LSCnotFT.\_\_init\_\_}）。
+検出器則を \texttt{\_compose\_in}（GF2 上のスタビライザ生成系への分解）できちんと書き直した段階で、まず gauge 検出器はゼロになりました。
+つまりノイズなしでサンプリングしても、どの検出器も常に $0$ しか出さない──回路は決定論的に正しく動いています。
+
+ところが \texttt{shortest\_graphlike\_error} で符号距離を測ると、\texttt{merge\_rounds} や \texttt{split\_rounds}、ノイズ強度 $p$ をどう変えても $2$ から動きません。
+パッチの物理サイズは距離 $3$ の表面符号 3 枚を組んでいるので、期待値は $3$ です。
+症状を整理すると次のようになります。
+
+\begin{itemize}
+  \item gauge 検出器数 $=0$（決定論性は満たしている）。
+  \item \texttt{shortest\_graphlike\_error} の長さが常に $2$（$d$ を変えても症状は変わらない）。
+\end{itemize}
+
+「gauge がゼロなら正しく実装できているはず」という直感は半分しか正しくありません。
+gauge ゼロは「検出器が正しい確定的な線形関数として書けている」ことしか保証しません。
+検出器の\textbf{個数や張り方}が足りず、本来検出すべき誤りの組み合わせを見逃していても、gauge はゼロのままです。
+この章の診断は、まさにこの盲点を追いかける話になります。
+
+\section{診断：shortest\_graphlike\_error の物理位置}\label{sec:diagnosis}
+
+診断の出発点は、graphlike 上界を数えるだけでなく、\textbf{その上界を実現する具体的な誤りがどこにあるか}を見ることです。
+\texttt{stim.Circuit.shortest\_graphlike\_error()} は、単に整数を返すのではなく、観測量を反転させる最小重みの誤り経路そのもの（\texttt{stim.ExplainedError} の並び）を返します。
+これを読むことで、「距離が足りない」という抽象的な症状を、「どの物理量子ビットのどのタイミングの誤りが、どの検出器にもかからずに観測量だけを反転させるか」という具体的な場所に変換できます。
+
+\begin{lstlisting}[language=Python, caption={距離を実現する誤り経路を直接見る（src/stages/02\_circuit\_level/src/ftqc/ls\_cnot\_ft.py の demo() 相当）}]
+c, _, _ = g.build(p=0.005, noise=True)
+err = c.shortest_graphlike_error(ignore_ungraphlike_errors=True)
+print(f"shortest_graphlike_error length = {len(err)}")
+for e in err:
+    print(e)  # 各要素が対応する回路命令・座標を持つ
+\end{lstlisting}
+
+この出力を \texttt{LSCnotFT} の座標系（\texttt{coords}, \texttt{patch\_of}, \texttt{anc\_of}）と突き合わせると、重み $2$ の誤り経路が一貫して\textbf{アンシラパッチ $A$ と標的パッチ $T$ の境界、しかも $T$ の左下角}に集中して見つかります。
+この角は、$A$–$C$ 間の $ZZ$ seam（$A$ の上辺）と $A$–$T$ 間の $XX$ seam（$A$ の右辺）が接する、$A$ の右上の角のさらに先、$T$ 側の左下角に対応します。
+つまり症状は回路全体に散らばっているわけではなく、\textbf{2つの seam が接する一点}に局在しています。
+ここまでで、原因を「回路のどこかにある一般的なバグ」から「$ZZ$ seam と $XX$ seam が接する角の検出器則」という具体的な対象に絞り込めます。
+
+\section{誤った仮説の棄却}\label{sec:rejected}
+
+角に症状が局在していることが分かっても、原因の候補はまだ複数あります。
+実際に検討し、棄却した3つの仮説を順に見ます。
+
+\subsection{仮説1：hook 誤り}
+
+回路レベルのシンドローム抽出では、アンシラと4つのデータ量子ビットを結ぶ CX の順序を誤ると、2量子ビットゲート中の1つの誤りがアンシラを経由して複数のデータ量子ビットに伝播する\textbf{hook 誤り}が生じ、実効距離を下げることが知られています（第14章）。
+\texttt{LSCnotFT.\_round} は \texttt{\_XSTEP}／\texttt{\_ZSTEP} という固定の CX 順序（NE, NW, SE, SW 等）を使っており、これは \texttt{surface\_patch.py} で Stim から抽出した hook 誤りを避ける順序を、\texttt{circuit\_level\_merge.py}（第15章）でそのまま流用したものです。
+
+この仮説は次の理由で棄却できます。
+第15章の \texttt{CircuitLevelMerge} は、まったく同じ CX 順序テーブルを使いながら、単一の $ZZ$ merge に対して \texttt{shortest\_graphlike\_error}$=3$ を達成しています。
+もし CX 順序そのものに hook 誤りが残っているなら、$ZZ$ merge 単体の時点で距離が $3$ に届かないはずです。
+単体では距離が出るのに、$ZZ$ と $XX$ の2つの merge を接続した \texttt{LSCnotFT} でだけ距離が落ちる、という違いは、CX 順序という「部品内部」の問題では説明できません。
+
+\subsection{仮説2：論理演算子の代表元の選び方}
+
+次に疑ったのは、\texttt{OBSERVABLE\_INCLUDE} に渡す論理演算子の代表元（\texttt{self.ZL\_C}, \texttt{self.ZL\_T} など、下端の行・左端の列を取る幾何的な規約）の選び方です。
+同じ論理演算子でもスタビライザ倍の異なる代表元を選べば、見かけ上の重みが変わるため、「代表元の取り方が悪くて重み2の経路に見えているだけではないか」という仮説です。
+
+これも棄却されます。
+\texttt{shortest\_graphlike\_error} は検出器誤りモデル（DEM）上で、指定した観測量を反転させる最小重みの誤り集合を探索します。
+検出器はスタビライザ群そのものを表現しているため、代表元をスタビライザ倍だけ変えても、その差分は既存の検出器のいずれかで検出されてしまい、DEM 上の最短距離は変わりません。
+実際に \texttt{ZL\_T} を $A$ との joint 測定記録で書き換えた \texttt{obs1\_mode}（\texttt{full} / \texttt{zlt\_manc} / \texttt{zlt\_mzz}、\texttt{build} の引数）を切り替えて距離を再計算しても、症状は変化しませんでした。
+代表元の選び方は真因ではありません。
+
+\subsection{仮説3：L 字レイアウトの幾何そのもの}
+
+3つ目の仮説は、$A$ の右上角で $ZZ$ seam と $XX$ seam が接する L 字レイアウト自体が原因であり、パッチの配置を変えて角の共有を避けるべきだ、というものです。
+実際、後の第18章で扱う \texttt{LSTeleportFT} は、データパッチ $D$ を中央に置き、2つの $ZZ$ merge をデータの上下（対辺）に配置して角の共有を避ける設計を取っています（\codepath{src/stages/02_circuit_level/src/ftqc/ls_cnot_ft.py} の \texttt{LSTeleportFT} クラスのコメント）。
+
+しかし \texttt{LSCnotFT} の修正では、この仮説は採用しませんでした。
+理由は、角を共有しない配置に変えても、seam が複数個所で接する、より複雑な格子手術（第 V 部以降で扱う $d$ 一般化や複数論理量子ビットの同時演算）では、いずれ同種の角が再発するからです。
+配置を変えることは症状を避ける対処にしかならず、検出器則そのものが「merge から split に戻るときに seam のスタビライザがどう分裂するか」を正しく扱っていないという設計上の欠落は残ります。
+次節で見る真因は、レイアウトに依存しない一般的な性質です。
+
+\section{真因：merge→split で分裂する seam の保存量}\label{sec:rootcause}
+
+角に局在する重み2の誤り経路を実際に追跡すると、次の構造が見えてきます。
+
+\texttt{LSCnotFT} のスケジュールは split（各パッチ独立）→ $ZZ$ merge（$C,A$ 融合）→ split → $XX$ merge（$A,T$ 融合）→ split という順で進みます（\texttt{build} の \texttt{schedule}）。
+$ZZ$ merge のラウンドでは、$C$ と $A$ を合わせた領域に対してスタビライザ（\texttt{zz\_info}）が定義されます。
+その中には、$A$ の右辺（$XX$ seam 側）に接する、あわせて $A$ 単独のスタビライザとは形が異なる seam スタビライザが含まれます。
+
+このラウンドが終わって次の split ラウンドに戻るとき、検出器則は\textbf{前向き}にしか比較していませんでした。
+すなわち「現在のラウンドの各スタビライザを、直前のラウンドのスタビライザの積として書けるか」だけを調べ、書けたら検出器を張っていました（\texttt{build} 内の \texttt{comp = self.\_decompose(...)} のループ）。
+ところが、merge ラウンドの seam スタビライザは、split に戻った瞬間に\textbf{2つの別々のスタビライザの積}に分裂します──たとえば $A$–$C$ の $ZZ$ seam の一部は、split 後は $A$ 単独の境界スタビライザと（角を挟んで）$XX$ seam に隣接するもう一方の境界スタビライザの積として初めて表現できます。
+前向きの比較だけでは、この「1つのスタビライザが2つに分裂する」変化を検出器として記録できません。
+分裂後の2つのスタビライザの\textbf{積}（＝分裂前の元のスタビライザと等しい保存量）は物理的に保存されているにもかかわらず、それを確認する検出器が回路に存在しない、という欠落が真因です。
+
+この欠落があっても、個々の検出器自体は依然として決定論的に発火するため、gauge 検出器はゼロのままです。
+これが「gauge はゼロなのに距離が2に張り付く」という、症状と真因のギャップの正体です。この保存量の欠落による距離短絡と、後ろ向き閉包検出器による修復の時空図を図\ref{fig:ch17_distance_shortcut}に示します。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[scale=0.92, every node/.style={transform shape}]
+    % 時間軸
+    \draw[-{Stealth[length=6pt]}, thick, gray!80] (-0.7, 2.5) -- (-0.7, -1.2)
+      node[midway, left=1pt, font=\scriptsize, text=black] {時間 $t$};
+
+    % ==================== (a) Before: 修正前 ====================
+    \begin{scope}[shift={(0,0)}]
+      \node[font=\bfseries] at (1.8, 3.0) {(a) 修正前：閉包検出器なし（距離 2）};
+
+      % 上層: merge フェーズ
+      \draw[fill=blue!5, draw=blue!40, thick] (0, 1.8) -- (3.2, 1.8) -- (4.0, 2.4) -- (0.8, 2.4) -- cycle;
+      \node[font=\tiny\bfseries, text=blue!70!black] at (0.9, 2.2) {merge 層 ($t_1$)};
+      % seam スタビライザ
+      \node[draw, fill=blue!20, font=\tiny, rounded corners=2pt, inner sep=2pt] (S_merge) at (2.4, 2.05) {$S_{\mathrm{seam}}$};
+
+      % 下層: split フェーズ
+      \draw[fill=gray!10, draw=gray!50, thick] (0, -0.4) -- (3.2, -0.4) -- (4.0, 0.2) -- (0.8, 0.2) -- cycle;
+      \node[font=\tiny\bfseries, text=gray!70!black] at (0.9, 0.0) {split 層 ($t_2$)};
+      % 分裂スタビライザ
+      \node[draw, fill=gray!25, font=\tiny, rounded corners=2pt, inner sep=1.5pt] (S1) at (1.8, -0.15) {$S_1$};
+      \node[draw, fill=gray!25, font=\tiny, rounded corners=2pt, inner sep=1.5pt] (S2) at (3.0, -0.15) {$S_2$};
+
+      % 検出器の欠落（隙間）
+      \draw[dashed, line width=1pt, gray!60] (S_merge) -- (2.4, 0.85);
+      \node[draw=orange!80!black, fill=yellow!15, rounded corners=2pt, font=\tiny\bfseries, text=orange!90!black, inner sep=2pt]
+        at (2.4, 0.85) {閉包検出器なし};
+
+      % 重み 2 の誤り鎖 (赤太線)
+      \draw[line width=2pt, red] (1.3, -0.15) -- (S1.west);
+      \draw[line width=2pt, red] (S1.east) -- (S2.west)
+        node[midway, below=2pt, font=\tiny\bfseries, text=red] {誤り鎖 ($w=2$)};
+      \draw[line width=2pt, red, -{Stealth[length=5pt]}] (S2.east) -- (3.7, -0.15)
+        node[right, font=\tiny\bfseries, text=red] {論理反転};
+
+      \node[dataqubit, fill=red!20, draw=red, minimum size=6pt] at (1.3, -0.15) {};
+      \node[dataqubit, fill=red!20, draw=red, minimum size=6pt] at (2.4, -0.15) {};
+
+      \node[below=8pt, font=\scriptsize, align=center] at (2.0, -0.4)
+        {seam 分裂の保存量が未検証\\たった 2 個の誤りで反転};
+    \end{scope}
+
+    % ==================== (b) After: 修正後 ====================
+    \begin{scope}[shift={(6.2,0)}]
+      \node[font=\bfseries] at (1.8, 3.0) {(b) 修正後：後ろ向き閉包を追加（距離 3）};
+
+      % 上層: merge フェーズ
+      \draw[fill=blue!5, draw=blue!40, thick] (0, 1.8) -- (3.2, 1.8) -- (4.0, 2.4) -- (0.8, 2.4) -- cycle;
+      \node[font=\tiny\bfseries, text=blue!70!black] at (0.9, 2.2) {merge 層 ($t_1$)};
+      \node[draw, fill=blue!20, font=\tiny, rounded corners=2pt, inner sep=2pt] (S_merge_b) at (2.4, 2.05) {$S_{\mathrm{seam}}$};
+
+      % 下層: split フェーズ
+      \draw[fill=gray!10, draw=gray!50, thick] (0, -0.4) -- (3.2, -0.4) -- (4.0, 0.2) -- (0.8, 0.2) -- cycle;
+      \node[font=\tiny\bfseries, text=gray!70!black] at (0.9, 0.0) {split 層 ($t_2$)};
+      \node[draw, fill=gray!25, font=\tiny, rounded corners=2pt, inner sep=1.5pt] (S1_b) at (1.8, -0.15) {$S_1$};
+      \node[draw, fill=gray!25, font=\tiny, rounded corners=2pt, inner sep=1.5pt] (S2_b) at (3.0, -0.15) {$S_2$};
+
+      % 後ろ向き閉包検出器
+      \node[draw=green!60!black, fill=green!20, line width=1.2pt, rounded corners=2pt, font=\tiny\bfseries, text=green!50!black, inner sep=2pt] (DET)
+        at (2.4, 0.85) {閉包検出器 $D$};
+      \draw[line width=1.2pt, green!60!black] (S_merge_b) -- (DET);
+      \draw[line width=1.2pt, green!60!black] (DET) -- (S1_b);
+      \draw[line width=1.2pt, green!60!black] (DET) -- (S2_b);
+
+      % 修正後は重み 3 の誤り鎖が必要
+      \draw[line width=2pt, red] (0.8, -0.15) -- (S1_b.west);
+      \draw[line width=2pt, red] (S1_b.east) -- (S2_b.west);
+      \draw[line width=2pt, red, -{Stealth[length=5pt]}] (S2_b.east) -- (3.7, -0.15)
+        node[right, font=\tiny\bfseries, text=red] {論理反転};
+
+      \node[dataqubit, fill=red!20, draw=red, minimum size=6pt] at (0.8, -0.15) {};
+      \node[dataqubit, fill=red!20, draw=red, minimum size=6pt] at (2.4, -0.15) {};
+      \node[dataqubit, fill=red!20, draw=red, minimum size=6pt] at (3.5, -0.15) {};
+
+      \node[above=2pt of DET, font=\tiny, text=green!50!black] {$S_{\mathrm{seam}} \oplus S_1 \oplus S_2$};
+
+      \node[below=8pt, font=\scriptsize, align=center] at (2.0, -0.4)
+        {閉包検出器が重み 2 を検知\\反転には 3 個の誤りが必要};
+    \end{scope}
+  \end{tikzpicture}
+  \caption{merge から split への遷移における距離短絡と後ろ向き閉包検出器の時空図。(a) 修正前は前向き比較のみを行っていたため、merge 時の seam スタビライザ $S_{\mathrm{seam}}$ が split 時に $S_1$ と $S_2$ へ分裂する保存量（$S_{\mathrm{seam}} = S_1 S_2$）を検証する検出器が存在しませんでした。その結果、seam の分裂点を跨ぐ重み 2 の短い誤り鎖（赤太線）がどの検出器にも引っかからずに観測量を反転させ、符号距離が 2 に低下していました。(b) 修正後は、分裂したスタビライザの積を照合する「後ろ向き閉包検出器」を追加することで重み 2 の短絡を捕捉し、本来の符号距離 3 を回復しています。}
+  \label{fig:ch17_distance_shortcut}
+\end{figure}
+
+
+\section{解決：後ろ向き閉包検出器}\label{sec:fix}
+
+解決は、前向きの比較に加えて\textbf{後ろ向き}の比較を追加することです。
+すなわち、直前のラウンドの各スタビライザについて、それが現在のラウンドのスタビライザの積として（前向きでは1対1に対応せず）複数個の積として分解できる場合、その積を保存量として確認する検出器を新たに張ります。
+これを本書では\textbf{後ろ向き閉包検出器}と呼びます。
+
+\begin{lstlisting}[language=Python, caption={前向き比較と後ろ向き閉包検出器（src/stages/02\_circuit\_level/src/ftqc/ls\_cnot\_ft.py, LSCnotFT.build 内）}]
+# 前向き: 現ラウンドのスタビライザを前 config で分解
+covered_prev = set()
+for si, (cx, cy, t, s) in enumerate(info):
+    comp = self._decompose(self._vec(t, s), pinfo)
+    if comp is None:
+        continue
+    detectors.append([rec[si]] + [prec[j] for j in comp])
+    if len(comp) == 1:
+        covered_prev.add(comp[0])
+# 後ろ向き閉包: merge->split で分裂する seam スタビライザ。前 config の
+# スタビライザ(seam)が現 config で複数スタビライザの積に分解する場合、
+# その積は保存量なので閉包検出器を張る (例: seam-Z = A右境界Z (+) T左境界Z)。
+# これが無いと分裂端の縮退で論理距離が落ちる。
+for pj, (pcx, pcy, pt, ps) in enumerate(pinfo):
+    if pj in covered_prev:
+        continue
+    back = self._decompose(self._vec(pt, ps), info)
+    if back is None or len(back) <= 1:
+        continue
+    detectors.append([prec[pj]] + [rec[k] for k in back])
+\end{lstlisting}
+
+ポイントは \texttt{covered\_prev} です。
+前向きの比較で「1対1」に対応づけられた前ラウンドのスタビライザ（\texttt{len(comp) == 1}）は除外し、対応づけられなかった（＝分裂した）スタビライザだけを後ろ向きに調べます。
+分裂先が2個以上のスタビライザの積として書ける場合（\texttt{len(back) > 1}）、その積は前ラウンドのスタビライザと等しい保存量なので、両者をまとめて1つの検出器として張ります。
+これにより、$T$ の左下角（$XX$ seam に隣接する角）の縮退が解消されます。
+
+修正後に \texttt{demo()} を実行すると、次のように graphlike 上界が回復します。
+
+\begin{lstlisting}[language=Python, caption={修正後の再検証（src/stages/02\_circuit\_level/src/ftqc/ls\_cnot\_ft.py, demo() の一部）}]
+cn, _, _ = g.build(p=0.005, noise=True)
+bound = len(cn.shortest_graphlike_error(ignore_ungraphlike_errors=True))
+print(f"shortest graphlike logical error (upper bound) = {bound}")
+# -> upper bound = 3
+\end{lstlisting}
+
+公開版の \texttt{tests/test\_ls\_invariants.py} では、決定論性・graphlike 上界・計算基底の真理値表を別々に検査します。距離の上界は、条件を満たさない限り厳密距離の証明ではありません。
+gauge 検出器がゼロのまま、真理値表も第16章の確認どおり保たれ、観測された上界が $2$ から $3$ に上がります──後ろ向き閉包検出器は既存の検出器を置き換えるのではなく、\textbf{見逃していた保存量の確認を1つ追加する}だけの修正だからです。
+
+\section{方法論の教訓}\label{sec:lesson}
+
+このケーススタディから得られる教訓は2つです。
+
+\paragraph{部品ごとの距離検証}
+第15章の $ZZ$ merge 単体、第16章の $ZZ+XX$ を接続した CNOT というように、部品を組み合わせるたびに \texttt{shortest\_graphlike\_error} を測り直すことで、「単体では距離3だが結合すると距離2に落ちる」という、部品の\textbf{境界}にしか現れない不具合を検出できました。
+結合してから初めてまとめて確認していたら、原因を hook 誤りや幾何配置といった部品内部の要因に誤って帰着させていたかもしれません。
+
+\paragraph{フラグで隠さない}
+退役済みの \codepath{src/stages/02_circuit_level/src/ftqc/circuit_level_ls.py} は、この種の検出器の取りこぼしを \texttt{detector\_error\_model(..., allow\_gauge\_detectors=True)} で\textbf{隠して}動かしていました。
+
+\begin{lstlisting}[language=Python, caption={circuit\_level\_ls.py の退役理由（docstring より、要約引用）}]
+"""circuit\_level_ls.py -- DEPRECATED / 退役
+検出器則が split<->merge 遷移の _compose_in (GF2 span) 合成を取りこぼすため、
+ノイズなしでも非決定論的検出器が残り、決定論性が崩れていました。当時はそれを
+detector_error_model(..., allow_gauge_detectors=True) で隠して動かしていました
+が、これは距離計算を壊し論理エラー率を不正に押し上げる「隠蔽」であり、修正では
+ありません。
+"""
+\end{lstlisting}
+
+\texttt{allow\_gauge\_detectors=True} は、非決定論的な検出器を「情報なし」として単に捨てる指定です。
+検出器の取りこぼしがある場合、これを立てるとエラーは出なくなりますが、実際には距離を過大評価したり（見逃した検出器で守られるはずの誤りをすり抜けさせる）、論理エラー率を不正に押し上げたりします。
+本章の \texttt{LSCnotFT} の後ろ向き閉包検出器は、\texttt{allow\_gauge\_detectors} を一切使わずに gauge をゼロのまま保ち、その上で距離の不足という別の症状を検出器則そのものの修正で解決しました。
+第19章で扱う \texttt{ls\_handoff\_shells.py} の \texttt{decode\_shell} が \texttt{allow\_gauge\_detectors} を使わないという設計判断（非決定論的検出器が出たら例外を素通しさせる正しさのガード）は、この教訓を API 全体に定着させたものです。
+
+\section{まとめ}\label{ch17:summary}
+
+\begin{itemize}
+  \item gauge 検出器がゼロであることは、検出器則が\textbf{確定的}であることしか保証せず、検出器則が誤りを見逃さず\textbf{十分}であることは別に確認する必要があります。
+  \item \texttt{shortest\_graphlike\_error} が返す誤り経路を座標系に照らして読むことで、抽象的な「距離不足」を具体的な物理的位置（本章では $XX$ seam に隣接する角）へ絞り込めます。
+  \item hook 誤り・論理演算子の代表元・幾何配置という3つの仮説は、部品単体の距離検証や DEM 上の距離の性質から、いずれも棄却できました。
+  \item 真因は、merge から split へ戻る際に seam のスタビライザが分裂して生まれる保存量を確認する検出器が欠けていたことでした。
+  \item 後ろ向き閉包検出器（分裂先の積を保存量として検出器に張る）を追加することで、gauge ゼロ・真理値表一致を保ったまま \texttt{shortest\_graphlike\_error} が $2$ から $3$ に回復しました。
+  \item \texttt{allow\_gauge\_detectors=True} で症状を隠すことは修正ではなく、距離や論理エラー率の評価を不正にする隠蔽であることを、退役した \texttt{circuit\_level\_ls.py} の実例から確認しました。
+\end{itemize}
+
+\subsection*{合否基準での検証}
+本章で得られた \texttt{LSCnotFT} は、第16章までの合否基準（ノイズなしで gauge 検出器ゼロ、計算基底 CNOT の真理値表一致）に加えて、\texttt{shortest\_graphlike\_error} $=3$（パッチ距離と一致）を満たします。
+これは \texttt{search\_for\_undetectable\_logical\_errors} による独立な探索でも裏づけられており、この段階で確認できる範囲では十分な検証といえます。
+ただし本章の検証は $d=3$ の固定パッチ・特定の L 字レイアウトに限定されたものであり、任意の $d$ や任意のパッチ配置への一般化、\texttt{decode\_shell} を通した \texttt{allow\_gauge\_detectors} 不使用ガードの API 全体への定着は、第18章以降および第19章で強化されます。
+
+\subsection*{次章への接続}
+次章では、同じ \texttt{ls\_cnot\_ft.py} に定義される \texttt{LSTeleportFT} を用いて、T ゲートテレポートの格子手術実装（LS-T）を構築し、magic state の故障と QEC の残差誤りがどのように直交する2つのチャネルとして扱われるかを見ます。
+
+\begin{exercise}
+  \begin{enumerate}
+    \item gauge 検出器がゼロであることと \texttt{shortest\_graphlike\_error} が符号距離と一致することが、それぞれ何を保証し、何を保証しないかを一文ずつで説明しなさい。
+    \item 本章で棄却した3つの仮説（hook 誤り、論理演算子の代表元、幾何配置）について、それぞれどのような追加実験（単体テスト・代表元の切り替え・レイアウト変更）が棄却の根拠になったかを説明しなさい。
+    \item \texttt{LSCnotFT.build} の前向き比較（\texttt{comp = self.\_decompose(...)}）と後ろ向き閉包（\texttt{back = self.\_decompose(...)}）が、それぞれどのラウンドのスタビライザをどのラウンドのスタビライザの積として分解しているかを、変数名を挙げて対応づけなさい。
+    \item \texttt{allow\_gauge\_detectors=True} を用いて非決定論的検出器を隠した場合、\texttt{shortest\_graphlike\_error} や論理エラー率の評価がどちらの方向に（過大・過小）ずれる可能性があるかを、本章の議論に基づいて考察しなさい。
+  \end{enumerate}
+\end{exercise}

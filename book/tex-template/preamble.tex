@@ -1,0 +1,121 @@
+% 基本的な数学パッケージ
+\usepackage{amsmath,amssymb}
+
+% ブラケット記法 (\bra, \ket, \braket 等) を直感的に書くためのパッケージ
+\usepackage{physics}
+
+% 太字ベクトル用
+\usepackage{bm}
+
+% 虚数単位、自然対数の底、微分記号を立体にする
+\newcommand{\ii}{\mathrm{i}}
+\newcommand{\ee}{\mathrm{e}}
+\RenewDocumentCommand{\dd}{}{\mathrm{d}}
+
+% 量子回路図描画用パッケージ
+\usepackage{graphicx} % \resizebox などで使用
+\usepackage{tikz}
+\usetikzlibrary{quantikz2} % 最新環境ではquantikz2が推奨されます
+% 格子配置図・時空図・ブロック図で使う TikZ ライブラリ
+\usetikzlibrary{positioning,calc,arrows.meta,fit,backgrounds,patterns,decorations.pathreplacing,shapes.geometric,3d}
+% 図版の共通スタイル
+\tikzset{
+  xtype/.style={red!70!black},          % X 型（primal）
+  ztype/.style={blue!70!black},         % Z 型（dual）
+  ytype/.style={green!50!black},        % Y 型
+  dataqubit/.style={circle, draw, fill=white, minimum size=4pt, inner sep=0pt},
+  ancqubit/.style={circle, draw, fill=black!45, minimum size=4pt, inner sep=0pt},
+  logpatch/.style={draw, dashed, thick}, % 論理アンシラパッチ
+  xplaq/.style={fill=red!12, draw=red!70!black},
+  zplaq/.style={fill=blue!12, draw=blue!70!black},
+}
+
+% ハイパーリンクの設定
+\usepackage{xurl}
+\usepackage[unicode,hidelinks]{hyperref}
+
+% 長いコードパスを行末で安全に折り返す
+\newcommand{\codepath}[1]{\nolinkurl{#1}}
+\newcommand{\codeinline}[1]{\nolinkurl{#1}}
+
+% 長い日本語文とインラインコードが混在する段落の微小なはみ出しを防ぐ
+\setlength{\emergencystretch}{2em}
+
+% 本文幅に追従する比較表
+\usepackage{tabularx}
+
+% ソースコード表示用の設定 (Python/Qiskit等を想定)
+\usepackage{listings}
+\usepackage{xcolor}
+% listingsのLOL出力を無効化（\@writefileのバッファ問題回避）
+\makeatletter
+\AtBeginDocument{\renewcommand{\lstlistoflistings}{}}
+\AtEndDocument{%
+  \let\orig@end@writefile\@writefile
+  \renewcommand{\@writefile}[2]{%
+    \def\@end@tmp@ext{lol}%
+    \def\@end@tmp@arg{#1}%
+    \ifx\@end@tmp@ext\@end@tmp@arg
+    \else
+      \orig@end@writefile{#1}{#2}%
+    \fi
+  }%
+}
+\makeatother
+
+% コールアウト用ボックス
+\usepackage{tcolorbox}
+\tcbuselibrary{breakable}
+
+% チャプターゴール / Note / 警告 / 演習 環境
+\newtcolorbox{chaptergoal}{
+  colback=blue!5,
+  colframe=blue!60!black,
+  title=\textbf{この章で学ぶこと},
+  fonttitle=\bfseries,
+  breakable
+}
+\newcommand{\cgitem}{\textbullet\ }
+
+\newtcolorbox{notebox}{
+  colback=blue!5,
+  colframe=blue!60!black,
+  title=\textbf{Note},
+  fonttitle=\bfseries,
+  breakable
+}
+
+\newtcolorbox{warningbox}{
+  colback=yellow!5,
+  colframe=orange,
+  title=\textbf{注意},
+  fonttitle=\bfseries,
+  breakable
+}
+
+\newtcolorbox{exercise}[1][演習]{
+  colback=green!5,
+  colframe=green!50!black,
+  title=\textbf{#1},
+  fonttitle=\bfseries,
+  breakable
+}
+
+\lstset{
+    language=Python,
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue}\bfseries,
+    stringstyle=\color{red},
+    commentstyle=\color{green!50!black},
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    stepnumber=1,
+    numbersep=5pt,
+    backgroundcolor=\color{black!5},
+    frame=single,
+    rulecolor=\color{black!20},
+    breaklines=true,
+    tabsize=4,
+    captionpos=b,
+    showstringspaces=false
+}

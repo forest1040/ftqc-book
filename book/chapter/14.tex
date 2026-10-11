@@ -1,0 +1,285 @@
+% Stage: 02 ／ 説明用コード: src/stages/02\_circuit\_level/src/ftqc
+\chapter{なぜ回路レベルが必要か}\label{ch:why_circuit_level}
+
+\begin{chaptergoal}
+  \begin{itemize}
+  \item 現象論的 MPP モデルが測定過程のどこをブラックボックス化しているかを理解します。
+  \item ancilla・CX ゲートの故障がシンドローム抽出回路にもたらす hook 誤りの直感を得ます。
+  \item CX スケジュールの選び方が回路レベルの符号距離を左右することを、実際の失敗例から学びます。
+  \item Stage 01（\codepath{src/stages/01_mpp/src/ftqc}）と Stage 02（\codepath{src/stages/02_circuit_level/src/ftqc}）のファイル対応を把握し、どこが回路レベル化されたかを地図として持ちます。
+  \item 合否基準の用語（gauge 検出器ゼロ、$\mathrm{shortest\_graphlike\_error}=d$ 等）が Stage が変わっても同じ意味で使われることを確認します。
+  \end{itemize}
+\end{chaptergoal}
+
+第III部では、表面符号パッチの安定化子を \texttt{MPP} 命令で直接測定する現象論的なモデル（Stage 01、\codepath{src/stages/01_mpp/src/ftqc/}）を使い、格子手術による論理 CNOT や論理 S ゲート、T ゲートテレポーテーションまでを一通り実装しました。
+この現象論モデルは、符号距離やフレーム追跡、QPD 分岐といった本書の骨格を導入するには十分な忠実度を持っていましたが、ハードウェアで実際に起きる誤りの伝わり方を正しく再現しているわけではありません。
+本章では、まず MPP モデルが何を単純化しているかを確認し、その単純化がどのような誤りを見えなくしてしまうか（hook 誤り）を具体的な失敗例で示します。
+そのうえで、第IV部（Stage 02、\codepath{src/stages/02_circuit_level/src/ftqc/}）で何がどう回路レベル化されるかを、ファイル単位の差分地図として整理します。
+実装の詳細（格子手術 CNOT・回路レベル merge の作り方そのもの）は第15章以降で扱うため、本章はもっぱら「なぜ乗り換える必要があるか」という動機づけに専念します。
+
+\begin{notebox}
+  Stage: \textbf{02}。
+  説明用コードは主に \codepath{src/stages/02_circuit_level/src/ftqc/} を用います。
+  第13章までの \codepath{src/stages/01_mpp/src/ftqc/} との差分を示すことが本章の主目的であり、両ディレクトリは大半のファイルを共有しています。
+\end{notebox}
+
+\section{MPP のモデルが落とすもの}\label{sec:mpp_limits}
+
+\subsection{測定をブラックボックス化する MPP}
+
+Stim の \texttt{MPP} 命令は、複数の量子ビットにまたがるパウリ積 $X_1 X_2 \cdots$ や $Z_1 Z_2 \cdots$ を、あたかも 1 回の操作で読み出せるかのように扱います。
+\codepath{src/stages/01_mpp/src/ftqc/lattice_surgery.py} の \texttt{joint\_measure} や \texttt{geom\_lattice\_surgery.py} の seam スタビライザ測定は、いずれもこの \texttt{MPP} を直接呼び出しており、ノイズも「この測定に確率 $p$ で誤りが乗る」という 1 段のパラメータとして与えられます。
+
+しかし実際のハードウェアでは、$X_1 X_2 X_3 X_4$ のような多体パウリ演算子を 1 回の物理操作で測ることはできません。
+現実には、
+\begin{enumerate}
+  \item 補助量子ビット（アンシラ）を $\ket0$ に初期化する、
+  \item データ量子ビットとアンシラの間に CNOT を 1 本ずつ、決められた順序で適用してパリティをアンシラへ写す、
+  \item アンシラを測定する、
+\end{enumerate}
+という複数ステップの回路（第3章のシンドローム測定と同じ発想）を経る必要があります。
+\texttt{MPP} はこの (1)–(3) の全過程を 1 命令に圧縮してしまうため、各ステップで個別に起こり得る故障を表現できません。
+これが「測定をブラックボックス化する」という第一の限界です。
+
+\subsection{ancilla・CX の故障が表現できない}
+
+MPP モデルにはそもそもアンシラという物理的な実体が存在しません。
+したがって、次のような現実の故障モードはモデルの外側にあります。
+
+\begin{itemize}
+  \item アンシラの初期化・待機中に生じる漏れやリセット誤り。
+  \item シンドローム抽出中の CX ゲート自体に生じる 2 量子ビット誤り（\texttt{DEPOLARIZE2} 相当）。
+  \item CX を何本、どの順序でかけるかというスケジュールに依存した誤りの伝播。
+\end{itemize}
+
+とくに 3 番目は、次節で扱う hook 誤りの直接の原因です。
+\codepath{src/stages/01_mpp/src/ftqc/} 側にも回路レベルノイズを使う部分はあります。
+たとえば \texttt{ftqc\_toy.py} の QEC 層は \texttt{stim.Circuit.generated("surface\_code:rotated\_memory\_z", ...)} を使い、1 パッチのメモリ実験自体はすでに ancilla ベースの回路レベルです。
+ですが、\textbf{格子手術の継ぎ目（seam）で 2 パッチをつなぐ結合測定}は \texttt{geom\_lattice\_surgery.py} が \texttt{MPP} で直接行っており、ここに ancilla も CX スケジュールもありません。
+つまり Stage 01 の弱点は「QEC 全体」ではなく、\textbf{論理 CNOT・論理 S・T テレポーテーションのハンドオフを担う結合測定の内部}に局在しています。
+Stage 02（\codepath{src/stages/02_circuit_level/src/ftqc/}）が置き換えるのは、まさにこの部分です。
+
+\section{hook 誤り}\label{sec:hook}
+
+\subsection{CX 順序が距離を落とす直感}
+
+シンドローム抽出回路では、1 個のアンシラに対して重み 4（角では重み 2）のスタビライザを測るために、データ量子ビット 4 個へ順番に CX をかけます。
+このとき、$k$ 番目の CX で 2 量子ビット誤りが起きると、その誤りは「アンシラ」と「まだ CX をかけていない残りのデータ量子ビット」の両方に伝播する可能性があります。
+これを\textbf{hook 誤り}と呼びます。単一の物理故障が複数個のデータ誤りへと広がる様子を図\ref{fig:ch14_hook_error}に示します。
+
+\begin{figure}[htbp]
+  \centering
+  % (a) 回路図 (quantikz2)
+  \begin{minipage}{0.54\linewidth}
+    \centering
+    \textbf{\small (a) 回路レベルでの誤り伝播}\\[4pt]
+    \begin{quantikz}[row sep={0.55cm,between origins}, column sep=0.42cm]
+      \lstick{$A$ ($\ket{+}$)} & \ctrl{1} & \ctrl{2} & \gate[style={fill=red!20,draw=red,thick}]{\textcolor{red}{X}} & \ctrl{3} & \ctrl{4} & \meter{X} \\
+      \lstick{$D_1$}           & \targ{}  & \qw      & \qw                                           & \qw      & \qw      & \qw       \\
+      \lstick{$D_2$}           & \qw      & \targ{}  & \qw                                           & \qw      & \qw      & \qw       \\
+      \lstick{$D_3$}           & \qw      & \qw      & \qw                                           & \targ{}  & \qw      & \gate[style={fill=red!20,draw=red,thick}]{\textcolor{red}{X}} \\
+      \lstick{$D_4$}           & \qw      & \qw      & \qw                                           & \qw      & \targ{}  & \gate[style={fill=red!20,draw=red,thick}]{\textcolor{red}{X}}
+    \end{quantikz}
+  \end{minipage}
+  \hfill
+  % (b) 格子図 (tikz)
+  \begin{minipage}{0.43\linewidth}
+    \centering
+    \textbf{\small (b) 格子上での重み2誤り}\\[4pt]
+    \begin{tikzpicture}[scale=0.95]
+      % プラケット
+      \filldraw[xplaq] (-1.3,-1.3) rectangle (1.3,1.3);
+
+      % データ量子ビット
+      \node[dataqubit, minimum size=14pt] (D2) at (-1.1, 1.1) {\scriptsize $D_2$};
+      \node[dataqubit, minimum size=14pt] (D1) at ( 1.1, 1.1) {\scriptsize $D_1$};
+      \node[dataqubit, minimum size=14pt, draw=red, line width=1.5pt, fill=red!15] (D3) at ( 1.1,-1.1) {\scriptsize \textcolor{red}{$D_3$}};
+      \node[dataqubit, minimum size=14pt, draw=red, line width=1.5pt, fill=red!15] (D4) at (-1.1,-1.1) {\scriptsize \textcolor{red}{$D_4$}};
+
+      % アンシラ
+      \node[ancqubit, minimum size=12pt, draw=red, line width=1.5pt] (A) at (0,0) {};
+      \node[font=\scriptsize\bfseries] at (0, 1.1) {Ancilla $A$};
+      \draw[<-, >=Stealth, red, thick] (A) to[out=0, in=180] (1.4, 0.05)
+        node[right, font=\scriptsize\bfseries, text=red] {$X$ 故障発生};
+
+      % CX 矢印 (1, 2 は通常, 3, 4 は赤太線で誤り伝播)
+      \draw[-{Stealth[length=4pt]}, thick] (A) -- (D1) node[midway, above right, font=\tiny] {\textbf{1}};
+      \draw[-{Stealth[length=4pt]}, thick] (A) -- (D2) node[midway, above left, font=\tiny] {\textbf{2}};
+      \draw[-{Stealth[length=5pt]}, line width=1.4pt, red] (A) -- (D3)
+        node[pos=0.4, above right=2pt, xshift=-2pt, font=\tiny\bfseries] {\textbf{3} 伝播};
+      \draw[-{Stealth[length=5pt]}, line width=1.4pt, red] (A) -- (D4)
+        node[pos=0.4, above left=2pt, xshift=3pt, font=\tiny\bfseries] {\textbf{4} 伝播};
+
+      % 重み2誤りのリンク
+      \draw[line width=2pt, red, dashed] (D3) -- (D4)
+        node[midway, below=5pt, font=\scriptsize\bfseries, text=red] {重み 2 のデータ誤り};
+    \end{tikzpicture}
+  \end{minipage}
+  \caption{hook 誤りの発生と伝播の模式図（$X$ 型スタビライザ測定の例）。(a) アンシラ $A$ から 4 つのデータ量子ビットへの CX スケジュールの途中で生じた 1 つの物理故障（アンシラ上の $X$ 誤り）が、後続の CX を通じてデータ量子ビット $D_3, D_4$ へと伝播します。(b) その結果、格子上のたった 1 箇所の故障から重み 2 のデータ誤り（赤破線）が励起されます。この誤り鎖の向きが符号距離の経路に重なると、実効的な符号距離が低下します。}
+  \label{fig:ch14_hook_error}
+\end{figure}
+
+
+符号距離 $d$ は非自明な論理演算子の最小重みであり、重み $d-1$ 以下の Pauli 誤りを検出でき、重み $t = \lfloor (d-1)/2 \rfloor$ 以下の任意の Pauli 誤りを一意に訂正できることを保証する指標でした（第3章）。
+hook 誤りは、名目上 1 個の故障であるにもかかわらず実質的に重みの大きいデータ誤りを生むため、CX の順序を誤って選ぶと、回路レベルで実際に区別できる誤りの最小個数（実効的な距離）が、符号として設計した $d$ より小さくなってしまいます。
+言い換えると、\textbf{符号の幾何は正しくても、CX スケジュールが悪いだけで距離が落ちる}という現象です。
+MPP モデルには CX スケジュールという概念自体が存在しないため、この失敗はそもそも起こり得ず、同時に検出することもできません。
+
+\subsection{FT な CX スケジュールと、隠れた失敗の教訓}
+
+\codepath{src/stages/02_circuit_level/src/ftqc/surface_patch.py} は、Stim が生成する \texttt{surface\_code:rotated\_memory\_z} 回路そのものから CX スケジュールを抽出します。
+自前で「良い順序」を考案するのではなく、Stim の生成回路がすでに hook 誤りを避ける順序で書かれていることを利用し、それを \texttt{geom\_lattice\_surgery.py} のローカル座標規約に整合させて取り出す、という設計です。
+
+\begin{lstlisting}[language=Python, caption={CX スケジュールを生成回路から抽出する（\codepath{src/stages/02_circuit_level/src/ftqc/surface_patch.py}）}]
+def _extract_stabilizers(circ, data, anc):
+    """生成回路の CX schedule から各 ancilla が測る (型, data support) を復元。"""
+    ...
+    for it in flat:
+        if it.name == "H":
+            for t in it.targets_copy():
+                h_anc.add(t.value)
+        if it.name in ("CX", "ZCX"):
+            ts = it.targets_copy()
+            cx += [(ts[i].value, ts[i + 1].value) for i in range(0, len(ts), 2)]
+\end{lstlisting}
+
+このスケジュールを 2 パッチの継ぎ目（seam）にも一様に適用するのが \codepath{src/stages/02_circuit_level/src/ftqc/circuit_level_merge.py} です。
+
+\begin{lstlisting}[language=Python, caption={hook 誤りを避ける CX 順序を seam 全体へ適用する（\codepath{src/stages/02_circuit_level/src/ftqc/circuit_level_merge.py}）}]
+# CX 方向 -> 4 ステップ割当 (surface_patch で Stim から抽出した FT 順)
+_XSTEP = {(1, 1): 0, (-1, 1): 1, (1, -1): 2, (-1, -1): 3}    # NE,NW,SE,SW
+_ZSTEP = {(1, 1): 0, (1, -1): 1, (-1, 1): 2, (-1, -1): 3}    # NE,SE,NW,SW
+\end{lstlisting}
+
+X 型アンシラは NE, NW, SE, SW の順に、Z 型アンシラはその転置に相当する NE, SE, NW, SW の順に CX をかけます。
+この非対称な順序こそが、単一の CX 誤りがデータ量子ビットへ与える影響を局所化し、hook 誤りによる実効距離の低下を防ぐ鍵です。
+
+この教材としての価値は、\codepath{src/stages/02_circuit_level/src/ftqc/circuit_level_ls.py} に残された「退役済みモジュール」の記録からも読み取れます。
+このファイルは回路レベル格子手術の最初期実装でしたが、split（分割）から merge（結合）へ遷移する境界の検出器則を取りこぼしており、ノイズがない状態でも検出器が非決定論的に揺れてしまいました。
+
+\begin{lstlisting}[language=Python, caption={退役理由の記録（\codepath{src/stages/02_circuit_level/src/ftqc/circuit_level_ls.py}）}]
+このモジュールは回路レベル lattice surgery (LS CNOT / LS S) の初期実装でしたが、
+検出器則が split<->merge 遷移の _compose_in (GF2 span) 合成を取りこぼすため、
+ノイズなしでも非決定論的検出器が残り、決定論性が崩れていました。当時はそれを
+detector_error_model(..., allow_gauge_detectors=True) で隠して動かしていました
+が、これは距離計算を壊し論理エラー率を不正に押し上げる「隠蔽」であり、修正では
+ありません (allow_gauge_detectors は非決定論検出器を情報なしとして捨てるため、
+seam 角で距離が崩壊する)。
+\end{lstlisting}
+
+この一件が示すのは、「動く」ことと「距離が保たれている」ことは別だという事実です。
+非決定論的な検出器を \texttt{allow\_gauge\_detectors=True} で消音してしまうと、回路は一見動作しているように見えますが、実際には情報を持つはずの検出器を握り潰しており、実効的な符号距離が seam の角で崩壊していることに気づけません。
+\codepath{src/stages/02_circuit_level/src/ftqc/} での正しい後継実装（\texttt{ls\_cnot\_ft.py} の後ろ向き閉包検出器、\texttt{circuit\_level\_merge.py} の一様な CX 順序）は、いずれも \texttt{allow\_gauge\_detectors} を使わずに gauge 検出器ゼロ・$\mathrm{shortest\_graphlike\_error}=3$ を満たすことを検証しています。
+hook 誤りも、この退役の教訓も、突き詰めれば「回路の時間順序を明示的にモデル化していないと発見できない不具合」という同じ根から生えています。
+MPP モデルにはこの時間順序が存在しないため、そもそも問いを立てることさえできません。
+
+\section{Stage 01 \texorpdfstring{$\to$}{→} B の差分地図}\label{sec:diff_map}
+
+\subsection{何が変わり、何が変わらないか}
+
+\codepath{src/stages/01_mpp/src/ftqc/} と \codepath{src/stages/02_circuit_level/src/ftqc/} は、ファイル名の大半を共有しています。
+T ゲート蒸留（\texttt{t\_gate.py}）、QPD 分岐（\texttt{qpd\_backend.py}）、transversal CNOT の参照実装（\texttt{transversal\_cnot.py}）、生成子追跡による Clifford FT コンパイラ（\texttt{clifford\_ft\_full.py}）などは、いずれも符号サイクル単体・非 Clifford ゲート単体を扱うものであり、格子手術の継ぎ目測定をどう実装するかとは独立です。
+そのため Stage 02 でも変更されず、そのまま使われ続けます。
+
+回路レベル化の影響を受けるのは、格子手術の継ぎ目（seam）測定を扱うファイル群だけです。
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X}
+\hline
+\textbf{Stage 01} & \textbf{Stage 02} & \textbf{変化} \\
+\hline
+\texttt{geom\_lattice\_surgery.py} & \texttt{geom\_lattice\_surgery.py} & 幾何の設計図として継続利用 \\
+\texttt{lattice\_surgery.py} & \texttt{lattice\_surgery.py} & MPP 版参照実装に降格 \\
+(なし) & \texttt{surface\_patch.py} & 新規：単一パッチの回路レベル化 \\
+(なし) & \texttt{circuit\_level\_merge.py} & 新規：seam の ancilla 化 \\
+(なし) & \texttt{ls\_cnot\_ft.py} & 新規：LS CNOT/T の検証済み回路レベル実装 \\
+(なし) & \texttt{circuit\_level\_ls.py} & 新規：退役済み初期実装（教訓として保存） \\
+\texttt{ls\_handoff\_shells.py} & \texttt{ls\_handoff\_shells.py} & 内部で \texttt{lattice\_surgery} 呼び出しを \texttt{circuit\_level\_merge} に置換 \\
+\texttt{hybrid\_ftqc\_runtime.py} & \texttt{hybrid\_ftqc\_runtime.py} & \texttt{cnot\_mode} と \texttt{LSCnotEvent} を追加 \\
+\hline
+\end{tabularx}
+\end{center}
+
+\texttt{lattice\_surgery.py}（MPP 版）は削除されず、現象論的な検証用・論理レベル参照実装として \codepath{src/stages/02_circuit_level/src/ftqc/} にも残ります。
+一方で \texttt{ls\_handoff\_shells.py} が実際に呼び出す先は、内部で \texttt{circuit\_level\_merge.py}（ancilla ベースの seam merge）に切り替わっています。
+\texttt{hybrid\_ftqc\_runtime.py} には、論理 CNOT を transversal に実行するか格子手術ベース（\texttt{lattice\_surgery}）で実行するかを選ぶ \texttt{cnot\_mode} パラメータと、それをイベントとして表す \texttt{LSCnotEvent} が新たに加わりました。
+
+\begin{lstlisting}[language=Python, caption={論理 CNOT の実行経路を選ぶ \texttt{cnot\_mode}（\codepath{src/stages/02_circuit_level/src/ftqc/hybrid_ftqc_runtime.py}）}]
+cnot_mode = str(cnot_mode).lower()
+if cnot_mode not in ("transversal", "lattice_surgery"):
+    raise ValueError("cnot_mode must be 'transversal' or 'lattice_surgery'")
+self.cnot_mode = cnot_mode
+...
+if name in ("CNOT", "CX") and self.cnot_mode == "lattice_surgery":
+    flush(f"before_CNOT_{gi}")
+    events.append(LSCnotEvent(control=a, target=b, label=f"CNOT_{gi}"))
+\end{lstlisting}
+
+\subsection{\texttt{ls\_s} の構成}
+
+\codepath{src/stages/02_circuit_level/src/ftqc/} における格子手術関連の依存関係は、以下のように積み上がっています。
+
+\begin{center}
+\begin{tabular}{l}
+\texttt{hybrid\_ftqc\_runtime.py}（中枢ランタイム） \\
+\quad $\rightarrow$ \texttt{ls\_handoff\_shells.py}（LS ハンドオフ Shell・回路レベル版） \\
+\qquad $\rightarrow$ \texttt{circuit\_level\_merge.py}（ancilla ベース seam merge） \\
+\qquad\quad $\rightarrow$ \texttt{geom\_lattice\_surgery.py}（幾何の設計図） \\
+\qquad $\rightarrow$ \texttt{surface\_patch.py}（CX スケジュールの抽出元） \\
+\qquad $\rightarrow$ \texttt{ls\_cnot\_ft.py}（LS CNOT／T テレポートの検証済み実装） \\
+\end{tabular}
+\end{center}
+
+つまり Stage 02 は、Stage 01 の幾何設計（\texttt{geom\_lattice\_surgery.py}）を土台としつつ、そこに「ancilla を割り当て、CX スケジュールを一様に適用し、split$\leftrightarrow$merge 遷移を閉じる検出器を追加する」という 1 段の回路レベル化を挟み込んだ構造になっています。
+設計そのものをやり直すのではなく、既存の幾何情報を保ったまま抽出過程だけをより現実的なものへ差し替えている、という点が重要です。
+
+\subsection{同じ合否基準を、より厳しい土俵で}
+
+第II部で定めた合否基準——ノイズなしで検出器がすべて 0 になる決定論性（gauge 検出器ゼロ）、graphlike な検出器誤りモデルでは $\mathrm{shortest\_graphlike\_error}=d$、真理値表や理想分布との一致、\texttt{seed} による再現性——は、Stage 01 から Stage 02 へ移っても\textbf{変わりません}。
+変わるのは、その基準をどれだけ厳しい土俵で検証するか、という点です。
+
+Stage 01 では、seam の測定が \texttt{MPP} による直接測定だったため、決定論性や距離はほぼ設計どおりに保たれます。
+Stage 02 では、同じ基準を ancilla・CX スケジュール・時間順序を含む回路レベルの実装に対して要求します。
+前節で見た \texttt{circuit\_level\_ls.py} の退役は、この「より厳しい土俵」で初めて表面化した不具合でした。
+\codepath{src/stages/02_circuit_level/src/ftqc/} の後継実装（\texttt{ls\_cnot\_ft.py}、\texttt{circuit\_level\_merge.py}）が、\texttt{allow\_gauge\_detectors} を使わずに gauge 検出器ゼロと $\mathrm{shortest\_graphlike\_error}=3$ を満たすと確認できたことは、単に「動く」のではなく「意図した距離を回路レベルで実現できている」ことの機械的な証拠になります。
+
+\section{やること・スコープ外}\label{sec:why_circuit_level_scope}
+
+\subsection{やること}
+
+\begin{itemize}
+  \item 現象論的 MPP モデルが測定過程とアンシラ・CX の故障を単純化していることを示す。
+  \item hook 誤りの直感と、CX スケジュール選択が回路レベルの符号距離を左右することを示す。
+  \item \codepath{src/stages/01_mpp/src/ftqc/} と \codepath{src/stages/02_circuit_level/src/ftqc/} のファイル対応を整理し、回路レベル化の範囲を明示する。
+\end{itemize}
+
+\subsection{スコープ外}
+
+\begin{itemize}
+  \item 格子手術 CNOT・回路レベル merge の具体的な構築手順（第15章、第16章）。
+  \item 距離 2 バグの診断と修正の詳細な追跡（第17章）。
+  \item T テレポーテーションの格子手術実装や Shell API の内部（第18章、第19章）。
+\end{itemize}
+
+\section{まとめ}\label{ch14:summary}
+
+\begin{itemize}
+  \item MPP モデルは、シンドローム抽出をアンシラ初期化・CX・測定という複数ステップの回路ではなく、単一の多体測定として扱います。
+  \item この単純化により、アンシラや CX ゲート自体の故障、および CX スケジュールに依存する誤りの伝播（hook 誤り）が表現できません。
+  \item hook 誤りは、符号の幾何が正しくても CX の順序が悪いだけで回路レベルの実効距離を下げてしまう現象です。
+  \item \texttt{circuit\_level\_ls.py} の退役は、非決定論的検出器を \texttt{allow\_gauge\_detectors=True} で隠蔽すると距離の崩壊に気づけなくなる、という具体的な教訓を残しています。
+  \item Stage 01（\codepath{src/stages/01_mpp/src/ftqc/}）から Stage 02（\codepath{src/stages/02_circuit_level/src/ftqc/}）への移行は、幾何設計（\codeinline{geom_lattice_surgery.py}）を保ったまま、格子手術の継ぎ目測定だけを ancilla ベースの回路レベル実装（\codeinline{surface_patch.py}、\codeinline{circuit_level_merge.py}、\codeinline{ls_cnot_ft.py}）へ差し替えるものです。
+  \item 合否基準の用語（gauge 検出器ゼロ、$\mathrm{shortest\_graphlike\_error}=d$、\codeinline{allow_gauge_detectors} を使わない \texttt{decode\_shell}）は Stage が変わっても同じであり、Stage 02 ではそれをより厳しい土俵で検証します。
+\end{itemize}
+
+次章では、本章で地図として示した \texttt{circuit\_level\_merge.py} を軸に、FT な CX スケジュールを持つ回路レベル格子手術 merge の具体的な構築手順を扱います。
+
+\begin{exercise}
+  \begin{enumerate}
+    \item \texttt{MPP} による直接測定と、アンシラ・CX を用いたシンドローム抽出の違いを、故障が起こり得る箇所の数という観点で説明しなさい。
+    \item hook 誤りが「1 個の物理故障が、複数個のデータ誤りとして現れる」現象である理由を、CX の順序とアンシラへの伝播の観点から説明しなさい。
+    \item \texttt{circuit\_level\_ls.py} が \texttt{allow\_gauge\_detectors=True} で隠していた問題は何であり、それがなぜ「修正ではない」と本文で述べられているかを説明しなさい。
+    \item \codepath{src/stages/01_mpp/src/ftqc/lattice_surgery.py} が \codepath{src/stages/02_circuit_level/src/ftqc/} でも削除されずに残されている理由を、本章の「Stage 01 → B の差分地図」の記述に基づいて答えなさい。
+  \end{enumerate}
+\end{exercise}

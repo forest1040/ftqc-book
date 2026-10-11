@@ -1,0 +1,435 @@
+% Stage: 01 ／ 説明用コード: src/stages/01\_mpp/src/ftqc
+\chapter{トランスバーサル操作と生成子追跡}\label{ch:transversal}
+
+\begin{chaptergoal}
+  \begin{itemize}
+  \item トランスバーサル操作がなぜ誤り耐性を持つかを、物理誤りの伝播範囲という観点から理解します。
+  \item 表面符号パッチにおいて H・S・CNOT のうちどれがトランスバーサルに実装できるかを理解します。
+  \item 生成子追跡により、ゲートごとに異なる検出器補正を「同じ生成子を連続ラウンドで比較する」という一様な規則へ一般化する方法を理解します。
+  \item \codepath{src/stages/01_mpp/src/ftqc/} の \texttt{CliffordFTCompiler} を用いて、ノイズなし決定論性の確認からデコードまでの検証手順を理解します。
+  \end{itemize}
+\end{chaptergoal}
+
+第7章では 1 枚の表面符号パッチにおけるスタビライザと論理演算子 $X_L, Z_L$ を、第8章では復号と合否基準の言葉を確認しました（いずれも本書の以降の章で内容を確定します）。
+本章からは、この 1 枚のパッチを複数並べ、パッチ間の論理演算——論理 CNOT や論理 H——をどのように誤り耐性を保ったまま実装するかを考えます。
+最も素朴な方法が\textbf{トランスバーサル操作}です。パッチ内の各データ量子ビットに対応する物理ゲートを、パッチをまたいで一斉に（あるいはパッチ内で独立に）適用するだけで論理ゲートを実現します。
+本章では、まずトランスバーサル操作がなぜ誤りを広げすぎないかを直感的に確認し（9.1）、続いて検出器則をゲート依存の場当たり的な補正から一様な規則へ一般化する\textbf{生成子追跡}を導入します（9.2）。
+最後に、MPP バックボーンによるトランスバーサル CNOT の実装を代数・真理値表・検出器・デコードの 4 段で検証し、後の格子手術との対比を予告します（9.3）。
+
+\begin{notebox}
+  Stage: \textbf{01}。
+  説明用コードは主に \codepath{src/stages/01_mpp/src/ftqc/} を用います。
+  データ量子ビットの安定化子測定は多体パウリ測定（MPP）で行い、アンシラの配置やスケジューリングは考えません。
+  回路レベルの実装は第 IV 部（Stage 02, \codepath{src/stages/02_circuit_level/src/ftqc/}）まで持ち越します。
+\end{notebox}
+
+\section{トランスバーサル操作と誤り耐性}\label{sec:transversal}
+
+\subsection{H, S, CNOT の横断}\label{subsec:hsc}
+
+パッチを 1 つの符号ブロックとみなすと、\textbf{トランスバーサル操作}とは、各局所成分が同じ符号ブロック内の複数量子ビットを結合しないように分解できる操作です。同一の 1 量子ビットゲートを全データへ加える形はその代表例ですが、一般の定義では局所成分がすべて同じである必要はなく、ブロック間の対応位置を結ぶゲートや置換も含みます\cite{eastin2009transversal}。
+本章で使う同型かつ論理演算子の配置が整合した 2 枚の CSS パッチ（制御側 C, 標的側 T）では、対応するデータ量子ビット $i=0,\dots,8$ の間に物理 CX を当てることで論理 CNOT が実現できます。
+\codepath{src/stages/01_mpp/src/ftqc/transversal_cnot.py} はこれをそのまま実装しています。
+
+\begin{lstlisting}[caption={パッチ間のトランスバーサル CX（src/stages/01\_mpp/src/ftqc/transversal\_cnot.py）}]
+    # --- transversal CNOT (control -> target) ---
+    for i in range(NDATA):
+        c.append("CX", [BC + i, BT + i])
+    if noise:
+        for i in range(NDATA):
+            c.append("DEPOLARIZE2", [BC + i, BT + i], pp)
+\end{lstlisting}
+
+これが論理 CNOT になる理由は、CSS 符号の構造そのものにあります。
+CX は制御の $X$ を標的へ、標的の $Z$ を制御へコピーするユニタリなので、論理演算子についても
+\begin{equation}
+  X_L^C \longmapsto X_L^C \cdot X_L^T, \qquad Z_L^T \longmapsto Z_L^C \cdot Z_L^T
+\end{equation}
+という、量子ビット 1 個の CNOT とまったく同じ関係が論理レベルで成り立ちます（他の論理演算子は不変です）。
+\texttt{transversal\_cnot.py} の \texttt{verify\_logical\_action} は、この関係を Stim の \texttt{Tableau} を使って物理レベルの CX から直接計算し、代数的に確認しています。
+
+同じパッチが自分自身と入れ替え対称（$X$ 型安定化子の台と $Z$ 型安定化子の台が形として一致する）であれば、\textbf{全データ量子ビットへの物理 H} も論理 H になります。
+物理 H は各量子ビットで $X \leftrightarrow Z$ を入れ替えるので、$X$ 型安定化子は $Z$ 型安定化子へ、$Z$ 型安定化子は $X$ 型安定化子へ写り、符号空間全体としては保たれたまま論理 $X_L, Z_L$ も入れ替わります。
+\codepath{src/stages/01_mpp/src/ftqc/logical_clifford_ftqc.py} は H をこの意味で「全データへの transversal H（$X \leftrightarrow Z$ 安定化子が双対化）」として実装しています。
+
+ただし、ここでいう「形として一致する」は、その場で一致するという意味ではありません。$d=3$ 回転表面符号の $X$ 型安定化子の台と $Z$ 型安定化子の台は、90 度回転 $(r,c) \mapsto (c, d-1-r)$ を挟んではじめて互いに移り合います（$X_L=[0,3,6]$ はこの写像で $[0,1,2]=Z_L$ に移ります）。したがって transversal H が返すのは元の向きのパッチではなく、境界の役割が入れ替わった 90 度回転後のパッチです。シミュレーションでは量子ビット番号が抽象ラベルなので、この回転は単なる付け替えであり生成子追跡（9.2 節）がそのまま吸収します。一方、実機やパッチ配置を扱う模型ではこの再ラベル付けを無料とはみなせず、配置に応じてパッチ回転、コード変形、または後続操作の境界規約変更が必要になります\cite{fowler2012surface,litinski2019game}。この transversal H による境界の双対化と 90 度回転の様子を図\ref{fig:ch9_transversal_h_rotation}に示します。
+
+
+\begin{figure}[htbp]
+  \centering
+  \resizebox{\linewidth}{!}{%
+  \begin{tikzpicture}[scale=1.1, every node/.style={font=\footnotesize}]
+    % --- Left Panel: Before Transversal H ---
+    \begin{scope}[shift={(0,0)}]
+      \node[font=\bfseries\normalsize] at (1, 3.6) {Before: 通常の $d=3$ パッチ};
+
+      % Bulk Plaquettes
+      \filldraw[zplaq] (0,1) rectangle (1,2);
+      \node[ztype, font=\scriptsize\bfseries] at (0.5, 1.5) {$Z$};
+      \filldraw[xplaq] (1,1) rectangle (2,2);
+      \node[xtype, font=\scriptsize\bfseries] at (1.5, 1.5) {$X$};
+      \filldraw[xplaq] (0,0) rectangle (1,1);
+      \node[xtype, font=\scriptsize\bfseries] at (0.5, 0.5) {$X$};
+      \filldraw[zplaq] (1,0) rectangle (2,1);
+      \node[ztype, font=\scriptsize\bfseries] at (1.5, 0.5) {$Z$};
+
+      % Boundary Plaquettes (half discs)
+      \filldraw[xplaq] (0,2) -- (1,2) arc (0:180:0.5) -- cycle;
+      \node[xtype, font=\tiny\bfseries] at (0.5, 2.25) {$X$};
+      \filldraw[xplaq] (2,0) -- (1,0) arc (180:360:0.5) -- cycle;
+      \node[xtype, font=\tiny\bfseries] at (1.5, -0.25) {$X$};
+      \filldraw[zplaq] (0,0) -- (0,1) arc (90:270:0.5) -- cycle;
+      \node[ztype, font=\tiny\bfseries] at (-0.25, 0.5) {$Z$};
+      \filldraw[zplaq] (2,2) -- (2,1) arc (270:450:0.5) -- cycle;
+      \node[ztype, font=\tiny\bfseries] at (2.25, 1.5) {$Z$};
+
+      % Grid edges
+      \draw[black!30] (0,0) grid (2,2);
+
+      % Boundaries (thick colored lines)
+      \draw[xtype, line width=2.5pt] (0, 2) -- (2, 2);
+      \draw[xtype, line width=2.5pt] (0, 0) -- (2, 0);
+      \draw[ztype, line width=2.5pt] (0, 0) -- (0, 2);
+      \draw[ztype, line width=2.5pt] (2, 0) -- (2, 2);
+
+      % Boundary labels
+      \node[xtype, font=\scriptsize\bfseries] at (1.0, 2.7) {$X$ 境界（上）};
+      \node[xtype, font=\scriptsize\bfseries] at (1.0, -0.7) {$X$ 境界（下）};
+      \node[ztype, font=\scriptsize\bfseries, rotate=90] at (-0.75, 1.0) {$Z$ 境界（左）};
+      \node[ztype, font=\scriptsize\bfseries, rotate=-90] at (2.75, 1.0) {$Z$ 境界（右）};
+
+      % Logical operators (highlighted chains)
+      \draw[xtype, line width=4pt, opacity=0.45, line cap=round] (0,2) -- (0,0);
+      \draw[ztype, line width=4pt, opacity=0.45, line cap=round] (0,2) -- (2,2);
+
+      % Data qubits (3x3)
+      \foreach \r in {0, 1, 2} {
+        \foreach \c in {0, 1, 2} {
+          \pgfmathtruncatemacro{\idx}{3*\r + \c}
+          \pgfmathtruncatemacro{\y}{2 - \r}
+          \node[dataqubit, minimum size=13pt] (q\idx) at (\c, \y) {\tiny\idx};
+        }
+      }
+
+      % Logical operator callouts
+      \node[xtype, font=\scriptsize\bfseries, fill=white, inner sep=1.5pt, draw=red!40, rounded corners=2pt] at (-0.45, 1.6) {$X_L$};
+      \node[ztype, font=\scriptsize\bfseries, fill=white, inner sep=1.5pt, draw=blue!40, rounded corners=2pt] at (1.6, 2.35) {$Z_L$};
+
+      \node[align=center, font=\scriptsize, text=black!80] at (1, -1.35) {
+        $X_L = [0,3,6]$（縦・赤の鎖）\\
+        $Z_L = [0,1,2]$（横・青の鎖）
+      };
+    \end{scope}
+
+    % --- Middle Panel: Transition Arrow ---
+    \begin{scope}[shift={(3.7,1)}]
+      \draw[-{Stealth[length=3.5mm, width=4mm]}, line width=2pt, color=black!75] (0,0) -- (1.6,0);
+      \node[above, font=\small\bfseries] at (0.8, 0.25) {Transversal $H$};
+      \node[below, align=center, font=\scriptsize, text=black!80] at (0.8, -0.3) {
+        $H^{\otimes 9}$\\
+        全データに適用\\
+        $X \leftrightarrow Z$
+      };
+    \end{scope}
+
+    % --- Right Panel: After Transversal H ---
+    \begin{scope}[shift={(6.7,0)}]
+      \node[font=\bfseries\normalsize] at (1, 3.6) {After: 双対化されたパッチ};
+
+      % Bulk Plaquettes (swapped)
+      \filldraw[xplaq] (0,1) rectangle (1,2);
+      \node[xtype, font=\scriptsize\bfseries] at (0.5, 1.5) {$X$};
+      \filldraw[zplaq] (1,1) rectangle (2,2);
+      \node[ztype, font=\scriptsize\bfseries] at (1.5, 1.5) {$Z$};
+      \filldraw[zplaq] (0,0) rectangle (1,1);
+      \node[ztype, font=\scriptsize\bfseries] at (0.5, 0.5) {$Z$};
+      \filldraw[xplaq] (1,0) rectangle (2,1);
+      \node[xtype, font=\scriptsize\bfseries] at (1.5, 0.5) {$X$};
+
+      % Boundary Plaquettes (swapped)
+      \filldraw[zplaq] (0,2) -- (1,2) arc (0:180:0.5) -- cycle;
+      \node[ztype, font=\tiny\bfseries] at (0.5, 2.25) {$Z$};
+      \filldraw[zplaq] (2,0) -- (1,0) arc (180:360:0.5) -- cycle;
+      \node[ztype, font=\tiny\bfseries] at (1.5, -0.25) {$Z$};
+      \filldraw[xplaq] (0,0) -- (0,1) arc (90:270:0.5) -- cycle;
+      \node[xtype, font=\tiny\bfseries] at (-0.25, 0.5) {$X$};
+      \filldraw[xplaq] (2,2) -- (2,1) arc (270:450:0.5) -- cycle;
+      \node[xtype, font=\tiny\bfseries] at (2.25, 1.5) {$X$};
+
+      % Grid edges
+      \draw[black!30] (0,0) grid (2,2);
+
+      % Boundaries (swapped)
+      \draw[ztype, line width=2.5pt] (0, 2) -- (2, 2);
+      \draw[ztype, line width=2.5pt] (0, 0) -- (2, 0);
+      \draw[xtype, line width=2.5pt] (0, 0) -- (0, 2);
+      \draw[xtype, line width=2.5pt] (2, 0) -- (2, 2);
+
+      % Boundary labels
+      \node[ztype, font=\scriptsize\bfseries] at (1.0, 2.7) {$Z$ 境界（上）};
+      \node[ztype, font=\scriptsize\bfseries] at (1.0, -0.7) {$Z$ 境界（下）};
+      \node[xtype, font=\scriptsize\bfseries, rotate=90] at (-0.75, 1.0) {$X$ 境界（左）};
+      \node[xtype, font=\scriptsize\bfseries, rotate=-90] at (2.75, 1.0) {$X$ 境界（右）};
+
+      % Logical operators (swapped)
+      \draw[ztype, line width=4pt, opacity=0.45, line cap=round] (0,2) -- (0,0);
+      \draw[xtype, line width=4pt, opacity=0.45, line cap=round] (0,2) -- (2,2);
+
+      % Data qubits (identical coordinates & indices!)
+      \foreach \r in {0, 1, 2} {
+        \foreach \c in {0, 1, 2} {
+          \pgfmathtruncatemacro{\idx}{3*\r + \c}
+          \pgfmathtruncatemacro{\y}{2 - \r}
+          \node[dataqubit, minimum size=13pt] (rq\idx) at (\c, \y) {\tiny\idx};
+        }
+      }
+
+      % Logical operator callouts
+      \node[ztype, font=\scriptsize\bfseries, fill=white, inner sep=1.5pt, draw=blue!40, rounded corners=2pt] at (-0.45, 1.6) {$Z_L$};
+      \node[xtype, font=\scriptsize\bfseries, fill=white, inner sep=1.5pt, draw=red!40, rounded corners=2pt] at (1.6, 2.35) {$X_L$};
+
+      \node[align=center, font=\scriptsize, text=black!80] at (1, -1.35) {
+        $Z_L = [0,3,6]$（縦・青の鎖）\\
+        $X_L = [0,1,2]$（横・赤の鎖）
+      };
+
+      % Prominent note: = 90 degree rotated patch
+      \node[draw=orange!80!black, fill=orange!10, rounded corners=4pt, font=\scriptsize\bfseries, align=center, inner sep=3.5pt] at (1, -2.2) {
+        $=$ 90度回転した $d=3$ パッチ\\
+        \normalfont\tiny（物理座標・番号固定のまま符号が回転）
+      };
+    \end{scope}
+  \end{tikzpicture}%
+  }
+  \caption{トランスバーサル $H$ による境界の双対化と 90 度回転。全データ量子ビットに物理 $H$ を適用すると、$X \leftrightarrow Z$ の入れ替えにより上下辺が $Z$ 境界、左右辺が $X$ 境界へと双対化されます。物理量子ビットの番号と幾何座標は動いていませんが、符号としては 90 度回転したパッチと等価になり、論理演算子も縦の鎖が $Z_L$、横の鎖が $X_L$ へと入れ替わります。シミュレーション上は生成子追跡により抽象ラベルとして吸収できますが、実機では配置に応じてパッチ回転、コード変形、または後続操作の境界規約変更が必要です。}
+  \label{fig:ch9_transversal_h_rotation}
+\end{figure}
+
+一方、本章で採用した回転表面符号パッチと物理ゲートの対応では、論理 S を全データへの同一 1 量子ビットゲートとして実現できません。
+\texttt{clifford\_ft\_full.py} の冒頭コメントが明記しているとおり、S の実装は別途必要であり、本書ではコード変形や、スタビライザ状態 $\ket{Y_L}=S\ket{+_L}$ を用いる測定注入（第 11 章）に委ねます。
+H と CNOT だけでは S を作れない、つまり \{Pauli, H, CNOT\} は完全な Clifford 群ではないという点も、この章の射程を決める重要な事実です。
+
+\begin{notebox}
+  任意の 1 物理サブシステム誤りを検出する量子符号では、トランスバーサル論理ゲートだけから普遍ゲート集合を作ることはできません（Eastin--Knill の定理）\cite{eastin2009transversal}。
+  本章のゲート可否はこの一般的制限と整合しますが、特定の S が横断的かどうかは定理だけでなく、採用した符号と物理ゲートの作用から個別に決まります。
+  本書ではこの限界を回避する手段として、次章以降で格子手術（第10章〜）を導入します。
+\end{notebox}
+
+\subsection{誤り伝播の直感}\label{subsec:propagation}
+
+トランスバーサル操作が誤り耐性を持つ理由は、\textbf{1 個の物理誤りが広がる範囲がインデックスをまたがない}ことにあります。
+上のコードで CX が結んでいるのは常に「制御パッチの量子ビット $i$」と「標的パッチの量子ビット $i$」だけです。
+そのため、CX 直前に制御パッチの量子ビット $i$ に $X$ 誤りが 1 個あっても、CX を通過した後は各ブロックの同じ位置 $i$ に高々 1 個ずつ残り、同一ブロック内の別インデックス $j\neq i$ へは広がりません。
+したがって 1 個の故障が各符号ブロック内で多重量誤りへ増殖することを防げます。これはトランスバーサル操作が持つブロック単位の誤り伝播抑制です\cite{eastin2009transversal}。
+
+ただし、この局所的な結びつきは安定化子そのものにも及びます。
+CX は制御パッチの $X$ 型安定化子を「制御の同じ安定化子 $\times$ 標的の同じ安定化子」へ、標的パッチの $Z$ 型安定化子を「標的の同じ安定化子 $\times$ 制御の同じ安定化子」へ広げます。
+\begin{equation}
+  S_X^C \longmapsto S_X^C \cdot S_X^T, \qquad S_Z^T \longmapsto S_Z^C \cdot S_Z^T
+\end{equation}
+そのため、CX を挟んだ直後のラウンドでは、単純に「同じ安定化子を前ラウンドと比較する」だけでは検出器がノイズなしでも反応してしまいます。
+\texttt{transversal\_cnot.py} はこれを\textbf{クロス境界補正}として、CX 直後のラウンドに限り相手パッチの前ラウンド値を XOR で混ぜることで解決しています。
+
+\begin{lstlisting}[caption={CX 直後ラウンドのクロス境界補正（src/stages/01\_mpp/src/ftqc/transversal\_cnot.py）}]
+        for si, (typ, sup) in enumerate(STABS):
+            for patch in ('c', 't'):
+                tg = [rr(ridx[(r, patch, si)]), rr(ridx[(r - 1, patch, si)])]
+                if remap and boundary:
+                    if typ == "X" and patch == 'c':       # S_X^C -> S_X^C·S_X^T
+                        tg.append(rr(ridx[(r - 1, 't', si)]))
+                    if typ == "Z" and patch == 't':       # S_Z^T -> S_Z^C·S_Z^T
+                        tg.append(rr(ridx[(r - 1, 'c', si)]))
+                c.append("DETECTOR", tg)
+\end{lstlisting}
+
+\texttt{verify\_boundary\_remap}（\texttt{[C]}）は、この補正の有無で「ノイズなしのとき検出器が全部 0 になるかどうか」が実際に変わることを確認しています。
+補正を外すと、ノイズを入れなくても検出器が反応してしまい、これは第8章で導入する合否基準の第一項目（ノイズなしで gauge 検出器ゼロ）に反する動作です。
+つまり、クロス境界補正は「見た目の後付け」ではなく、トランスバーサル CX が安定化子を広げるという事実から必然的に要求される補正です。
+
+\section{生成子追跡}\label{sec:gen_tracking}
+
+\subsection{Pauli 文字列の共役}\label{subsec:conjugation}
+
+前節のクロス境界補正は、CX という 1 種類のゲートに対して手で導いた場当たり的な規則でした。
+ゲートの種類が増える（H を含める）と、この場当たり的な補正をゲートごとに書き直す必要が出てきます。
+\codepath{src/stages/01_mpp/src/ftqc/logical_clifford_ftqc.py} の \texttt{compile\_ft} は、実際にこの限界にぶつかっています。
+
+\begin{lstlisting}[caption={H を含む回路のフォールトトレラント版を拒否するガード（src/stages/01\_mpp/src/ftqc/logical\_clifford\_ftqc.py）}]
+    def compile_ft(self, layers, rounds_tail=2, noise=True):
+        if any(name == "H" for layer in layers for (name, _, _) in layer):
+            raise ValueError("compile_ft は {Pauli, CNOT} 専用です (H のデコードは双対格子検出器が必要)。")
+\end{lstlisting}
+
+\texttt{logical\_clifford\_ftqc.py} は前身の実装であり、論理値の正しさ検証（\texttt{compile\_logical\_only} / \texttt{validate}）は H を含む任意の Clifford 回路に対応しますが、検出器つきのフォールトトレラント版（\texttt{compile\_ft}）は \{Pauli, CNOT\} に限定されています。
+\codepath{src/stages/01_mpp/src/ftqc/clifford_ft_full.py} はこの限界を、\textbf{生成子追跡}によって取り除きます。
+考え方は、パッチ固有の検出器を後から張り替えるのではなく、\textbf{安定化子生成子そのものを Pauli 文字列として保持し、各トランスバーサルゲートで共役変換する}というものです。
+
+\begin{lstlisting}[caption={生成子を表す Pauli 文字列とその共役変換（src/stages/01\_mpp/src/ftqc/clifford\_ft\_full.py）}]
+class PauliStr:
+    __slots__ = ("x", "z")
+
+    def __init__(self, M):
+        self.x = np.zeros(M, np.int8)
+        self.z = np.zeros(M, np.int8)
+
+    def conj_H(self, qubits):
+        for t in qubits:
+            self.x[t], self.z[t] = self.z[t], self.x[t]
+
+    def conj_CX(self, a, b):           # 制御 a, 標的 b
+        self.x[b] ^= self.x[a]
+        self.z[a] ^= self.z[b]
+\end{lstlisting}
+
+\texttt{PauliStr} は、全パッチ全データ量子ビットに渡る 1 個の Pauli 演算子を、量子ビットごとの $X$ 成分・$Z$ 成分のビット配列 \texttt{x}, \texttt{z} として表現します（$X$ 成分と $Z$ 成分が両方立っている量子ビットは $Y$ を意味し、$Y=\ii XZ$ です）。
+\texttt{conj\_H} は対象量子ビットで $X$ 成分と $Z$ 成分を入れ替えるだけで、9.1 節で述べた「物理 H が $X\leftrightarrow Z$ を入れ替える」という事実そのものです。
+\texttt{conj\_CX} は、制御 \texttt{a} の $X$ 成分を標的 \texttt{b} の $X$ 成分へ XOR し、標的 \texttt{b} の $Z$ 成分を制御 \texttt{a} の $Z$ 成分へ XOR します。
+これは「$X$ は制御から標的へ、$Z$ は標的から制御へ伝播する」という CNOT の共役関係を、生成子 1 個ずつに対して機械的に適用したものです。
+
+\subsection{\texttt{CliffordFTCompiler} の骨格}\label{subsec:compiler}
+
+\texttt{CliffordFTCompiler}（\codepath{src/stages/01_mpp/src/ftqc/clifford_ft_full.py}）は、各パッチの安定化子生成子と論理 $Z_L$ 生成子を \texttt{PauliStr} として初期化し、回路をゲート単位で走査しながら、物理ゲートを回路に積むと同時に、保持しているすべての生成子を対応する \texttt{conj\_H} / \texttt{conj\_CX} で更新します。
+
+\begin{lstlisting}[caption={生成子の初期化とゲート適用時の共役更新（src/stages/01\_mpp/src/ftqc/clifford\_ft\_full.py）}]
+    def _init_generators(self):
+        M = NDATA * self.N
+        gens = []  # [patch, stab_idx, PauliStr, init_type]
+        for q in range(self.N):
+            base = q * NDATA
+            for si, (typ, sup) in enumerate(STABS):
+                g = PauliStr(M)
+                for s in sup:
+                    (g.x if typ == "X" else g.z)[base + s] = 1
+                gens.append([q, si, g, typ])
+\end{lstlisting}
+
+各ラウンドでは、そのラウンド開始時点での「現在の」生成子を \texttt{mpp\_targets()} で MPP の測定対象に変換して測ります。
+物理ゲートを 1 つ適用するたびに \texttt{conj\_H} / \texttt{conj\_CX} で全生成子を更新するので、次のラウンドで測る生成子は自動的に「ゲートを通過した後の正しい生成子」になっています。
+末尾では、更新済みの論理 $Z_L$ 生成子（\texttt{logz}）を MPP で測って観測量とします。9.1 節の「論理 H が $X_L, Z_L$ を入れ替える」「論理 CNOT が $X_L^C, Z_L^T$ を広げる」という関係は、この \texttt{logz} の更新としてまったく同じコードで扱われます。
+
+\subsection{一様検出器則}\label{subsec:uniform_detector}
+
+生成子追跡の効果は、検出器の作り方に集約されます。
+\texttt{compile} が置く検出器は、ゲートの種類に関係なく「同じ生成子インデックスをラウンド $r$ とラウンド $r-1$ で比較する」というただ 1 種類の規則だけです。
+
+\begin{lstlisting}[caption={ゲート依存の分岐を持たない一様検出器規則（src/stages/01\_mpp/src/ftqc/clifford\_ft\_full.py）}]
+        for gi, (_, _, _, typ) in enumerate(gens):
+            if typ == "Z":                      # round 0: Z 型は決定論的
+                c.append("DETECTOR", [rr(ridx[(0, gi)])])
+        for r in range(1, R):                   # 一様規則: 同インデックス連続比較
+            for gi in range(len(gens)):
+                c.append("DETECTOR", [rr(ridx[(r, gi)]), rr(ridx[(r - 1, gi)])])
+\end{lstlisting}
+
+9.1 節のクロス境界補正が「CX 直後だけ相手パッチの値を混ぜる」という特別扱いだったのに対し、ここでは特別扱いが 1 つもありません。
+理由は単純です。ラウンド $r$ で測る生成子は、ラウンド $r-1$ の生成子にそのラウンドで適用したゲート $G$ を共役させたもの ($G$ を挟んでも固有値は変わらない) なので、同じインデックスの生成子を比較すれば、ノイズがない限り常に同じ測定値になります。
+ゲートが CX であっても H であっても、この論法は変わりません。つまり生成子追跡は、9.1 節で見た「ゲートごとに検出器を張り替える」という手間を、「測る対象そのものを更新する」ことで一様な規則に置き換えていると言えます。
+
+\section{トランスバーサル CNOT の検証}\label{sec:tcnot_verify}
+
+\subsection{MPP 版の限界と利点}\label{subsec:limits}
+
+\texttt{transversal\_cnot.py} は、\{Pauli, CNOT\} という限られたゲート集合に対してであれば、生成子追跡を使わずに手で書いた検出器規則でも正しく動くことを、4 段階で検証しています。
+
+\begin{lstlisting}[caption={4 段階の検証（src/stages/01\_mpp/src/ftqc/transversal\_cnot.py の main）}]
+    print("\n[A] 論理作用の代数確認 (Tableau)")
+    a = verify_logical_action()
+
+    print("\n[B] 論理 CNOT 真理値表 (ノイズなし)")
+    b = verify_truth_table()
+
+    print("\n[C] クロス境界 検出器補正の必要性")
+    c = verify_boundary_remap()
+
+    print("\n[D] ノイズあり実行 + MWPM デコード")
+\end{lstlisting}
+
+\texttt{[A]} は Stim の \texttt{Tableau} で $X_L^C \to X_L^C X_L^T$ などの論理作用を代数的に確認し、\texttt{[B]} はノイズなしで両パッチを Z 測定し、CNOT の真理値表（制御は不変、標的は制御 XOR 標的）が実際に成り立つことを確認します。
+\texttt{[C]} は前節のクロス境界補正の必要性を、\texttt{[D]} は物理誤り率 $p$ を振ってノイズ付き回路を \texttt{compile\_detector\_sampler} でサンプリングし、\texttt{detector\_error\_model} から作った PyMatching で復号したときの論理エラー率を確認します。
+
+利点は、MPP バックボーンなので\textbf{アンシラの配置やシンドローム抽出回路のスケジューリングを考える必要が一切ない}ことです。安定化子はすべて \texttt{MPP} 命令 1 行で直接測っており、後の第 IV 部（回路レベル、\codepath{src/stages/02_circuit_level/src/ftqc/}）で必要になる CX スケジュールや hook 誤りは、この段階では登場しません。
+限界は、この検証がゲート集合 \{Pauli, CNOT\} に留まっていることです。H を含めると 9.2 節で見たとおり検出器規則を作り直す必要があり、\texttt{clifford\_ft\_full.py} の生成子追跡がその解決策になります。S は、9.1 節で述べたとおりトランスバーサルに実装できないため、\texttt{transversal\_cnot.py} の対象にそもそも含まれません。
+
+\subsection{第16章 LS-CNOT への対比予告}\label{subsec:ls_preview}
+
+トランスバーサル CNOT は、対応するデータ量子ビットの間に直接 CX を当てるという意味で理解しやすく、検証も 9.3.1 節のように直接的です。
+しかし、これは 2 枚のパッチの\textbf{すべての}データ量子ビットが 1 対 1 で物理的に隣接している（あるいは配線できる）ことを前提にしています。
+パッチの大きさが増えたり、パッチ同士が境界の一部でしか接していない配置では、この前提は成り立ちません。
+
+第16章では、パッチ同士を境界で\textbf{融合}し、結合的な多体パウリ測定（$M_{ZZ}, M_{XX}$）だけで論理 CNOT を実現する\textbf{格子手術 CNOT（LS-CNOT）}を扱います。
+トランスバーサル CNOT が「全データ量子ビットを一度に結ぶ」方式であるのに対し、格子手術 CNOT は「境界だけを一時的に結合し、フレーム補正観測量で読み出す」方式であり、必要な物理接続がずっと少なくて済みます。
+本章のトランスバーサル CNOT は、この対比のための基準点として位置づけられます。
+
+\section{やること・スコープ外}\label{ch9:scope}
+
+\subsection{やること}
+
+\begin{itemize}
+  \item トランスバーサル操作（H, CNOT）が誤り耐性を持つ理由を、物理誤りの伝播範囲から説明する。
+  \item トランスバーサル CX が安定化子を広げること、それに対するクロス境界補正の必要性を示す。
+  \item 生成子追跡により、検出器規則をゲート依存の場当たり的な補正から一様な規則へ一般化する。
+  \item MPP バックボーンでのトランスバーサル CNOT の検証（代数・真理値表・検出器・デコード）を示す。
+\end{itemize}
+
+\subsection{スコープ外}
+
+\begin{itemize}
+  \item 回路レベルのシンドローム抽出（アンシラ配置・CX スケジュール・hook 誤り）は第 IV 部（第14章〜）で扱う。
+  \item 格子手術による論理 CNOT・S の具体的な実装は第10章以降で扱う。
+  \item S の $\ket{Y_L}$ 補助状態を使う測定注入は第11章、非 Clifford な T の魔法状態注入は第12章以降で扱う。
+\end{itemize}
+
+\section{合否基準での検証}\label{sec:acceptance}
+
+第8章で導入する合否基準のうち、本章の範囲で確認できるのは次の 2 点です。
+
+\begin{itemize}
+  \item \textbf{ノイズなし決定論性}：\texttt{verify\_boundary\_remap} が示すとおり、クロス境界補正込みのトランスバーサル CNOT 回路は \texttt{noise=False} のとき検出器が常に全て 0 になります。9.2.3 節の一様検出器則も、\texttt{clifford\_ft\_full.py} の \texttt{demo} 内の \texttt{[B]} で同様に確認されています。これは合否基準の第一項目（ノイズなしで gauge 検出器ゼロ）を、CNOT だけでなく H を含む回路でも満たすことを意味します。
+  \item \textbf{ノイズあり残差サンプリング}：\codeinline{CliffordFTCompiler.decode} は \codeinline{compile_detector_sampler} でショットをサンプリングし、\codeinline{detector_error_model(decompose_errors=True)} を MWPM（PyMatching）に渡して復号します。graphlike に分解できない場合（\texttt{ValueError}）は BP+OSD（\texttt{stimbposd.BPOSD}）へ自動的に切り替えます。
+\end{itemize}
+
+\begin{lstlisting}[caption={MWPM を試し、非 graphlike なら BP+OSD に切り替える復号（src/stages/01\_mpp/src/ftqc/clifford\_ft\_full.py）}]
+    def decode(self, circ, shots=40000):
+        """MWPM を試し、非 graphlike なら BP+OSD (ハイパーグラフ) にフォールバック。"""
+        det, obs = circ.compile_detector_sampler().sample(shots, separate_observables=True)
+        try:
+            dem = circ.detector_error_model(decompose_errors=True)
+            matcher = pymatching.Matching.from_detector_error_model(dem)
+            pred = matcher.decode_batch(det)
+            decoder = "MWPM"
+        except ValueError:
+            from stimbposd import BPOSD
+            dem = circ.detector_error_model(decompose_errors=False)
+            pred = BPOSD(dem, max_bp_iters=40).decode_batch(det)
+            decoder = "BP+OSD"
+        return (obs ^ pred).mean(axis=0), obs.mean(axis=0), decoder
+\end{lstlisting}
+
+一方で、次の 2 点は本章の段階ではまだ確認していません。\textbf{後段で強化される点}として明記します。
+
+\begin{itemize}
+  \item \codeinline{shortest_graphlike_error} が符号距離 $d$ と一致するかどうかの機械的な確認は、第8章で基準を定義した後、格子手術（第10章〜）や回路レベル実装（第14章〜）で行います。本章のトランスバーサル CNOT・生成子追跡はいずれも \codeinline{search_for_undetectable_logical_errors} による距離検証を行っていません。
+  \item \texttt{seed} を固定したときの測定値の再現性、および \texttt{decode\_shell} が \codeinline{allow_gauge_detectors} を使わずに動作することは、第 IV 部の Shell API（第19章）で導入する基準です。本章のコードは Shell API 化されていないため、この基準の対象にはまだ入りません。
+\end{itemize}
+
+\section{まとめ}\label{ch9:summary}
+
+\begin{itemize}
+  \item トランスバーサル操作は、各局所成分が同じ符号ブロック内の複数量子ビットを結合しないように分解できる操作であり、1 個の物理誤りが各ブロック内で多重量誤りへ広がらないことが誤り耐性の根拠になります。
+  \item 本章の回転表面符号規約では CNOT と H をトランスバーサルに実装できますが、S は同じ方法では実装できず、コード変形や $\ket{Y_L}$ 補助状態を使う測定注入が必要です。
+  \item トランスバーサル CX は安定化子も広げるため、CX 直後のラウンドにはクロス境界補正が必要であり、これはゲートごとに手で導く必要のある場当たり的な規則でした。
+  \item 生成子追跡は、安定化子生成子を Pauli 文字列として保持し各ゲートで共役変換することで、検出器規則を「同じ生成子の連続ラウンド比較」という一様な規則に置き換えます。
+  \item \texttt{CliffordFTCompiler} はこの一様規則により \{Pauli, H, CNOT\} をノイズなし決定論性を保ったままコンパイルし、MWPM もしくは BP+OSD でデコードできます。
+\end{itemize}
+
+本章で確認した合否基準は、ノイズなし決定論性とデコードの動作までであり、\texttt{shortest\_graphlike\_error} による距離検証や Shell API の基準は後段で強化されます。
+次章では、本章でトランスバーサルに実現できなかった論理 S を含む論理演算を、パッチ同士の境界を融合する\textbf{格子手術}という枠組みで扱います。
+
+\begin{exercise}
+  \begin{enumerate}
+    \item トランスバーサル CX が安定化子を $S_X^C \mapsto S_X^C \cdot S_X^T$, $S_Z^T \mapsto S_Z^C \cdot S_Z^T$ のように広げることを踏まえ、なぜ $Z$ 型安定化子には制御側からの寄与を混ぜず、$X$ 型安定化子には標的側からの寄与を混ぜないのか（9.1.2 節の式とコードを参照して）説明しなさい。
+    \item \texttt{PauliStr.conj\_H} と \texttt{conj\_CX} を使い、$X_0$ という 1 量子ビットの生成子に対して「H(0); CX(0,1)」を順に共役変換した結果の Pauli 文字列を手で求めなさい。
+    \item \texttt{compile\_ft}（\texttt{logical\_clifford\_ftqc.py}）が H を含む回路に対して \texttt{ValueError} を出す理由を、生成子追跡を使わない検出器規則の限界という観点から説明しなさい。
+    \item トランスバーサル CNOT と格子手術 CNOT（第16章で扱う）を、必要な物理的接続の範囲という観点で比較し、パッチが大きくなるとトランスバーサル CNOT がなぜ実用上不利になるかを論じなさい。
+  \end{enumerate}
+\end{exercise}

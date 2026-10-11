@@ -1,0 +1,56 @@
+id = "01"
+name = "mpp"
+display_name = "Stage 01: MPP Only"
+description = "MPP だけで動く版（現象論MPP、論理レベルLS、Tの2経路、最小ハイブリッドランタイム）"
+logical_chapters = [6, 7, 8, 9, 10, 11, 12, 13]
+current_chapters = [6, 7, 8, 9, 10, 11, 12, 13]
+current_files = [
+  "book/chapter/6.tex",
+  "book/chapter/7.tex",
+  "book/chapter/8.tex",
+  "book/chapter/9.tex",
+  "book/chapter/10.tex",
+  "book/chapter/11.tex",
+  "book/chapter/12.tex",
+  "book/chapter/13.tex"
+]
+source_root = "src/ftqc"
+inherits = ""
+
+added = [
+  "__init__.py",
+  "surface_patch.py",
+  "clifford_ft_full.py",
+  "ftqc_toy.py",
+  "transversal_cnot.py",
+  "logical_clifford_ftqc.py",
+  "geom_lattice_surgery.py",
+  "lattice_surgery.py",
+  "ls_handoff_shells.py",
+  "t_gate.py",
+  "qpd_backend.py",
+  "hybrid_ftqc_runtime.py",
+  "viz/__init__.py",
+  "viz/ftqc_mapping_visualizer.py",
+  "viz/stim_timeline_visualizer.py",
+  "viz/t_branch_visualizer.py"
+]
+changed = []
+unchanged = []
+removed = []
+
+forbidden_import_prefixes = [
+  "ref.",
+  "ftqc.circuit_level_merge",
+  "ftqc.ls_cnot_ft",
+  "ftqc.circuit_level_ls",
+  "ftqc.core.surface_code_d",
+  "ftqc.runtime.symplectic_frame"
+]
+
+acceptance_tests = [
+  "tests/test_imports.py",
+  "tests/test_smoke.py",
+  "tests/test_boundaries.py",
+  "tests/test_examples.py"
+]

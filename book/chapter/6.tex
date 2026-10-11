@@ -1,0 +1,311 @@
+% Stage: 01 入口 ／ 説明用コード: Stim / src/stages/01\_mpp/src/ftqc
+\chapter{Stim の使いかた}\label{ch:stim}
+
+\begin{chaptergoal}
+  \begin{itemize}
+  \item Stim の \texttt{Circuit} と \texttt{TableauSimulator} を使い、量子回路を組み立ててノイズなしで動作確認できるようになります。
+  \item \texttt{DETECTOR}・\texttt{OBSERVABLE\_INCLUDE}・測定レコードの意味を理解し、検出器が「決定論的であるべき量」であることを説明できます。
+  \item detector sampler と生のサンプラの違いを理解し、真理値表検証とデコードのそれぞれに適切な方を選べます。
+  \item \texttt{detector\_error\_model} の役割と \texttt{allow\_gauge\_detectors} の落とし穴を理解し、本書がこれを使わない理由を説明できます。
+  \item PyMatching・BP+OSD・qulacs がハイブリッド型シミュレータの中でどの役割を担うかを把握します。
+  \end{itemize}
+\end{chaptergoal}
+
+第5章では、符号サイクルを周期的に繰り返してシンドロームを取得するという時間軸上の構造を確認しました。
+本章では、その構造を実際にプログラムとして書き下すための道具である Stim（対象バージョン 1.16.0）を扱います\cite{gidney2021stim, stim2026doc}。
+Stim はスタビライザ回路を高速にサンプリングできるシミュレータであり、本書の主エンジンとして第II部以降のほぼ全ての章で使われます。
+本章の目的は Stim の全機能を網羅することではなく、\codepath{src/stages/01_mpp/src/ftqc/} のコードを読み解くために最低限必要な API（回路構築、検出器、観測量、サンプラ、DEM、デコーダ連携）を実装可能な粒度で押さえることです。
+
+\begin{notebox}
+  Stage: \textbf{01}。
+  説明用コードは Stim の最小例および \codepath{src/stages/01_mpp/src/ftqc/} を用います。
+  本章のコード引用はすべて \codepath{src/stages/01_mpp/src/ftqc/} 内の既存ファイルから採ったものであり、架空の関数名は用いません。
+\end{notebox}
+
+\section{インストールと基本}\label{sec:stim_basics}
+
+\subsection{インストール}
+
+本書は Python の実行に uv 環境を使います。導入手順の詳細は付録\ref{app:setup}に譲ります。Stage 01 の依存関係とロック情報は \codepath{src/stages/01_mpp/pyproject.toml} と \codepath{src/stages/01_mpp/uv.lock} で管理します。
+
+\begin{lstlisting}[caption={pyproject.toml の依存関係の記法（抜粋）}]
+[project]
+dependencies = ["numpy", "scipy", "matplotlib", "stim", "pymatching", "qulacs"]
+\end{lstlisting}
+
+\texttt{stim} が本章の主役、\texttt{pymatching} と \texttt{stimbposd} は6.5節のデコーダ、\texttt{qulacs} は非 Clifford の状態ベクトル計算に使います。
+\texttt{qulacs} はオプショナルな依存であり、無い場合は NumPy 状態ベクトルにフォールバックする実装が \codepath{src/stages/01_mpp/src/ftqc/hybrid_ftqc_runtime.py} にあります（13章で詳しく扱います）。
+
+\subsection{Circuit}
+
+\texttt{stim.Circuit} は量子回路を表すオブジェクトで、\texttt{append} メソッドでゲート・測定・ノイズ命令を1つずつ追加していきます。
+
+\begin{lstlisting}[language=Python, caption={最小のベル状態回路}]
+import stim
+
+c = stim.Circuit()
+c.append("H", [0])
+c.append("CX", [0, 1])
+c.append("M", [0, 1])
+print(c)
+\end{lstlisting}
+
+\codepath{src/stages/01_mpp/src/ftqc/} の実装では、回路を1命令ずつ手で組み立てる代わりに \texttt{stim.Circuit.generated} で組み込みの符号ファミリを生成することも多く使われます。
+たとえば \codepath{src/stages/01_mpp/src/ftqc/ftqc_toy.py} の \texttt{stage1\_qec} 関数は次のように rotated surface code のメモリ実験回路を得ています。
+
+\begin{lstlisting}[language=Python, caption={src/stages/01\_mpp/src/ftqc/ftqc\_toy.py の抜粋（stage1\_qec 内）}]
+circuit = stim.Circuit.generated(
+    "surface_code:rotated_memory_z",
+    distance=distance,
+    rounds=rounds,
+    after_clifford_depolarization=p,      # 2量子ビットゲート後の脱分極
+    before_measure_flip_probability=p,    # 測定エラー
+)
+\end{lstlisting}
+
+一方、\codepath{src/stages/01_mpp/src/ftqc/transversal_cnot.py} や \texttt{clifford\_ft\_full.py} のように、検出器やスタビライザを自前で管理したい場合は \texttt{MPP}（multi-Pauli product measurement、多体 Pauli 測定）命令で回路を手組みします。
+\texttt{MPP} で複数量子ビットにわたる Pauli 積 $X_0 X_1$ や $Z_1Z_2$ を1回の測定で読み出せるため、表面符号のスタビライザ測定を簡潔に書けます（第7章で詳しく扱います）。
+
+\subsection{TableauSimulator}
+
+ノイズを含まない Clifford 回路を厳密に追跡したい場合は \texttt{stim.TableauSimulator} を使います。
+\codepath{src/stages/01_mpp/src/ftqc/hybrid_ftqc_runtime.py} の \texttt{StimCliffordBackend} は、ハイブリッドランタイムの Clifford 専用バックエンドとしてこれを利用しています。
+
+\begin{lstlisting}[language=Python, caption={src/stages/01\_mpp/src/ftqc/hybrid\_ftqc\_runtime.py の抜粋（StimCliffordBackend）}]
+self.sim = stim.TableauSimulator()
+...
+circ = self._stim.Circuit()
+circ.append(stim_name, [int(t) for t in targets])
+if hasattr(self.sim, "do"):
+    self.sim.do(circ)
+\end{lstlisting}
+
+\texttt{TableauSimulator} は状態ベクトルを持たずスタビライザ表（タブロー）だけを更新するため、量子ビット数が増えても Clifford 演算であれば高速に動きます。
+非 Clifford な T ゲートを扱う際にはこの表現では追えないため、6.5節で述べる状態ベクトルバックエンド（qulacs／NumPy）に処理を渡します。
+
+\section{DETECTOR・OBSERVABLE\_INCLUDE・レコード}\label{sec:detectors_obs}
+
+\subsection{測定レコード}
+
+Stim は \texttt{M}（単一量子ビット測定）や \texttt{MPP}（多体 Pauli 測定）を実行するたびに、その結果を\textbf{測定レコード}という連番付きの列に積み重ねます。
+\texttt{DETECTOR} や \texttt{OBSERVABLE\_INCLUDE} は、このレコードのうち「どの測定結果を XOR するか」を \texttt{stim.target\_rec} で指定します。
+\texttt{target\_rec} の引数は現在位置からの負の相対オフセットで、直前の測定が \texttt{-1}、その1つ前が \texttt{-2} という具合です。
+絶対インデックス \texttt{a} と現在の測定総数 \texttt{mc} から相対オフセットへ変換する次のパターンが \codepath{src/stages/01_mpp/src/ftqc/} のほぼ全ファイルで繰り返し使われます。
+
+\begin{lstlisting}[language=Python, caption={絶対インデックス→相対オフセット変換（各ファイル共通の慣用句）}]
+rr = lambda a: stim.target_rec(a - mc)
+\end{lstlisting}
+
+\subsection{検出器の意味}
+
+\texttt{DETECTOR} は、指定した測定レコードたちの XOR が\textbf{ノイズがなければ常に同じ値（通常は0）になる}という主張を Stim に登録する命令です。
+言い換えると、検出器は「回路の理想的な振る舞いから決定論的に求まる量」でなければなりません。
+ノイズが入ったときに、この決定論的な値からずれた（つまり検出器が1になった）ことをもって「どこかで誤りが起きた」と判定するのがシンドローム測定の実装そのものです。
+
+第9章で扱う生成子追跡（generator tracking）の実装 \codepath{src/stages/01_mpp/src/ftqc/clifford_ft_full.py} では、この決定論性を「同じインデックスの生成子を連続する2ラウンドで比較する」という一様な規則だけで実現しています。
+
+\begin{lstlisting}[language=Python, caption={src/stages/01\_mpp/src/ftqc/clifford\_ft\_full.py の抜粋（DETECTOR の一様規則）}]
+for gi, (_, _, _, typ) in enumerate(gens):
+    if typ == "Z":                      # round 0: Z 型は決定論的
+        c.append("DETECTOR", [rr(ridx[(0, gi)])])
+for r in range(1, R):                   # 一様規則: 同インデックス連続比較
+    for gi in range(len(gens)):
+        c.append("DETECTOR", [rr(ridx[(r, gi)]), rr(ridx[(r - 1, gi)])])
+\end{lstlisting}
+
+ゲート（H や CNOT）を挟んでも、生成子そのものを共役変換して追いかけているため、round $r$ の生成子は round $r-1$ の生成子に一致し、ノイズなしでは検出器が恒等的に0になります。
+これは「ゲートごとに検出器の張り替えルールを場当たり的に書く」設計とは対照的で、6.4節で述べる gauge 検出器を生まないための鍵になります。
+
+\subsection{論理オブザーバブル}
+
+\texttt{OBSERVABLE\_INCLUDE} は、測定レコードの XOR を「論理量子ビットの読み出し値」として登録する命令です。
+デコーダの予測とこの観測量の理想値を比較した差が論理エラーになります。
+\codepath{src/stages/01_mpp/src/ftqc/transversal_cnot.py} では、制御・標的パッチそれぞれの論理 $Z_L$ を次のように登録しています。
+
+\begin{lstlisting}[language=Python, caption={src/stages/01\_mpp/src/ftqc/transversal\_cnot.py の抜粋}]
+c.append("OBSERVABLE_INCLUDE", [rr(drec[('c', q)]) for q in ZL], 0)
+c.append("OBSERVABLE_INCLUDE", [rr(drec[('t', q)]) for q in ZL], 1)
+\end{lstlisting}
+
+\texttt{OBSERVABLE\_INCLUDE} の第2引数（ここでは \texttt{0}, \texttt{1}）は観測量番号で、複数の論理量子ビットを1つの回路の中で別々に追跡するために使われます。
+
+\section{detector sampler と生のサンプラ}\label{sec:samplers}
+
+Stim の回路から結果を取り出す方法には、目的の異なる2種類のサンプラがあります。
+
+\begin{itemize}
+  \item \textbf{生のサンプラ}（\texttt{circuit.compile\_sampler()}）：すべての測定レコードをそのままビット列として返します。デコード前の「論理値そのもの」を見たいとき、すなわち真理値表検証や参照分布との比較に向いています。
+  \item \textbf{detector sampler}（\texttt{circuit.compile\_detector\_sampler()}）：検出器の値（シンドローム）と観測量の値を別々に返します。デコード・論理エラー率の評価に向いています。
+\end{itemize}
+
+\codepath{src/stages/01_mpp/src/ftqc/transversal_cnot.py} の真理値表検証は、ノイズを切った回路の生のサンプルを使って「制御ビットは不変、標的ビットは XOR」という代数的な性質を確認しています。
+
+\begin{lstlisting}[language=Python, caption={src/stages/01\_mpp/src/ftqc/transversal\_cnot.py の抜粋（verify\_truth\_table）}]
+circ, nm = build_cnot_circuit(noise=False, control_one=c1, target_one=t1)
+ref = np.array(circ.without_noise().reference_sample(), int)
+cz = _logical_z(ref, nm, 'c')
+tz = _logical_z(ref, nm, 't')
+\end{lstlisting}
+
+\texttt{without\_noise()} はノイズ命令を取り除いた回路を返し、\texttt{reference\_sample()} はその決定論的な1サンプルを取得します。
+一方、ノイズを入れたままデコードして論理エラー率を測る場面では \texttt{compile\_detector\_sampler} を使います。
+
+\begin{lstlisting}[language=Python, caption={src/stages/01\_mpp/src/ftqc/transversal\_cnot.py の抜粋（decode）}]
+def decode(circ, shots=40000):
+    det, obs = circ.compile_detector_sampler().sample(shots, separate_observables=True)
+    dem = circ.detector_error_model(decompose_errors=True)
+    matcher = pymatching.Matching.from_detector_error_model(dem)
+    pred = matcher.decode_batch(det)
+    res = obs ^ pred
+    return res[:, 0].mean(), res[:, 1].mean()
+\end{lstlisting}
+
+\texttt{separate\_observables=True} を指定すると、戻り値が検出器ビット \texttt{det} と観測量ビット \texttt{obs} に分かれます。
+\texttt{det} をデコーダに渡して予測 \texttt{pred} を得て、\verb|obs ^ pred| が0でなければ論理エラーが起きたと判定します。
+この構図（サンプル → DEM → デコーダ → \texttt{obs} との比較）は、本書の全ての Stage で繰り返し登場する基本パターンです。
+
+\section{detector\_error\_model と allow\_gauge\_detectors}\label{sec:dem_gauge}
+
+\subsection{DEM の役割}
+
+\texttt{circuit.detector\_error\_model()} は、回路中のノイズ命令1つ1つを「どの検出器とどの観測量を反転させるか」という誤りメカニズムの集合（detector error model、DEM）へ変換します。
+これにより、量子回路のデコードを古典的なグラフ上の最小重みマッチング問題（あるいはより一般のデコード問題）に落とし込めます。
+
+\texttt{decompose\_errors} 引数は、DEM をどこまで単純化するかを指定します。
+
+\begin{itemize}
+  \item \texttt{decompose\_errors=True}：各誤りメカニズムを、検出器を2つだけ反転させる素なエッジ（graphlike）に分解しようとします。分解に成功すれば PyMatching（MWPM）が使えます。
+  \item \texttt{decompose\_errors=False}：分解を行わず、3つ以上の検出器を同時に反転させるハイパーエッジも含めた生の DEM を返します。graphlike に分解できない回路（H を含む Clifford など）では BP+OSD にこちらを渡します。
+\end{itemize}
+
+\codepath{src/stages/01_mpp/src/ftqc/clifford_ft_full.py} の \texttt{decode} メソッドは、まず graphlike 分解を試み、失敗したら（\texttt{ValueError}）BP+OSD にフォールバックするという構成になっています（詳細は6.5節）。
+
+\subsection{gauge 検出器とその落とし穴}
+
+DETECTOR を組み立てる際、指定した測定レコードの XOR が実は理想回路でも決定論的に定まらない（測定ごとに0と1のどちらも出る）ことがあります。
+このような検出器を\textbf{gauge 検出器}と呼びます。
+gauge 検出器が生じる典型的な原因は、検出器の張り替えルールの取りこぼしです。
+たとえば \codepath{src/stages/01_mpp/src/ftqc/transversal_cnot.py} では、transversal CX の直後にどちらのパッチのどの安定化子が広がるかを踏まえて前ラウンドの測定値をクロス境界補正として混ぜ込む必要があります。
+
+\begin{lstlisting}[language=Python, caption={src/stages/01\_mpp/src/ftqc/transversal\_cnot.py の抜粋（クロス境界補正）}]
+if remap and boundary:
+    if typ == "X" and patch == 'c':       # S_X^C -> S_X^C·S_X^T
+        tg.append(rr(ridx[(r - 1, 't', si)]))
+    if typ == "Z" and patch == 't':       # S_Z^T -> S_Z^C·S_Z^T
+        tg.append(rr(ridx[(r - 1, 'c', si)]))
+\end{lstlisting}
+
+この補正の有無で検出器の決定論性が変わることを、同ファイルの \texttt{verify\_boundary\_remap} がノイズなし回路のサンプルだけで確認しています。
+
+\begin{lstlisting}[language=Python, caption={src/stages/01\_mpp/src/ftqc/transversal\_cnot.py の抜粋（verify\_boundary\_remap）}]
+def verify_boundary_remap():
+    res = {}
+    for rm in (False, True):
+        circ, _ = build_cnot_circuit(noise=False, control_one=True, remap=rm)
+        det, _ = circ.compile_detector_sampler().sample(100, separate_observables=True)
+        res[rm] = not det.any()
+    return (res[True] is True) and (res[False] is False)
+\end{lstlisting}
+
+補正あり（\texttt{remap=True}）ではノイズなし回路の検出器がすべて0になり、補正なし（\texttt{remap=False}）では0にならない検出器が現れます。
+これがまさに本章の合否基準「ノイズなし回路で検出器が全0になる例」であり、同時に「補正を忘れると gauge 検出器が生まれる」という失敗例そのものでもあります。
+
+Stim はこのような非決定論的な検出器を見つけると、\texttt{detector\_error\_model()} の呼び出しで例外を送出します。
+\texttt{allow\_gauge\_detectors=True} を渡すと、Stim は非決定論的な検出器を「情報を持たない gauge 自由度」として黙って畳み込み、エラーを出さずに DEM を作ってくれます。
+しかし、これは便利さと危険さが背中合わせのオプションです。
+本当に対称性から生じる gauge 自由度（例：安定化子の生成子に冗長性がある場合）と、上記の \texttt{remap=False} のような\textbf{実装の取りこぼし}を、\texttt{allow\_gauge\_detectors=True} は区別しません。
+バグによって生じた非決定論的検出器も、正当な gauge 自由度と同じように「情報なし」として握りつぶされてしまうため、デコーダは動くものの、検出器が本来検出できたはずの誤りを見逃したまま論理エラー率だけが（見かけ上）低く出る、という発見しづらい不具合を生みます。
+
+\begin{warningbox}
+  本書は \texttt{allow\_gauge\_detectors} を一切使いません。
+  \codepath{src/stages/01_mpp/src/ftqc/} の実装はすべて、検出器の張り替えルールを正しく設計することで gauge 検出器の数をゼロに保っています。
+  gauge 検出器が現れたら、それは「隠して進める」対象ではなく「検出器の構成ミスを直す」対象であるというのが本書の一貫した方針です。
+  この方針は Stage 02 以降（\codepath{src/stages/02_circuit_level/src/ftqc/}）でも踏襲され、\texttt{decode\_shell} のようなデコード用ヘルパー関数は \texttt{allow\_gauge\_detectors} を使わずに実装されています。
+\end{warningbox}
+
+なお、回路がどこまで誤りを見分けられるか（第3章の符号距離 $d$ の回路レベル版）を機械的に測る API として、Stim は \texttt{circuit.shortest\_graphlike\_error()} を提供しています。
+これは graphlike な DEM 上で「論理エラーを引き起こす最小個数の誤りメカニズムの組」を探索するもので、本書では第8章以降、\texttt{shortest\_graphlike\_error} の長さが符号距離 $d$ と一致することを合否基準の中心に据えます。
+Stage 01（\codepath{src/stages/01_mpp/src/ftqc/}）では現象論レベルの検証が中心のため、この API は次章以降で本格的に使う予告として触れる程度に留めます。
+
+\section{PyMatching・BP+OSD・qulacs}\label{sec:decoders}
+
+\subsection{MWPM（PyMatching）}
+
+graphlike な DEM（\texttt{decompose\_errors=True}）が得られる場合、本書は最小重みパーフェクトマッチング（MWPM）を実装した PyMatching を第一の選択肢として使います。
+
+\begin{lstlisting}[language=Python, caption={MWPM デコードの基本形（src/stages/01\_mpp/src/ftqc/ 各ファイル共通）}]
+dem = circ.detector_error_model(decompose_errors=True)
+matcher = pymatching.Matching.from_detector_error_model(dem)
+pred = matcher.decode_batch(det)
+\end{lstlisting}
+
+\texttt{Matching.from\_detector\_error\_model} は DEM のエッジ構造をそのままマッチング問題のグラフへ変換するため、DEM が graphlike であることが前提になります。
+
+\subsection{stimbposd フォールバック（BP+OSD）}
+
+H ゲートを含む Clifford 回路のように、誤りが3個以上の検出器を同時に反転させるハイパーエッジを持つ場合、DEM は graphlike に分解できず PyMatching は使えません。
+\codepath{src/stages/01_mpp/src/ftqc/clifford_ft_full.py} はこの場合を \texttt{ValueError} で捕捉し、\texttt{stimbposd} の BP+OSD デコーダにフォールバックします。
+
+\begin{lstlisting}[language=Python, caption={src/stages/01\_mpp/src/ftqc/clifford\_ft\_full.py の抜粋（decode メソッド）}]
+def decode(self, circ, shots=40000):
+    """MWPM を試し、非 graphlike なら BP+OSD (ハイパーグラフ) にフォールバック。"""
+    det, obs = circ.compile_detector_sampler().sample(shots, separate_observables=True)
+    try:
+        dem = circ.detector_error_model(decompose_errors=True)
+        matcher = pymatching.Matching.from_detector_error_model(dem)
+        pred = matcher.decode_batch(det)
+        decoder = "MWPM"
+    except ValueError:
+        from stimbposd import BPOSD
+        dem = circ.detector_error_model(decompose_errors=False)
+        pred = BPOSD(dem, max_bp_iters=40).decode_batch(det)
+        decoder = "BP+OSD"
+    return (obs ^ pred).mean(axis=0), obs.mean(axis=0), decoder
+\end{lstlisting}
+
+BP+OSD には \texttt{decompose\_errors=False} の生の（graphlike に分解していない）DEM を渡す点に注意してください。
+この「まず MWPM、ダメなら BP+OSD」という try/except の構造は \texttt{circuit\_level\_merge.py}・\texttt{geom\_lattice\_surgery.py}・\texttt{surface\_patch.py}・\texttt{ls\_handoff\_shells.py} など \codepath{src/stages/01_mpp/src/ftqc/} の多くのファイルで共通して使われている、本書のデコード連携における標準パターンです。
+
+\subsection{qulacs：非 Clifford の状態ベクトル}
+
+Stim はスタビライザ回路しか厳密に扱えないため、T ゲートのような非 Clifford 演算そのものは Stim の中では表現できません。
+本書のハイブリッドランタイム \codepath{src/stages/01_mpp/src/ftqc/hybrid_ftqc_runtime.py} は、Clifford chunk を Stim（\texttt{StimCliffordBackend}）に、T/S など非 Clifford のハンドオフを状態ベクトルバックエンドに振り分けます。
+
+\begin{lstlisting}[language=Python, caption={src/stages/01\_mpp/src/ftqc/hybrid\_ftqc\_runtime.py の抜粋（QulacsStateBackend）}]
+from qulacs import QuantumState
+self._QuantumState = QuantumState
+self.state = QuantumState(self.n)
+self.state.set_zero_state()
+\end{lstlisting}
+
+\texttt{qulacs} は密な状態ベクトルで任意のユニタリを厳密に適用できるため、T ゲートの正しさを検証する基準（グラウンドトゥルース）として使われます。
+\texttt{qulacs} が利用できない環境向けに、同じ役割を NumPy 密行列で果たす \texttt{NumpyStateBackend} も用意されており、\texttt{make\_backend(n, backend="auto")} が利用可能な方を自動的に選びます。
+Clifford 部分は Stim の \texttt{TableauSimulator} または DEM+PyMatching/BP+OSD のパイプラインが高速に処理し、非 Clifford 部分だけを状態ベクトルに委ねる——これが本書のハイブリッド型シミュレータの骨格であり、13章でランタイム全体として組み立てます。
+
+\section{まとめ}\label{ch6:summary}
+
+\begin{itemize}
+  \item Stim の \texttt{Circuit} は \texttt{append} で命令を積み上げて構築し、\texttt{TableauSimulator} は Clifford 回路をタブロー表現で高速に追跡します。
+  \item \texttt{DETECTOR} は「ノイズなしなら決定論的に定まるはずの測定レコードの XOR」を宣言する命令であり、\texttt{OBSERVABLE\_INCLUDE} は論理読み出し値を宣言する命令です。
+  \item 生のサンプラ（\texttt{compile\_sampler}）は真理値表検証に、detector sampler（\texttt{compile\_detector\_sampler}）は論理エラー率の評価に使い分けます。
+  \item \texttt{detector\_error\_model} は \texttt{decompose\_errors} の指定次第で graphlike なエッジ集合にも、非 graphlike な生のハイパーエッジ集合にもなります。gauge 検出器は「本来は誤り」を隠しかねないため、本書は \texttt{allow\_gauge\_detectors} を使わず、検出器の構成そのものを正しく直す方針を取ります。
+  \item MWPM（PyMatching）を基本とし、graphlike に分解できない場合のみ BP+OSD（stimbposd）にフォールバックします。非 Clifford 演算は qulacs（またはNumPy）の状態ベクトルに委ねます。
+\end{itemize}
+
+\subsection*{合否基準での検証}
+
+本章の合否基準は「ノイズなし回路で検出器が全0になる例を1つ示す」ことでした。
+6.4節で見た \codepath{src/stages/01_mpp/src/ftqc/transversal_cnot.py} の \texttt{verify\_boundary\_remap} がこれに対応します。
+クロス境界補正を入れた回路（\texttt{remap=True}）では \texttt{circ.compile\_detector\_sampler().sample(100, separate\_observables=True)} で得られる検出器ビット列がノイズなしで全て0になり、補正を外すと0にならない検出器が現れます。
+これは「検出器がゼロであること」が単なる偶然ではなく検出器構成の正しさそのものを示す指標であることの最小の実例であり、第8章で導入する「gauge 検出器ゼロ」という一般的な合否基準の先取りにもなっています。
+
+次章では、この検出器・観測量・サンプラの道具立てを使って、\codepath{src/stages/01_mpp/src/ftqc/} の d=3 rotated surface code パッチのスタビライザ列挙とメモリ実験を実装します。
+
+\begin{exercise}
+  \begin{enumerate}
+    \item \texttt{circuit.compile\_sampler()} と \texttt{circuit.compile\_detector\_sampler()} の戻り値がそれぞれ何を表すかを説明し、真理値表検証と論理エラー率評価のどちらにどちらを使うべきかを述べなさい。
+    \item \codepath{src/stages/01_mpp/src/ftqc/transversal_cnot.py} の \texttt{build\_cnot\_circuit} において \texttt{remap=False} にすると何が起きるかを、DETECTOR の一様規則（同インデックス生成子の連続ラウンド比較）が崩れる観点から説明しなさい。
+    \item \texttt{allow\_gauge\_detectors=True} を使えば非決定論的検出器を持つ回路でも \texttt{detector\_error\_model()} は例外を出さずに動きます。それでも本書がこのオプションを使わない理由を、正当な gauge 自由度と実装の取りこぼしの区別という観点から説明しなさい。
+    \item \texttt{clifford\_ft\_full.py} の \texttt{decode} メソッドが \texttt{decompose\_errors=True} での \texttt{ValueError} を捕捉して BP+OSD にフォールバックする理由を、H ゲートを含む Clifford 回路における検出器の重みの観点から説明しなさい。
+  \end{enumerate}
+\end{exercise}

@@ -1,0 +1,90 @@
+\documentclass[book,openany,lualatex,paper={182mm,232mm},fontsize=10pt,line_length=41zw,number_of_lines=33]{jlreq}
+\input{tex-template/preamble.tex}
+
+% openany でも jlreq は部扉の前を奇数ページまで送り、\frontmatter/\mainmatter で
+% \cleardoublepage するため空白ページが残る。画面で読む前提なので改ページのみにする。
+% （印刷に回す場合は openany とあわせてこのブロックを外す）
+\makeatletter
+\renewcommand{\jlreq@cleartooddpage}[1][]{\clearpage}
+\makeatother
+\jlreqsetup{frontmatter_pagebreak=clearpage,mainmatter_pagebreak=clearpage}
+
+\title{ゼロから作る FTQC シミュレータ\\— Stim で学ぶ誤り耐性量子計算の実装}
+\author{森 俊夫}
+\date{\today}
+
+\begin{document}
+
+\hypersetup{pageanchor=false}
+\maketitle
+
+\frontmatter
+\hypersetup{pageanchor=true}
+\setcounter{tocdepth}{1} % 目次は節（\section）まで表示する
+\tableofcontents
+
+\chapter*{まえがき}
+\addcontentsline{toc}{chapter}{まえがき}
+本書では、Stim を用いた誤り耐性量子計算（FTQC）の小さなシミュレータを、基礎から段階的に組み立てます。安定化器回路、表面符号、格子手術を学び、最後に回路レベルの誤りと論理状態のトラジェクトリを結び付けます。各段階では、実装が何をモデル化し、どの検査で確かめられるかを区別します。シミュレーション結果は、明示した物理・論理モデルの範囲で解釈してください。
+
+本書は第I部から第V部までで構成します。前半では量子誤り訂正と Stim の基礎を学び、Stage 01 の現象論的 MPP モデル、Stage 02 の回路レベルモデル、Stage 03 の統合ランタイムへ進みます。第25章で扱うのは $d=3$ 固定の実装です。距離一般化や、完全な相関付き論理パウリフレームは本書の範囲外です。
+
+本文のコードは、本書に同梱した独立実行環境に対応します。Stage 01 と Stage 02 はそれぞれ専用のソース、テスト、例、依存関係を持ちます。Stage 03 はリポジトリ直下の \codepath{src/ftqc}、\codepath{tests}、\codepath{examples}、\codepath{pyproject.toml} を使います。環境構築と実行方法は付録A、構成は付録B、検証の解釈と制限は付録C、引用文献は付録Dを参照してください。
+
+\mainmatter
+
+% ----- 第I部 -----
+\part{基礎 — なぜ FTQC シミュレータが必要か}\label{part:foundations}
+
+\input{chapter/1.tex}
+\input{chapter/2.tex}
+\input{chapter/3.tex}
+\input{chapter/4.tex}
+\input{chapter/5.tex}
+% ----- 第II部 -----
+\part{道具立て — Stim と最初の論理量子ビット}\label{part:tools}
+
+\input{chapter/6.tex}
+\input{chapter/7.tex}
+\input{chapter/8.tex}
+% ----- 第III部 -----
+\part{Stage 01 — 現象論 MPP で論理演算まで}\label{part:stage_01}
+
+\input{chapter/9.tex}
+\input{chapter/10.tex}
+\input{chapter/11.tex}
+\input{chapter/12.tex}
+\input{chapter/13.tex}
+% ----- 第IV部 -----
+\part{Stage 02 — 回路レベルへの拡張}\label{part:stage_02}
+
+\input{chapter/14.tex}
+\input{chapter/15.tex}
+\input{chapter/16.tex}
+\input{chapter/17.tex}
+\input{chapter/18.tex}
+\input{chapter/19.tex}
+% ----- 第V部 -----
+\part{Stage 03 — \texorpdfstring{$d=3$}{d=3} 固定の統合シミュレータ}\label{part:stage_03}
+
+\input{chapter/20.tex}
+\input{chapter/21.tex}
+\input{chapter/22.tex}
+\input{chapter/23.tex}
+\input{chapter/24.tex}
+\input{chapter/25.tex}
+% ----- 結び -----
+\chapter*{結び}
+\addcontentsline{toc}{chapter}{結び}
+本書では、単一の安定化器シミュレーションから始め、格子手術の論理操作と回路レベルの検査を経て、固定距離のハイブリッドランタイムまでを実装しました。各段階の結果はモデルの前提に依存します。特に $d=3$ の評価や簡略化した残差注入だけから、大規模な FTQC の性能や一般の論理故障率を結論することはできません。次の実装へ進む際も、検査が示す上界・統計的推定・決定論的性質を分けて報告することが大切です。
+
+\appendix
+\part{付録}\label{part:appendix}
+
+\input{chapter/aa.tex}
+\input{chapter/ab.tex}
+\input{chapter/ac.tex}
+\input{chapter/ad.tex}
+
+\backmatter
+\end{document}

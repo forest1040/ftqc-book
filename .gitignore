@@ -1,0 +1,24 @@
+# Generated artifacts
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+*.egg-info/
+dist/
+build/
+out/
+.env
+.env.*
+book/*.aux
+book/*.log
+book/*.out
+book/*.toc
+book/*.fls
+book/*.fdb_latexmk
+book/*.synctex.gz
+book/main.pdf
+book/figures/ch24_stim_timeline.html
+book/figures/ch24_stim_timeline.json

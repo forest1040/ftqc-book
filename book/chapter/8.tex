@@ -1,0 +1,325 @@
+% Stage: 01 入口 ／ 説明用コード: src/stages/01\_mpp/src/ftqc（基準は advanced 整合）
+\chapter{デコードと評価の基準}\label{ch:decoding}
+
+\begin{chaptergoal}
+  \begin{itemize}
+  \item ノイズモデルの階層（現象論モデルと回路レベルモデルの違い）を整理します。
+  \item MWPM（最小重み完全マッチング）による復号の考え方と PyMatching（対象バージョン 2.4.0）の使いかたを理解します\cite{higgott2022pymatching,higgott2025sparse}。
+  \item 本書全体を通じて使う合否基準——gauge 検出器ゼロ、厳密条件を満たす場合の回路距離（それ以外は graphlike／探索上界）、真理値表・理想分布一致、seed 再現性、\texttt{allow\_gauge\_detectors} を使わない——を確定します。
+  \item graphlike ではない検出器誤りモデルに対する BP+OSD フォールバックの位置づけを理解します。
+  \end{itemize}
+\end{chaptergoal}
+
+前章までで、Stim の DETECTOR・OBSERVABLE\_INCLUDE の基本（第6章）と、MPP によるパッチ構築（第7章）に触れました。
+ここまでの実装は、いずれも「回路を作って測定すれば、それでよい」という段階にとどまっています。
+しかし本書の目的はシミュレータを\textbf{作ること}であって、作ったつもりのコードが本当に量子誤り訂正として機能しているかは別問題です。
+検出器の作り方を一つ間違えても Stim はエラーを出さずに走り続けますし、符号距離を意図せず落としてしまうバグも黙って通り抜けます。
+
+本章では、この「作ったつもりのコード」に対して機械的に白黒をつけるための\textbf{合否基準}を定義します。
+以降の各章は、新しい構成要素（トランスバーサル操作や格子手術など）を導入するたびに、ここで定義する基準に照らして「本当に機能しているか」を検証します。
+つまり本章は、個々の技術の説明ではなく、本書全体の「ものさし」を作る章です。
+
+\begin{notebox}
+  Stage: \textbf{01}。
+  説明用コードは主に \codepath{src/stages/01_mpp/src/ftqc/} を用いますが、合否基準の語彙と最終形は \codepath{tests/} と公開版の実装に整合させます。
+  Stage 01 の時点ではまだ測れない項目（たとえば \texttt{decode\_shell} の seed 対応）もあり、その点は本章で明示します。
+\end{notebox}
+
+\section{ノイズモデルの階層}\label{sec:noise_models}
+
+\subsection{現象論モデルと回路レベルモデル}
+
+量子誤り訂正の数値実験でノイズを入れる方法には、大きく 2 つの階層があります。
+
+\begin{itemize}
+  \item \textbf{現象論モデル}：各ラウンドでデータ誤りとシンドローム測定誤りを直接確率的に与え、測定回路の内部構造を理想化します。文献や実装によってチャネルの細部は異なりますが、測定値反転だけを指す語ではありません。アンシラを介した CNOT の順序を再現しないため、測定回路自身の誤り伝播（後述の hook 誤り）は表現できません\cite{dennis2002topological}。
+  \item \textbf{回路レベルモデル}：実際の物理ゲート列（初期化・CNOT・測定）に対して \texttt{DEPOLARIZE1}／\texttt{DEPOLARIZE2}／測定前フリップなどのノイズを 1 ゲートごとに挿入し、シンドローム測定回路そのものの誤り伝播を再現します。
+\end{itemize}
+
+第III部（Stage 01）では、\codepath{src/stages/01_mpp/src/ftqc/} のコードは主に MPP（多体パウリ測定）でスタビライザを直接測定する現象論に近いモデルを使います。
+一方で、本書の合否基準そのものは Stim の \texttt{stim.Circuit.generated} が提供する回路レベルの表面符号回路でも検証できます。
+例として \codepath{src/stages/01_mpp/src/ftqc/ftqc_toy.py} の STAGE 1 は、回路レベルノイズを持つ \texttt{surface\_code:rotated\_memory\_z} を直接組み立てています。
+
+\begin{lstlisting}[language=Python, caption={回路レベルノイズを持つ表面符号メモリ実験（src/stages/01\_mpp/src/ftqc/ftqc\_toy.py）}]
+circuit = stim.Circuit.generated(
+    "surface_code:rotated_memory_z",
+    distance=distance,
+    rounds=rounds,
+    after_clifford_depolarization=p,      # 各 Clifford ゲート後の脱分極
+    before_measure_flip_probability=p,    # 測定エラー
+)
+sampler = circuit.compile_detector_sampler()
+det, obs = sampler.sample(num_shots, separate_observables=True)
+dem = circuit.detector_error_model(decompose_errors=True)
+matcher = pymatching.Matching.from_detector_error_model(dem)
+pred = matcher.decode_batch(det)
+n_err = int(np.sum(obs ^ pred))
+\end{lstlisting}
+
+\texttt{after\_clifford\_depolarization} は生成回路中の各 Clifford ゲート後に、ゲートの量子ビット数に応じた脱分極チャネルを挿入し、\texttt{before\_measure\_flip\_probability} は測定直前に結果を反転し得る誤りを挿入します\cite{stim2026python}。
+これに対し、\codepath{src/stages/01_mpp/src/ftqc/geom_lattice_surgery.py} や \codepath{src/stages/02_circuit_level/src/ftqc/circuit_level_merge.py} のように、データ量子ビットとアンシラの両方に \texttt{DEPOLARIZE1}／\texttt{DEPOLARIZE2} を明示的に付ける実装もあり、現象論と回路レベルの境界は「アンシラを介した測定回路の各ゲートを陽に書くかどうか」で判断できます。
+
+\begin{notebox}
+  第14章「なぜ回路レベルが必要か」では、この 2 つの階層の差が\textbf{符号距離そのものに影響する}こと（hook 誤りによって回路レベル距離が符号距離を下回り得ること）を具体的に扱います。
+  本章では、その差を検出するための道具（本節後半の $\mathrm{shortest\_graphlike\_error}$）を先に定義しておきます。
+\end{notebox}
+
+\subsection{DETECTOR と検出器誤りモデル}
+
+Stim は回路中の物理誤りチャネルを伝播させてサンプルを生成でき、解析時にはその効果を DETECTOR（測定記録のパリティから作る 0/1 の量）と論理観測量の反転へ写します。
+回路に対して \texttt{circuit.detector\_error\_model()} を呼ぶと、独立とみなす各誤り機構の確率、その検出器症状、論理フレーム変化を記録した\textbf{検出器誤りモデル}（DEM: Detector Error Model）が得られます\cite{gidney2021stim,stim2026doc}。
+復号（デコード）とは、観測した検出器パターンから論理フレーム変化または訂正を推定する作業です。MWPM は graphlike 模型上で整合する辺集合の重みを最小化しますが、相関・縮退を含む一般模型の厳密な最尤誤り集合を必ず返すわけではありません\cite{higgott2022pymatching,higgott2025sparse}。
+
+\section{MWPM による復号}\label{sec:mwpm}
+
+\subsection{graphlike な誤りとマッチング}
+
+DEM に現れる各誤り機構が反転させる検出器を高々 2 個持つとき、この DEM は\textbf{graphlike}であるといいます。0個は検出器症状のない論理誤り、1個は境界へ至る辺、2個は検出器間の辺に対応し、論理 observable target はこの個数に数えません\cite{stim2026doc}。
+graphlike な DEM は、検出器を頂点、誤り機構を辺とするグラフとして表現できます。
+反転した検出器（シンドローム）は、このグラフ上で「奇数個の端点を持つ頂点集合」として現れるので、復号問題は「シンドローム頂点どうしを辺のコストが最小になるように対にする」という\textbf{最小重み完全マッチング}（MWPM: Minimum Weight Perfect Matching）に帰着します。
+本書では、この MWPM を高速に解くライブラリとして PyMatching を使います。
+このマッチンググラフと復号の様子を図\ref{fig:ch8_matching_graph}に示します。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[
+    detnode/.style={circle, draw=black!70, fill=white, thick, minimum size=16pt, inner sep=0pt, font=\footnotesize},
+    defectnode/.style={circle, draw=red!70!black, fill=red!70!black, text=white, thick, minimum size=16pt, inner sep=0pt, font=\footnotesize\bfseries},
+    boundnode/.style={rectangle, draw=black!60, fill=black!8, rounded corners=3pt, thick, minimum width=22pt, minimum height=64pt, align=center, font=\footnotesize},
+    erredge/.style={draw=black!30, thick},
+    matchedge/.style={draw=red!70!black, line width=2.4pt},
+  ]
+    % 境界ノード
+    \node[boundnode] (BL) at (-0.5, 1.0) {境\\界};
+    \node[boundnode] (BR) at (6.5, 1.0) {境\\界};
+
+    % 検出器ノードグリッド (2行 x 3列)
+    % 行1 (y=2.0)
+    \node[detnode] (d11) at (1.2, 2.0) {$d_1$};
+    \node[defectnode] (d12) at (3.0, 2.0) {$d_2$};
+    \node[detnode] (d13) at (4.8, 2.0) {$d_3$};
+
+    % 行2 (y=0.0)
+    \node[detnode] (d21) at (1.2, 0.0) {$d_4$};
+    \node[defectnode] (d22) at (3.0, 0.0) {$d_5$};
+    \node[defectnode] (d23) at (4.8, 0.0) {$d_6$};
+
+    % 通常エッジ (潜在的な誤り機構)
+    \draw[erredge] (BL.north east) -- (d11);
+    \draw[erredge] (BL.south east) -- (d21);
+    \draw[erredge] (d11) -- (d12);
+    \draw[erredge] (d12) -- (d13);
+    \draw[erredge] (d13) -- (BR.north west);
+    \draw[erredge] (d21) -- (d22);
+    \draw[erredge] (d22) -- (d23);
+    \draw[erredge] (d11) -- (d21);
+    \draw[erredge] (d13) -- (d23);
+
+    % マッチングエッジ（太線ハイライト）
+    % d12 と d22 のマッチング
+    \draw[matchedge] (d12) -- node[right=4pt, text=red!70!black, font=\footnotesize] {対消滅} (d22);
+    % d23 と BR のマッチング（境界へ抜ける誤り鎖）
+    \draw[matchedge] (d23) -- node[below=3pt, text=red!70!black, font=\footnotesize] {境界へ結合} (BR.south west);
+
+    % 凡例 (Legend)
+    \begin{scope}[shift={(0.0, -1.2)}]
+      \node[detnode, minimum size=11pt] at (0.2, 0) {};
+      \node[right, font=\footnotesize] at (0.45, 0) {未反応の検出器 ($0$)};
+
+      \node[defectnode, minimum size=11pt] at (3.5, 0) {};
+      \node[right, font=\footnotesize] at (3.75, 0) {反応した検出器 ($1$, フラストレーション)};
+    \end{scope}
+    \begin{scope}[shift={(0.0, -1.75)}]
+      \draw[erredge] (0.2, 0) -- (0.7, 0);
+      \node[right, font=\footnotesize] at (0.8, 0) {graphlike 誤り枝};
+
+      \draw[matchedge] (3.3, 0) -- (3.8, 0);
+      \node[right, font=\footnotesize] at (3.9, 0) {MWPM によるマッチング};
+    \end{scope}
+
+  \end{tikzpicture}
+  \caption{MWPM によるマッチンググラフの概念図。検出器をノード、反転確率に応じた重みを持つ graphlike な誤り機構をエッジとして表します。シンドロームとして反応した検出器（塗りつぶしノード）のペアを最小コストで結ぶほか、表面符号の境界へ抜ける誤り鎖は境界ノード（Boundary）とマッチングさせることで完全マッチングを実現します。}
+  \label{fig:ch8_matching_graph}
+\end{figure}
+
+\begin{lstlisting}[language=Python, caption={PyMatching による MWPM 復号（src/stages/02\_circuit\_level/src/ftqc/circuit\_level\_merge.py）}]
+def decode(self, c, shots=40000):
+    det, obs = c.compile_detector_sampler().sample(shots, separate_observables=True)
+    try:
+        dem = c.detector_error_model(decompose_errors=True)
+        m = pymatching.Matching.from_detector_error_model(dem)
+        pred = m.decode_batch(det)
+        which = "MWPM"
+    except ValueError:
+        from stimbposd import BPOSD
+        pred = BPOSD(c.detector_error_model(decompose_errors=False), max_bp_iters=40).decode_batch(det)
+        which = "BP+OSD"
+    return (obs ^ pred).mean(axis=0), which
+\end{lstlisting}
+
+\texttt{decompose\_errors=True} を付けると、Stim は 3 個以上の検出器を同時に反転させる誤り機構について、区切り記号で関連づけた graphlike 成分への分解を提案します。分解不能なら既定では DEM 構築が失敗し、分解後の成分を独立辺として MWPM へ渡すと元の相関を近似または失う場合があります\cite{stim2026doc}。
+掲載コードの \texttt{except ValueError} は実装上のフォールバックですが、\texttt{ValueError} は非 graphlike 以外の入力不備でも起こり得ます。堅牢な実装では未分解 DEM の構造と例外内容を確認して分岐する必要があります。
+このフォールバックの受け皿が、8.4 節で扱う BP+OSD です。
+
+\subsection{符号距離とデコーダ観測量の関係}
+
+第3章・第4章で導入した符号距離 $d$ は、「ある論理状態を別の論理状態に変えてしまう最小の誤りの個数」でした。
+すべての誤り機構が graphlike な回路に対しては、Stim はこれを計算する手段を提供しています。
+
+\begin{lstlisting}[language=Python, caption={shortest\_graphlike\_error による graphlike 上界の確認（src/stages/02\_circuit\_level/src/ftqc/circuit\_level\_merge.py）}]
+cdist, _, _ = clm.build(aone=True, noise=True, p=0.005)
+bound = len(cdist.shortest_graphlike_error(ignore_ungraphlike_errors=True))
+print(f"DEM 上の最短 graphlike 論理誤り = {bound} (回路距離の上界)")
+\end{lstlisting}
+
+\texttt{circuit.shortest\_graphlike\_error()} は、その回路から得た DEM 上で、検出器症状を残さず論理観測量を反転させる graphlike 誤り機構の組み合わせのうち、機構数が最小のものを返します。確率の大小は目的関数に使いません\cite{stim2026python}。
+ただし、Stim では既定値が \texttt{ignore\_ungraphlike\_errors=True} であり、非 graphlike 誤り（検出器 3 個以上を発火させる誤りや分解不能な誤り）は自動的に無視されます。そのため、単に引数なしで呼び出した場合に返される長さは、一般には真の回路距離の\textbf{上界（upper bound）}に過ぎません。
+
+これが厳密な\textbf{回路レベルの距離}（\texttt{graphlike\_exact}）と呼べるのは、未分解 DEM の各物理誤り機構が検出器を高々 2 個しか反転しないことを先に確認し、\texttt{ignore\_ungraphlike\_errors=False} を指定した探索が成功し、返された各項に実際の回路誤りが対応している場合に限られます。単に「高次誤りを graphlike 成分へ分解できた」だけでは、成分数と物理 fault 数が一致しないため、この条件を満たしません。
+これが設計上意図した符号距離 $d$（たとえばパッチ距離 3 の表面符号なら $d=3$）と一致するかどうかは、本章で定義する合否基準の中心をなします。
+一致していなければ、検出器の張り方や測定順序のどこかに、距離を落としてしまうバグ（第14章で扱う hook 誤りなど）が潜んでいる、ということになります。
+
+\section{本書の合否基準}\label{sec:criteria}
+
+以上を踏まえて、本書のシミュレータが新しい構成要素（ゲート・符号・格子手術・スケジュールなど）を追加するたびに満たすべき合否基準を、以下の 5 項目として確定します。
+用語と最終的な定義は \codepath{tests/} と公開版に含む tests/ とコードに整合させています。
+
+\begin{enumerate}
+  \item \textbf{本書の非 gauge 回路で検出器が決定論的}：\texttt{noise=False} の回路について、既定の \texttt{allow\_gauge\_detectors=False} で DEM 構築が成功することを主判定とします。有限回サンプリングで反転がないことは補助的な健全性確認であり、決定論性の証明ではありません。
+    \codepath{src/ftqc/ls_cnot_ft.py} の \texttt{demo()} は、この点を次のように直接検査しています。
+\begin{lstlisting}[language=Python, caption={gauge 検出器ゼロの検査（src/ftqc/ls\_cnot\_ft.py）}]
+c0, _, _ = g.build(noise=False)
+det, _ = c0.compile_detector_sampler().sample(3000, separate_observables=True)
+nd = int(det.any(axis=0).sum())
+print(f"検出器数={c0.num_detectors}, 非決定論的={nd}  "
+      f"({'OK — allow_gauge_detectors 不要' if nd == 0 else 'NG'})")
+\end{lstlisting}
+    \texttt{det.any(axis=0).sum()} は「標本内で一度でも 1 になった検出器の個数」を数えます。本書の通常のスタビライザ回路でノイズなしの検出器が揺れるならバグの兆候です。一方、subsystem code などでは gauge detector を意図的に使う場合があり、非決定論的検出器が一般に誤りとは限りません\cite{stim2026python}。
+
+  \item \textbf{未分解の全誤り機構が graphlike なら $\mathrm{shortest\_graphlike\_error}=d$}：前節で見た事前検査を満たし、\texttt{ignore\_ungraphlike\_errors=False} で求めた \texttt{circuit.shortest\_graphlike\_error()} の長さが、設計上の符号距離 $d$ に一致すること（非 graphlike な DEM の場合は \texttt{search\_for\_undetectable\_logical\_errors} 等による探索上界として扱います）。
+    回路から graphlike 上界を得る基本形は次のとおりです。
+\begin{lstlisting}[language=Python, caption={回路距離の graphlike 上界（Stim Circuit API）}]
+noisy.detector_error_model(decompose_errors=True,
+                           allow_gauge_detectors=False)
+bound = len(noisy.shortest_graphlike_error(ignore_ungraphlike_errors=True))
+print(f"graphlike upper bound={bound}")
+\end{lstlisting}
+    \texttt{method == "graphlike\_exact"} の場合にだけ \texttt{value} を厳密距離と呼びます。\texttt{"graphlike\_upper\_bound"} や \texttt{"search\_upper\_bound"} の場合は、意図した距離と整合する証拠にはなりますが、距離保存の証明にはなりません。
+    非 graphlike な回路（本書では対象外の高重み検査回路など）では厳密値が計算できないため、この基準は 8.4 節で述べる探索上界に置き換わります。
+
+  \item \textbf{選んだ入力・測定設定で理想結果と一致}：計算基底入力に対する論理演算（CNOT など）の出力が、期待される古典的な真理値表と一致すること。
+    たとえば \codepath{src/ftqc/ls_cnot_ft.py} の \texttt{demo()} は、制御・標的の 4 通りの入力それぞれについて $(c,t)\to(c,\,c\oplus t)$ を確認しています。
+    計算基底の真理値表だけでは相対位相を検査できません。重ね合わせ入力や複数の測定基底を加え、Qulacs による理想分布との TVD なども使います。ただし有限個の設定と有限ショットによる一致は、量子チャネル全体の等価性の証明ではありません。
+
+  \item \textbf{seed 再現性}：再現可能なサンプリング経路では、同じ \texttt{seed} から同じシンドロームと復号結果が得られることを確認します。現行 Stage 03 の \texttt{decode\_shell(shell, shots=...)} は seed 引数を受けず、runtime 内の Stim detector sampler 呼び出しも seed を渡していません。したがって QEC sampling を含む runtime 全体の再現性は、この API では保証されません。公開テストの同一 seed 検査は \texttt{qec\_mode="off"} の実行経路を対象にしており、QEC sampling の再現性を検査するものではありません。
+
+  \item \textbf{shell の gauge 方針}：本書の shell 契約では \texttt{allow\_gauge\_detectors} を使いません。Stim の \texttt{detector\_error\_model()} は、回路状態に対して非決定的な検出器があると既定でエラーを出します。このオプションは、互いに反可換な非決定的検出器を gauge として扱い、対応する確率 $1/2$ の機構を DEM に加える正規の機能です\cite{stim2026python}。
+    本書のシェル構築コードは、この抑制オプションを\textbf{使いません}。
+\begin{lstlisting}[language=Python, caption={allow\_gauge\_detectors を使わない方針（src/ftqc/ls\_handoff\_shells.py の decode\_shell docstring）}]
+"""
+Does NOT use allow_gauge_detectors.  All shells produced here are built so
+that the noiseless circuit has zero non-deterministic detectors; if the DEM
+build raises a "non-deterministic detector" error, that signals a malformed
+shell (the gauge allowance would only hide the bug and collapse distance),
+so the error is allowed to propagate as a correctness guard.
+"""
+\end{lstlisting}
+    本書の shell は通常のスタビライザ回路として全検出器を決定論的に設計する契約なので、このオプションを使わず例外を伝播させます。この契約下では安易な指定が構築バグを隠し得ますが、オプション自体が一般に距離を崩すわけではありません。意図的な gauge 回路では、検出器の代数と距離の定義を別途定めて使用します。
+\end{enumerate}
+
+\begin{warningbox}
+  第6章で触れた \texttt{allow\_gauge\_detectors} の落とし穴は、この項目 5 として本章で正式な合否基準になりました。
+  本書の shell に「エラーが出て動かないから \texttt{allow\_gauge\_detectors=True} を付ける」という対処は\textbf{禁止}です。まず検出器の張り方・測定順序を見直します。意図的な subsystem/gauge 構成はこの shell 契約の対象外です。
+\end{warningbox}
+
+\subsection{Stage 01 における適用範囲}
+
+Stage 01 と Stage 03 の公開スナップショットに含まれる \texttt{decode\_shell} は、いずれも sampler seed を受け取る引数を持ちません。
+
+\begin{lstlisting}[language=Python, caption={Stage 01 の decode\_shell（src/stages/01\_mpp/src/ftqc/ls\_handoff\_shells.py）}]
+def decode_shell(shell: ShellCircuit, shots: int = 1000) -> ShellDecodeResult:
+    ...
+    det, obs = circ.compile_detector_sampler().sample(shots, separate_observables=True)
+\end{lstlisting}
+
+このため項目 4 は望ましい検証基準として定義しますが、公開 runtime の QEC sampling に対しては未達です。Stage 01／02 の各デモが確認する範囲も、決定論性・距離条件・位相を含む機能同値性を一括して証明するものではありません。
+本書では、各 Stage の実装が実際に満たす基準と、未達の基準を区別して記述します。
+
+\section{BP+OSD フォールバック}\label{sec:bposd}
+
+\subsection{非 graphlike な誤りモデル}
+
+3 個以上の検出器を同時に反転させる誤り機構が \texttt{decompose\_errors=True} でも graphlike な成分に分解できない場合、その DEM は\textbf{非 graphlike}（ハイパーグラフ的）です。
+このような DEM は、頂点と辺だけのグラフでは表現できず、MWPM の枠組みをそのまま適用できません。
+8.2 節のコード例で見たとおり、本書の復号関数は \texttt{pymatching.Matching.from\_detector\_error\_model} が \texttt{ValueError} を投げたときに、この非 graphlike な場合の受け皿として BP+OSD（Belief Propagation + Ordered Statistics Decoding）へフォールバックします。
+
+\begin{lstlisting}[language=Python, caption={BP+OSD フォールバック（再掲、src/stages/02\_circuit\_level/src/ftqc/circuit\_level\_merge.py）}]
+try:
+    dem = c.detector_error_model(decompose_errors=True)
+    m = pymatching.Matching.from_detector_error_model(dem)
+    pred = m.decode_batch(det)
+    which = "MWPM"
+except ValueError:
+    from stimbposd import BPOSD
+    pred = BPOSD(c.detector_error_model(decompose_errors=False), max_bp_iters=40).decode_batch(det)
+    which = "BP+OSD"
+\end{lstlisting}
+
+BP+OSD は、まずビリーフプロパゲーションで誤り変数の周辺信頼度を反復的に推定し、BP が有効な解を返さない場合などに、その信頼度で列を並べ替えて情報集合を選び、低次数の候補を再処理する Ordered Statistics Decoding を組み合わせる復号法です\cite{roffe2020bposd}。
+MWPM のようにグラフ上の最短距離問題に帰着できない一般のパリティ検査行列（qLDPC 符号など）に対しても適用できる代わりに、MWPM より計算コストが高く、厳密性（最小重みの保証）もありません。
+
+\subsection{距離検証への影響と本書の報告範囲}
+
+非 graphlike な回路では、8.3 節項目 2 の $\mathrm{shortest\_graphlike\_error}$ による厳密な距離計算はそのままでは使えません。
+本書で採用する評価上の注意 が示す方針では、こうした場合に \texttt{stim.Circuit.search\_for\_undetectable\_logical\_errors} による\textbf{探索上界}を代替の距離証拠として用い、戻り値に \texttt{"search\_upper\_bound"} のような手法名を明記することで、厳密値と探索上界を区別して報告します。
+本書では、未分解 DEM の各機構と1物理 fault の対応など前節の条件を満たす graphlike 回路には $\mathrm{shortest\_graphlike\_error}=d$ を厳密値として使います。それ以外では探索上界と、必要なら論理エラー率の $p$ 依存性を組み合わせた証拠を使い、厳密距離とは区別します。
+
+本書では BP+OSD は、graphlike DEM を MWPM で扱えない場合のフォールバックとして紹介します。復号器が返す解は一般に最尤解の保証ではなく、回路の距離評価とも区別してください。
+
+\section{やること・スコープ外}\label{sec:decoding_scope}
+
+\subsection{やること}
+
+\begin{itemize}
+  \item ノイズモデルの階層（現象論／回路レベル）を整理し、両者の違いが符号距離に影響し得ることを予告する。
+  \item MWPM による復号の仕組みと、graphlike という判定基準を PyMatching の実装レベルで示す。
+  \item 本書全体で使う 5 項目の合否基準を確定し、Stage 01 の時点でどこまで検証できるかを明示する。
+  \item BP+OSD フォールバックの役割と、graphlike 条件の制限を説明する。
+\end{itemize}
+
+\subsection{スコープ外}
+
+\begin{itemize}
+  \item hook 誤りの詳細な機構と、回路レベル距離が符号距離を下回る具体的な様子（第14章）。
+  \item BP+OSD のビリーフプロパゲーションの数式的な詳細と収束性の議論（発展章で必要に応じて触れます）。
+  \item 探索上界を計算する \texttt{search\_for\_undetectable\_logical\_errors} の詳細な探索パラメータ設計。
+  \item 複数の判定結果を一つの汎用ユーティリティへ集約する設計。本書では各検査を対象コードとテストに即して説明します。
+\end{itemize}
+
+\section{まとめ}\label{ch8:summary}
+
+\begin{itemize}
+  \item ノイズには現象論モデルと回路レベルモデルの 2 階層があり、後者だけが測定回路自身の誤り伝播（hook 誤りなど）を再現できます。
+  \item DEM が graphlike であれば、検出器を頂点とするグラフ上で MWPM を適用できます。これは graph model に対する最小重み解であり、一般の相関模型の厳密最尤復号と同義ではありません。
+  \item 本書の合否基準は次の 5 項目です。
+    \begin{enumerate}
+      \item 本書の非 gauge 回路では既定設定で検出器が決定論的。
+      \item 未分解 DEM の全機構が graphlike などの条件を満たす場合に限り、最短 graphlike 論理誤りの機構数を距離 $d$ と照合。
+      \item 選んだ入力・測定設定で真理値表・理想分布と一致。
+      \item seed 再現性。
+      \item \texttt{decode\_shell} は \texttt{allow\_gauge\_detectors} を使ってバグを隠さない。
+    \end{enumerate}
+  \item 項目 4 は理想的な基準として示しますが、QEC sampling に seed を渡す API は本書の公開 snapshot には含まれていません。
+  \item 本書の実装では非 graphlike な DEM に BP+OSD を使い、距離は探索上界で評価します。一般の非 graphlike 回路では、採用する復号器と評価手法を回路に応じて別途選ぶ必要があります。
+\end{itemize}
+
+次章では、この合否基準を実際の物差しとして使いながら、トランスバーサル操作と生成子追跡による Clifford の完全な誤り耐性化を扱います。
+
+\begin{exercise}
+  \begin{enumerate}
+    \item \codepath{src/stages/02_circuit_level/src/ftqc/circuit_level_merge.py} の \texttt{demo()} 内で、「検出器の決定論性」（[C]）と「回路レベル距離」（[D]）をそれぞれ確認しているコードを引用し、それぞれが本章のどの合否基準項目に対応するかを説明しなさい。
+    \item \texttt{allow\_gauge\_detectors=True} を使って non-deterministic detector エラーを抑制した場合に、本章の合否基準のどの項目が実質的に検証されなくなるかを、$\mathrm{shortest\_graphlike\_error}$ の計算方法に触れながら説明しなさい。
+    \item \texttt{pymatching.Matching.from\_detector\_error\_model} が \texttt{ValueError} を投げる状況を、graphlike・非 graphlike という語を使って説明し、そのときに呼び出されるデコーダの名前を答えなさい。
+    \item Stage 01 と公開 Stage 03 の \texttt{decode\_shell} の sampler 呼び出しを比較し、両者が seed 再現性の基準を満たすかを判断しなさい。
+  \end{enumerate}
+\end{exercise}

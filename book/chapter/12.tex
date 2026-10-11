@@ -1,0 +1,396 @@
+% Stage: 01 ／ 説明用コード: src/stages/01\_mpp/src/ftqc
+\chapter{T ゲート・蒸留・2 経路（statevector / QPD）}\label{ch:t_gate}
+
+\begin{chaptergoal}
+  \begin{itemize}
+  \item Clifford ゲートだけでは万能な量子計算にならない理由と、非 Clifford な $T$ ゲートの役割を理解します。
+  \item 魔法状態 $\ket{A}=T\ket{+}$ とゲートテレポーテーションにより、$T$ を測定と補正で実現する仕組みを理解します。
+  \item 独立同分布の入力誤りと理想 Clifford 操作の模型で、15-to-1 蒸留が誤り率を $p_{\mathrm{out}}=35p^3+O(p^4)$ へ 3 次抑圧する理由を、$[[15,1,3]]$ 符号の重み 3 の undetected-logical 誤りの個数から説明できるようになります。
+  \item statevector 経路と QPD（Quasi-Probability Decomposition）経路という 2 つの実装戦略の違いと、それぞれの得失を対比できるようになります。
+  \item シミュレータならではの近道（蒸留バイパス）がどこにあり、何を省略しているかを説明できるようになります。
+  \end{itemize}
+\end{chaptergoal}
+
+第9〜11章では、Clifford ゲート（$X,Y,Z,H,S,\mathrm{CNOT}$）をトランスバーサル操作・生成子追跡・格子手術で論理的に実現する方法を見てきました。
+ただし、スタビライザ状態の準備、Clifford ゲート、パウリ測定からなる回路は古典計算機で効率よく模擬できるため、この範囲だけでは一般の量子計算を実現できません\cite{aaronson2004stabilizer}。
+本章では、万能性のために必要な最後のピースである非 Clifford ゲート $T$ を取り上げます。
+本書で扱う表面符号のClifford操作だけでは論理 $T$ を直接実装できないため、魔法状態と呼ばれる特別な補助状態を蒸留で高品質に用意し、ゲートテレポーテーションで論理量子ビットへ転写します。
+説明用コードは Stage 01 の \codepath{src/stages/01_mpp/src/ftqc/t_gate.py} と \codepath{src/stages/01_mpp/src/ftqc/qpd_backend.py}、可視化には \codepath{src/stages/01_mpp/src/ftqc/viz/t_branch_visualizer.py} を用います。
+
+\begin{notebox}
+  Stage: \textbf{01}。
+  説明用コードは主に \codepath{src/stages/01_mpp/src/ftqc/} を用います。
+  格子手術による $T$ テレポーテーションの回路レベル実装（LS-T）は第18章で扱い、本章ではまず「何を実現すべきか」を statevector と QPD の 2 つの経路で押さえます。
+\end{notebox}
+
+\section{なぜ \texorpdfstring{$T$}{T} ゲートが必要か}\label{sec:why_t}
+
+\subsection{Clifford だけでは不十分}
+
+パウリ群 $\{I,X,Y,Z\}$ とアダマール $H$、位相ゲート $S$、$\mathrm{CNOT}$ が生成する群を Clifford 群と呼びます。
+Clifford 群には Gottesman--Knill の定理という重要な性質があります。
+スタビライザ入力、Clifford ゲート、パウリ測定で構成された量子回路は、測定結果のサンプリングを含めて古典計算機で効率よくシミュレートできます\cite{aaronson2004stabilizer}。
+本書のシミュレータが Stim という安定化シミュレータで符号サイクルを高速に扱えるのも、まさにこの性質のおかげです。
+
+したがって、このスタビライザ計算模型を万能な量子計算へ拡張するには、Clifford 群に属さない資源を追加する必要があります。
+その代表が $T$ ゲートです。
+
+\begin{equation}
+  T = \begin{pmatrix} 1 & 0 \\ 0 & \ee^{\ii\pi/4} \end{pmatrix}
+\end{equation}
+
+$T$ は対角ゲートで、$Z$ 基底の測定確率を変えないという意味では「おとなしい」ゲートですが、$T$ を Clifford 群の生成子として付け加えると群全体が無限になり、任意の 1 量子ビットユニタリを任意の精度で近似できるようになります（Solovay--Kitaev の定理）。
+$\{$Pauli, $H$, $S$, $\mathrm{CNOT}$, $T\}$ が揃うと、万能な量子計算のための標準的なゲート集合になります\cite{bravyi2005magic}。
+
+\subsection{魔法状態 $\ket{A}=T\ket{+}$}
+
+$T$ を安定化符号の上で直接かつ誤り耐性を保ったまま実行する簡単な方法はありません。
+$T$ は Clifford ではないため、パウリフレームの伝播だけでは処理できず、生成子追跡や格子手術のような「安定化群を保つ操作」の枠組みの外に出てしまいます。
+
+そこで使われるのが\textbf{ゲートテレポーテーション}という手法です。
+$T\ket{+}$ という状態を\textbf{魔法状態}（magic state）と呼び、$\ket{A}$ と表記します。
+
+\begin{equation}
+  \ket{A} = T\ket{+} = \frac{1}{\sqrt2}\left(\ket{0} + \ee^{\ii\pi/4}\ket{1}\right)
+\end{equation}
+
+$\ket{A}$ はスタビライザ状態ではありません。
+つまり、パウリ演算子の固有状態として射影測定だけで用意することができず、状態そのものを何らかの方法で作り込む必要があります。
+次節で見るように、あらかじめ用意した $\ket{A}$ を補助量子ビットとして使い、対象の論理量子ビットと $\mathrm{CNOT}$ で絡めてから測定するだけで、$T$ を実行できます。
+つまり「$T$ を直接かける」問題を、「$\ket{A}$ を高品質に用意する」問題と「Clifford 操作（$\mathrm{CNOT}$、測定、$S$ 補正）で転写する」問題に分解するのが、この章全体を通じた戦略です\cite{bravyi2005magic}。
+
+\section{ゲートテレポーテーション}\label{sec:teleport}
+
+\subsection{CNOT + Z 測定 + S 補正の骨格}
+
+対象量子ビットの状態を $\ket{\psi}$、補助量子ビットに用意した魔法状態を $\ket{A}$ とします。
+手順は次のとおりです。
+
+\begin{enumerate}
+  \item 対象を制御、補助を標的とする $\mathrm{CNOT}$ をかける。
+  \item 補助量子ビットを $Z$ 基底で測定し、測定値 $m\in\{0,1\}$ を得る。
+  \item $m=1$ の場合のみ、対象量子ビットに $S$ 補正をかける。
+  \item 補助量子ビットは捨てる。対象量子ビットには $T\ket{\psi}$ が残る。
+\end{enumerate}
+
+このテレポーテーションの回路構成を図\ref{fig:ch12_t_teleport}に示します。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{quantikz}[row sep={1.2cm,between origins}, column sep=0.7cm]
+    \lstick{$\ket{\psi}$} & \ctrl{1} & \qw & \gate{\substack{S \\ \text{\scriptsize (if $m=1$)}\phantom{i}}} & \qw & \rstick{$T\ket{\psi}$} \\
+    \lstick{$\ket{A}=T\ket{+}$} & \targ{} & \meter{Z} & \ctrl[wire=c]{-1} & \cw & \rstick{測定値 $m$}
+  \end{quantikz}
+  \caption{魔法状態 $\ket{A}=T\ket{+}$ を用いた $T$ ゲートテレポーテーション回路。データ量子ビット $\ket{\psi}$ を制御、魔法状態 $\ket{A}$ を標的として $\mathrm{CNOT}$ を作用させた後、補助量子ビットを $Z$ 測定します。測定結果が $m=1$ の場合のみデータ側へ古典制御（二重線）によって $S$ 補正を適用することで、常に目的の $T\ket{\psi}$ が確定的に得られます。}
+  \label{fig:ch12_t_teleport}
+\end{figure}
+
+この骨格は \codepath{src/stages/01_mpp/src/ftqc/t_gate.py} の \texttt{verify\_t\_teleportation()} で、状態ベクトル計算により正しさが検証されています。
+
+\begin{lstlisting}[language=Python, caption={T ゲートテレポーテーションの骨格（src/stages/01\_mpp/src/ftqc/t\_gate.py）}]
+def teleport(psi):
+    state = np.kron(psi, A)               # target(0) (X) ancilla(1)
+    state = CNOT @ state                  # CNOT(target->ancilla)
+    # ancilla(qubit1) を Z 測定する2分岐
+    results = {}
+    for m in (0, 1):
+        proj = np.zeros((4, 4), complex)
+        for t in (0, 1):                  # target basis
+            idx = t * 2 + m
+            proj[idx, idx] = 1
+        br = proj @ state
+        nrm = np.linalg.norm(br)
+        if nrm < 1e-9:
+            continue
+        br = br / nrm
+        out = np.array([br[0 * 2 + m], br[1 * 2 + m]])
+        if m == 1:
+            out = S @ out                 # S 補正 (= 既存の LS S ゲート)
+        results[m] = out
+    return results
+\end{lstlisting}
+
+\texttt{demo()} を実行すると、5 種類のテスト入力（$\ket0,\ket1,\ket+,\ket{+\ii},$ 任意の実係数状態）すべてで、テレポーテーション後の状態が理想的な $T\ket{\psi}$ に大域位相を除いて一致することが確認できます（フィデリティ $1-10^{-9}$ 以内）。
+
+\begin{notebox}
+  ここで使う $S$ 補正は、第9〜11章で構築してきた既存の $S$ ゲート実装（生成子追跡または格子手術による論理 $S$）を\textbf{そのまま再利用}します。
+  つまり $T$ ゲートテレポーテーションが新しく必要とするのは「$\ket{A}$ をどう用意するか」だけであり、測定後の補正操作は既存の Clifford スタックに委譲できます。
+  この分離が、非 Clifford な $T$ を安定化符号ベースのシミュレータへ組み込むうえで本質的です。
+\end{notebox}
+
+なぜ $m=1$ のときだけ $S$ 補正が要るかは、状態ベクトルを直接展開すると確かめられます。
+$\ket{\psi}=a\ket0+b\ket1$、$\ket{A}=(\ket0+\ee^{\ii\pi/4}\ket1)/\sqrt2$ として $\mathrm{CNOT}$ 適用後に補助を $Z$ 測定すると、$m=0$ のとき対象量子ビットには大域位相を除いて $T\ket\psi=a\ket0+b\,\ee^{\ii\pi/4}\ket1$ がそのまま現れます。
+一方 $m=1$ のときは $a\,\ee^{\ii\pi/4}\ket0+b\ket1$、すなわち大域位相を除いて $T^\dagger\ket\psi$ が現れます。
+$S T^\dagger=\mathrm{diag}(1,\ii)\cdot\mathrm{diag}(1,\ee^{-\ii\pi/4})=\mathrm{diag}(1,\ee^{\ii\pi/4})=T$ なので、$m=1$ のときに $S$ を掛ければ $T^\dagger\ket\psi$ が $T\ket\psi$ に揃います。
+この「測定結果に応じた補正」という構造は、本書のパウリフレーム追跡の考え方（第5章）を、パウリではなく $S$ という Clifford ゲートに拡張した例だと見ることができます。
+$T$ ゲートテレポーテーションは、フレーム補正の対象が単純なパウリではなく $S$ という Clifford ゲートに拡張された例だと見ることができます。
+
+\section{魔法状態蒸留}\label{sec:distill}
+
+\subsection{なぜ蒸留が必要か}
+
+前節のゲートテレポーテーションは、$\ket{A}$ が完全に理想的である前提で成り立っています。
+実際には $\ket{A}$ を物理的に用意する過程にも誤りが混入し、確率 $p$ でノイズの乗った $\ket{A}$ しか得られません。
+このノイズがそのまま論理 $T$ ゲートの誤りになってしまうと、他の論理ゲートと同程度の誤り率まで抑え込む必要があり、$T$ ゲートが計算全体のボトルネックになります。
+
+そこで、複数の（誤り率 $p$ の）ノイジーな $\ket{A}$ を消費して、より低い誤り率の $\ket{A}$ を 1 個取り出す\textbf{蒸留}という手続きを使います。
+代表的な方式が\textbf{15-to-1 蒸留}です。15 個のノイジーな $\ket{A}$ を入力に、$[[15,1,3]]$ Reed--Muller 符号に基づく検査を行い、シンドロームがすべて $0$（postselect）だった場合に限り、1 個の高品質な $\ket{A}$ を出力します\cite{bravyi2005magic}。
+
+\subsection{$[[15,1,3]]$ 符号}
+
+$[[15,1,3]]$ 符号は、4 変数の $\mathbb{F}_2^4$ における 15 個の非零点を物理量子ビットに対応させて構成される CSS 符号です。
+\codepath{src/stages/01_mpp/src/ftqc/t_gate.py} の \texttt{build\_15to1()} は、次数 1 の単項式（4 個）から $X$ 誤り検出用の検査行列 $H_Z$、次数 1 と次数 2 の単項式（合計 10 個）から $Z$ 誤り検出用の検査行列 $H_X$ を構成します。
+
+\begin{lstlisting}[language=Python, caption={[[15,1,3]] 符号の構成（src/stages/01\_mpp/src/ftqc/t\_gate.py）}]
+_PTS = [tuple((i >> b) & 1 for b in range(4)) for i in range(1, 16)]
+
+def _monomial(S):
+    return np.array([int(all(p[i] for i in S)) if S else 1 for p in _PTS], np.int8)
+
+def build_15to1():
+    HZ = np.array([_monomial((i,)) for i in range(4)], np.int8)            # 4 行 (X誤り検出)
+    HX = np.array([_monomial((i,)) for i in range(4)] +
+                  [_monomial((i, j)) for i, j in itertools.combinations(range(4), 2)], np.int8)  # 10 行
+    return HX, HZ
+\end{lstlisting}
+
+\texttt{code\_properties(HX, HZ)} はこの構成が CSS 条件（$H_X H_Z^\top \equiv 0 \pmod 2$）を満たすこと、論理量子ビット数が $k=1$ であることを確認し、さらに\textbf{検出されないまま論理演算子を書き換えてしまう $X$ 誤り}を重み別に数え上げます。
+重み $w$ の誤り $e$ が「検出されない」とは $H_Z e \equiv 0$（シンドロームに現れない）、「論理を書き換える」とは $e$ が $H_X$ の行空間に属さないことを意味します。
+
+\begin{lstlisting}[language=Python, caption={undetected-logical 誤りの数え上げ（src/stages/01\_mpp/src/ftqc/t\_gate.py）}]
+def code_properties(HX, HZ):
+    k = 15 - _gf2_rank(HX) - _gf2_rank(HZ)
+    css = bool(np.all((HX @ HZ.T) % 2 == 0))
+    HXb, HXp = _reduce_basis(HX)
+    counts = {}
+    for w in range(1, 5):
+        cnt = 0
+        for supp in itertools.combinations(range(15), w):
+            e = np.zeros(15, np.int8)
+            for q in supp:
+                e[q] = 1
+            if np.all((HZ @ e) % 2 == 0) and _not_in_span_batch(e[None, :], HXb, HXp)[0]:
+                cnt += 1
+        counts[w] = cnt
+    return css, k, counts
+\end{lstlisting}
+
+\texttt{demo()} を実行すると、この数え上げの結果は次のとおりです。
+
+\begin{lstlisting}[caption={t\_gate.py 実行結果（抜粋）}]
+CSS=True, k=1, 符号 [[15,1,3]]
+undetected-logical X誤りの重み分布: {1: 0, 2: 0, 3: 35, 4: 0}
+=> 重み3 がちょうど 35 個 (=有名な 35) -> 出力誤り ~35 p^3
+\end{lstlisting}
+
+重み 1 と重み 2 の誤りは、いずれも $H_Z$ のどこかで検出されるか、$H_X$ の行空間に属して論理には影響しません。
+重み 3 の誤りだけが、シンドロームに現れずに論理演算子を書き換えてしまう「危険な」誤りとして残り、その個数がちょうど \textbf{35 個}になります。
+独立同分布の入力 $Z$ 型魔法状態誤りを確率 $p$ で入れ、Clifford 操作を理想化した模型では、これが蒸留後の条件付き誤り率 $p_{\mathrm{out}}=35p^3+O(p^4)$ の先頭項になります\cite{bravyi2005magic}。
+直感的には、15 個の物理 $\ket{A}$ のうち独立に誤りが起きた場合、1 個や 2 個の誤りは検査で弾かれるため、出力誤りに寄与するのは「ちょうど都合の悪い 3 個の組み合わせ」だけが残る、という 3 次抑圧の仕組みです。
+
+\subsection{受理率と出力誤り率の検証}
+
+\texttt{distill(HX, HZ, p, shots, seed)} は、入力誤り率 $p$ を与えてモンテカルロサンプリングを行い、シンドロームが全 $0$ になる受理率と、受理された中で論理誤りが起きている割合（出力誤り率）を返します。
+
+\begin{lstlisting}[language=Python, caption={蒸留のモンテカルロ検証（src/stages/01\_mpp/src/ftqc/t\_gate.py）}]
+def distill(HX, HZ, p, shots=3_000_000, seed=1):
+    """入力 |A> の誤り率 p。X誤りを HZ で検出し syndrome 0 を postselect。"""
+    HXb, HXp = _reduce_basis(HX)
+    rng = np.random.default_rng(seed)
+    e = (rng.random((shots, 15)) < p).astype(np.int8)
+    accept = ~((e @ HZ.T) % 2).any(axis=1)
+    ea = e[accept]
+    n_log = int(_not_in_span_batch(ea, HXb, HXp).sum())
+    return accept.mean(), n_log / max(len(ea), 1)
+\end{lstlisting}
+
+実行結果は次のようになります。
+
+\begin{lstlisting}[caption={蒸留モンテカルロの実行結果（src/stages/01\_mpp/src/ftqc/t\_gate.py, shots=3\,000\,000）}]
+    p_in |  accept率 |      p_out |     35 p^3 | ratio
+----------------------------------------------------
+   0.010 |    0.860 |   3.88e-05 |   3.50e-05 | 1.11
+   0.020 |    0.739 |   3.00e-04 |   2.80e-04 | 1.07
+   0.050 |    0.465 |   5.11e-03 |   4.38e-03 | 1.17
+\end{lstlisting}
+
+この独立入力誤り・理想検査の代数模型では、出力誤り率 $p_{\mathrm{out}}$ は $35p^3$ にほぼ比例し、比 ratio が 1 に近いことが数値的に確認できます（$p$ が大きくなるほど、$35p^3$ で無視した高次項の影響でずれます）。\texttt{t\_gate.py} は完全な物理蒸留回路ではなく、この仮定下で誤りパターンを列挙・標本化する模型です。
+受理率は $p$ が大きいほど下がる点にも注意が必要です。
+シンドローム $0$ を要求する postselect は、確率的に蒸留が「失敗」する（やり直しになる）ことを意味し、これは資源見積もりにおける重要なコストです。
+
+\section{2 つの実装戦略（statevector / QPD）}\label{sec:two_paths}
+
+蒸留とゲートテレポーテーションの原理を理解したところで、これをハイブリッド型シミュレータのランタイムにどう実装するかを見ます。
+\codepath{src/stages/01_mpp/src/ftqc/hybrid_ftqc_runtime.py} の \texttt{HybridFTQCRuntime} は、\texttt{nonclifford\_mode} パラメータで 2 つの経路を切り替えられます。
+
+\subsection{statevector 直接適用（デフォルト）}
+
+\texttt{nonclifford\_mode="statevector"} では、$T$（および $T^\dagger$）を論理状態ベクトル層で直接適用し、その前後に Stim による汎用の QEC ハンドオフシェルを挟みます。
+非 Clifford の状態更新そのものは Stim では表現できないため、Qulacs/NumPy の状態ベクトルバックエンドが担当し、Stim は物理シンドロームのサンプリングとデコードされた論理残差の供給に専念します。
+
+蒸留による誤り率 $p_{\mathrm{magic}}$ は、\codeinline{_estimate_magic_error()} が推定します。
+\codeinline{magic_distillation_shots} が指定されていれば \codeinline{t_gate.distill()} を呼び出してモンテカルロで推定し、指定がなければ解析的な近似 $\min(1, 35p_{\mathrm{phys}}^3)$ を使います。
+
+\begin{lstlisting}[language=Python, caption={蒸留誤りの推定（src/stages/01\_mpp/src/ftqc/hybrid\_ftqc\_runtime.py）}]
+def _estimate_magic_error(self) -> float:
+    if self.magic_distillation_shots <= 0:
+        return float(min(1.0, 35.0 * self.p_phys ** 3))
+    try:
+        from t_gate import build_15to1, distill  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("t_gate.py is required for magic-state distillation estimates.") from exc
+    HX, HZ = build_15to1()
+    _, p_magic = distill(HX, HZ, self.p_phys, shots=self.magic_distillation_shots, seed=self.seed)
+    return float(p_magic)
+\end{lstlisting}
+
+推定された $p_{\mathrm{magic}}$ をベルヌーイ確率としてショットごとにフォールト $Z\ket{A}$ が起きたかどうかをサンプルし、フォールトが起きていれば理想 $T$ の後に $S^\dagger$（$T^\dagger$ の場合は $S$）を追加で補正します。
+これは $Z\ket{A}$ という「1 個だけ悪い魔法状態」がゲートテレポーテーションを通じてどのような Clifford 誤りに化けるかを、あらかじめ計算しておいた結果です。
+
+\begin{lstlisting}[language=Python, caption={statevector 経路での磁法状態フォールト適用（src/stages/01\_mpp/src/ftqc/hybrid\_ftqc\_runtime.py）}]
+if ev.name == "T":
+    state.apply_gate("T", ev.target)
+    if int(magic_faults[ev.label][sidx]):
+        # Bad distilled |A> = Z|A> makes the corrected gadget apply T^dag.
+        # T^dag = S^dag T, so after ideal T we apply S^dag.
+        state.apply_gate("SDG", ev.target)
+elif ev.name == "T_DAG":
+    state.apply_gate("T_DAG", ev.target)
+    if int(magic_faults[ev.label][sidx]):
+        # Symmetric model: a bad |A^dag> applies T instead of T^dag.
+        state.apply_gate("S", ev.target)
+\end{lstlisting}
+
+\begin{notebox}
+  \textbf{シミュレータならではの蒸留バイパス}。
+  実機であれば 15 個のノイジーな $\ket{A}$ を実際に用意し、$[[15,1,3]]$ 符号の検査測定を毎回実行して postselect する必要があります。
+  しかし本書のシミュレータでは、\texttt{t\_gate.distill()}（あるいは解析式 $35p^3$）で出力誤り率 $p_{\mathrm{magic}}$ を\textbf{一度だけ}求めてキャッシュし、以降は各ショットで単純にベルヌーイ乱数を 1 回引くだけで蒸留後の誤りを再現します。
+  15 量子ビット分の物理検査回路を毎ショット走らせる必要がないという意味で、これは「蒸留の結果」を統計的に代入するバイパスです。
+  受理率（postselect の資源コスト）や、蒸留回路自体の詳細な誤り伝播（15 個の物理誤りがどのように組み合わさるか）は、この近道では捨象されています。
+  格子手術による $T$ 注入の回路レベル実装（LS-T、第18章）では、この省略の一部がより物理的な形で埋められます。
+\end{notebox}
+
+\subsection{QPD（I/S/Z 符号付き分岐）}
+
+もう一つの経路が \texttt{nonclifford\_mode="qpd"} です。
+QPD（quasi-probability decomposition, 準確率分解）は、非 Clifford なチャネル $T\rho T^\dagger$ を、符号付きの重みを持つ Clifford チャネルの線形和として\textbf{厳密に}書き換える手法です。
+
+\begin{equation}
+  T\rho T^\dagger
+    = \frac12\, I\rho I
+    + \frac{1}{\sqrt2}\, S\rho S^\dagger
+    - \frac{\sqrt2-1}{2}\, Z\rho Z
+\end{equation}
+
+$T^\dagger$ の場合は $S$ を $S^\dagger$ に置き換えれば同じ形になります。
+\codepath{src/stages/01_mpp/src/ftqc/hybrid_ftqc_runtime.py} では、この分解が \texttt{T\_QPD\_TERMS} / \texttt{TDG\_QPD\_TERMS} として定義されています。
+
+\begin{lstlisting}[language=Python, caption={T ゲートの QPD 分解（src/stages/01\_mpp/src/ftqc/hybrid\_ftqc\_runtime.py）}]
+T_QPD_TERMS = (
+    ("I", 0.5),
+    ("S", 1.0 / math.sqrt(2.0)),
+    ("Z", -(math.sqrt(2.0) - 1.0) / 2.0),
+)
+TDG_QPD_TERMS = (
+    ("I", 0.5),
+    ("SDG", 1.0 / math.sqrt(2.0)),
+    ("Z", -(math.sqrt(2.0) - 1.0) / 2.0),
+)
+\end{lstlisting}
+
+3 つの係数の絶対値の和 $\gamma=\sum_i|c_i|=\frac12+\frac{1}{\sqrt2}+\frac{\sqrt2-1}{2}=\sqrt2$ を\textbf{準確率の 1 ノルム}と呼びます。
+各ショットでは項 $i$ を確率 $|c_i|/\gamma$ でサンプルし、対応する Clifford ゲート（$I$、$S$（または $S^\dagger$）、$Z$）を実際に適用したうえで、符号付き重み $\gamma\cdot\operatorname{sign}(c_i)$ を記録します。
+最終的な観測量は、この符号付き重みで加重した不偏推定量として復元します。
+
+\begin{lstlisting}[language=Python, caption={QPD 分岐の展開（src/stages/01\_mpp/src/ftqc/qpd\_backend.py）}]
+def expand_qpd_branches(qc_or_gates: Any, max_branches: Optional[int] = None) -> List[QPDExpandedBranch]:
+    """Enumerate all Clifford-only QPD branches.
+
+    T expands to I/S/Z with coefficients
+        1/2, 1/sqrt(2), -(sqrt(2)-1)/2.
+    """
+    ...
+\end{lstlisting}
+
+重要なのは、\textbf{どの分岐も Clifford ゲートしか含まない}という点です。
+$T$ を含む元の回路は 1 個の Stim 回路では表現できませんが、QPD 展開後の各分岐は Stim にそのまま流せる Clifford 専用の回路になります。
+さらに、$S/S^\dagger$ の分岐だけを既存の LS-S シェルへルーティングし、$I/Z$ の分岐は汎用の Stim メモリシェルへルーティングするという「ルート分け」を、\texttt{route\_qpd\_s\_via\_ls} オプションで制御します。
+これにより「$T$ ゲートの実行」という一見特殊な処理を、既存の Clifford QEC インフラの組み合わせに還元できます。
+
+\codepath{src/stages/01_mpp/src/ftqc/qpd_backend.py} の \texttt{run\_exact\_noiseless()} は、$3^{\,T\text{数}}$ 個の分岐をすべて列挙し、ノイズなしで厳密に最終分布を再構成する検証専用の経路です。
+たとえば $H,T,H$ という 1 量子ビット回路を $\ket0$ に適用すると、次の結果が得られます。
+
+\begin{lstlisting}[caption={qpd\_backend.py の run\_exact\_noiseless() 実行結果（H T H, 入力 |0>）}]
+t_count: 1
+num_branches: 3
+coefficient_l1: 1.414214
+coefficient_sum: 1.000000
+distribution: {'0': 0.853553, '1': 0.146447}
+branches:
+  coeff=+0.500000, terms=('I',), gates=(('H',0,None), ('H',0,None))
+  coeff=+0.707107, terms=('S',), gates=(('H',0,None), ('S',0,None), ('H',0,None))
+  coeff=-0.207107, terms=('Z',), gates=(('H',0,None), ('Z',0,None), ('H',0,None))
+\end{lstlisting}
+
+得られた $P(0)=0.853553\ldots$ は解析値 $(2+\sqrt2)/4$ と一致します。
+この値は $T$ の位相 $\ee^{\ii\pi/4}$ による干渉項そのものであり、$S$ と $S^\dagger$ を取り違えるといった符号ミスは、この数値がずれることで発見できます。
+分岐そのものには複素位相が現れず、実数の符号付き重みだけで干渉を再現できる点が QPD の面白さです。
+
+\subsection{2 つの経路の対比}
+
+\begin{itemize}
+  \item \textbf{statevector 経路}: $T$ を状態ベクトル上で直接適用し、蒸留誤りをベルヌーイフォールトとして後付けで載せます。ショットあたりの Clifford 分岐が発生しないため実装は単純で、Stim 呼び出しも $T$ ごとに 1 回のハンドオフシェルで済みます。一方で「なぜ $35p^3$ なのか」という蒸留の内部構造そのものはモデルの外に置かれています。
+  \item \textbf{QPD 経路}: $T$ を厳密に Clifford の符号付き分岐へ展開するため、各分岐が Stim（Clifford 専用シミュレータ）に完全に載ります。干渉効果を含めて厳密に再現できる一方、この標本化推定量では $T$ 1 個あたり $\gamma^2=2$ が二次モーメントと最悪時ショットオーバーヘッドの尺度になります。これは個々の観測量の分散が常に厳密に 2 倍という意味ではありません。$T$ の個数が増えると全体の $\gamma$ は各 $T$ の $\gamma$ の積になり、所要ショット数の上界が指数的に増えます\cite{temme2017qpd}。
+\end{itemize}
+
+statevector 経路は 15-to-1 の出力誤り模型を明示的に使います。一方、ここでの QPD 経路は理想 $T$ チャネルを Clifford 分岐へ分解するもので、15-to-1 の品質を自動的には含みません。QPD 経路へ蒸留誤りを入れるには、別途ノイズチャネルを合成する必要があります。
+
+\section{合否基準での検証}\label{ch12:verification}
+
+Stage 01 の実装と同梱テストが扱う性質を整理します。
+
+\begin{itemize}
+  \item \textbf{決定論的な性質}: \texttt{tests/test\_magic\_state.py} は 15-to-1 符号の距離と重み3の論理誤り数、理想 T テレポーテーションを検査します。
+  \item \textbf{理想 QPD 分布}: \texttt{tests/test\_tsim\_ideal.py} は $H,T,H$ の理想分布を評価します。有限ショットの推定には統計誤差があり、分岐列挙による厳密再構成とは区別します。
+  \item \textbf{範囲外}: QEC を含む魔法状態蒸留や、LS-T の回路レベル距離・検出器の評価は本章の対象外です。LS-T のシェル構成は第18章で扱います。
+\end{itemize}
+
+\section{やること・スコープ外}\label{sec:t_gate_scope}
+
+\subsection{やること}
+
+\begin{itemize}
+  \item 非 Clifford な $T$ ゲートが万能性に必要な理由を示す。
+  \item 魔法状態 $\ket{A}=T\ket{+}$ とゲートテレポーテーション（CNOT + Z 測定 + S 補正）の骨格を示す。
+  \item 独立入力誤り・理想 Clifford 操作の模型における $[[15,1,3]]$ 符号の 15-to-1 蒸留と、$35p^3+O(p^4)$ という 3 次抑圧の根拠を示す。
+  \item statevector 経路と QPD 経路という 2 つの実装戦略を、\texttt{hybrid\_ftqc\_runtime.py} の実コードで対比する。
+\end{itemize}
+
+\subsection{スコープ外}
+
+\begin{itemize}
+  \item 格子手術上での $T$ 注入の回路レベル実装（LS-T、第18章）。
+  \item 蒸留プロトコル自体の物理誤り伝播の詳細シミュレーション（本章では出力誤り率のみを扱う）。
+  \item QPD 経路の分散削減・サンプリング戦略の最適化。
+\end{itemize}
+
+\section{まとめ}\label{ch12:summary}
+
+\begin{itemize}
+  \item Clifford ゲート群だけでは万能な量子計算にならず、非 Clifford な $T$ ゲートが必要です。
+  \item $T$ は魔法状態 $\ket{A}=T\ket{+}$ とゲートテレポーテーション（$\mathrm{CNOT}$、$Z$ 測定、条件付き $S$ 補正）によって、既存の Clifford スタックの上に実装されます。
+  \item 独立同分布の入力 $Z$ 型誤りと理想 Clifford 操作の模型では、$[[15,1,3]]$ 符号による 15-to-1 蒸留は、重み 3 の undetected-logical 誤りが 35 個であることから $p_{\mathrm{out}}=35p^3+O(p^4)$ を与えます。
+  \item statevector 経路は蒸留誤りを後付けのベルヌーイフォールトとしてモデル化し、シミュレータならではの「蒸留バイパス」で 15 量子ビット分の検査回路を省略します。
+  \item QPD 経路は $T\rho T^\dagger$ を $I/S/Z$ の符号付き Clifford チャネルへ厳密に分解し、干渉効果を含めて Stim だけで再現します。$\gamma^2=2$ は、この標本化法の二次モーメントと最悪時ショットオーバーヘッドの尺度です。
+\end{itemize}
+
+次章では、本章で得た $T$ の 2 経路を含む Clifford ＋ 非 Clifford の全体を、\texttt{hybrid\_ftqc\_runtime.py} の \texttt{plan}/\texttt{run} という Stage 01 ハイブリッドランタイムの骨格として統合します。
+
+\begin{exercise}
+  \begin{enumerate}
+    \item ゲートテレポーテーションにおいて、補助量子ビットの測定値が $m=0$ のときに $S$ 補正が不要である理由を、$\mathrm{CNOT}$ 適用後の状態の形から説明しなさい。
+    \item $[[15,1,3]]$ 符号で重み 1 および重み 2 の $X$ 誤りが undetected-logical にならない理由を、検査行列 $H_Z$ と $H_X$ の役割の違いから説明しなさい。
+    \item \texttt{t\_gate.distill(HX, HZ, p, shots)} を $p=0.03$ で実行し、得られた出力誤り率と $35p^3$ の比を求め、$p$ が小さいほど比が 1 に近づく理由を考察しなさい。
+    \item QPD 分解の係数 $\gamma=1/2+1/\sqrt2+(\sqrt2-1)/2$ が $\sqrt2$ に等しいことを示し、$T$ を $k$ 個含む回路全体の準確率 1 ノルムが $(\sqrt2)^k$ になる理由を、\texttt{expand\_qpd\_branches()} の分岐展開の構造から説明しなさい。
+  \end{enumerate}
+\end{exercise}

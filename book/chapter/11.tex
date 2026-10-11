@@ -1,0 +1,339 @@
+% Stage: 01 ／ 説明用コード: src/stages/01\_mpp/src/ftqc
+\chapter{論理レベル格子手術と LS ハンドオフ}\label{ch:ls_logical}
+
+\begin{chaptergoal}
+  \begin{itemize}
+  \item \texttt{lattice\_surgery.py} が論理レベルの LS CNOT・LS S をどのように MPP 測定で構成するかを理解します。
+  \item joint 測定 $M_{PP}$ が論理演算子の積を直接測る「論理レベルの近道」であり、回路レベルのアンシラ抽出とは別物であることを理解します。
+  \item ランタイムと QEC 回路の境界を「シェル」として切り出す設計意図を理解します。
+  \item mpp 版 \texttt{ls\_handoff\_shells} が提供する API（\texttt{build\_ls\_s\_shell}、\texttt{build\_ls\_t\_injection\_shell}、\texttt{decode\_shell}）を把握します。
+  \item この段階で確認できる合否基準と、回路レベル版で強化される点を区別できるようになります。
+  \end{itemize}
+\end{chaptergoal}
+
+前章では、格子手術を「符号変形（code deformation）」として幾何的に眺め、seam 上のスタビライザと merge/split の遷移検出器を GF2 の合成則として整理しました。
+本章ではいったんその幾何を脇に置き、論理量子ビットのパッチそのものを 1 つの操作対象として扱う\textbf{論理レベル}の格子手術に立ちます。
+ここでの主役は個々のデータ量子ビットではなく、パッチの論理演算子 $X_L,Z_L,Y_L$ です。
+\codepath{src/stages/01_mpp/src/ftqc/lattice_surgery.py} は、この論理レベルの LS CNOT・LS S を MPP 測定の組み合わせとして実装しており、ハイブリッドランタイムはそれを\textbf{シェル}という単位でハンドオフ点に呼び出します。
+どこまでが「論理レベルの近道」であり、どこからが回路レベルで初めて現れる現象かを区別しておくことが、後段の章（第 IV 部・回路レベル拡張）を読む準備になります。
+
+\begin{notebox}
+  Stage: \textbf{01}。
+  説明用コードは主に \codepath{src/stages/01_mpp/src/ftqc/} を用います。
+  本章のコード引用は \codepath{src/stages/01_mpp/src/ftqc/lattice_surgery.py} と \codepath{src/stages/01_mpp/src/ftqc/ls_handoff_shells.py} に限定し、実際に存在する関数・データクラスのみを扱います。
+\end{notebox}
+
+\section{論理レベル LS-S / LS 操作}\label{sec:logical_ls}
+
+\subsection{\texttt{lattice\_surgery.py} の役割}\label{subsec:ls_role}
+
+各論理量子ビットは、これまでの章と同じ rotated 表面符号の $d=3$ パッチ（データ量子ビット 9 個）として表されます。
+\texttt{lattice\_surgery.py} は次の定数でパッチの構造を固定します。
+
+\begin{lstlisting}[language=Python, caption={パッチのスタビライザと論理演算子の支持集合（src/stages/01\_mpp/src/ftqc/lattice\_surgery.py）}]
+STABS = [("X", [0, 1]), ("Z", [0, 1, 3, 4]), ("X", [1, 2, 4, 5]), ("Z", [2, 5]),
+         ("Z", [3, 6]), ("X", [3, 4, 6, 7]), ("Z", [4, 5, 7, 8]), ("X", [7, 8])]
+XL = [0, 3, 6]
+ZL = [0, 1, 2]
+NDATA = 9
+\end{lstlisting}
+
+\texttt{LatticeSurgery} クラスは、この 1 パッチを $n$ 個複製し、パッチ間の\textbf{論理演算子どうしの joint 測定}を組み立てるビルダです。
+コンストラクタが持つ状態は、Stim 回路 \texttt{self.c}、絶対測定インデックスの通し番号 \texttt{self.mc}、そして検出器制約を絶対インデックスのまま蓄える \texttt{self.detectors} のリストです。
+
+\begin{lstlisting}[language=Python, caption={LatticeSurgery のコンストラクタと MPP 発行（src/stages/01\_mpp/src/ftqc/lattice\_surgery.py）}]
+def __init__(self, n_patches, merge_rounds=3, p=0.0, noise=False):
+    self.n = n_patches
+    self.mr = merge_rounds
+    self.p = float(p)
+    self.noise = bool(noise)
+    self.pp = self.p if self.noise else 0.0
+    self.c = stim.Circuit()
+    self.mc = 0
+    self.detectors = []   # list of lists of abs indices (XOR=0 expected, noiseless)
+    ...
+
+def _mpp(self, ops_global, p=None):
+    """ops_global: list of (global_qubit,'X/Y/Z'). returns record index."""
+    ...
+    self.c.append("MPP", tg, pp)
+    idx = self.mc
+    self.mc += 1
+    return idx
+\end{lstlisting}
+
+検出器は測定を追加するたびに絶対インデックスの組として記録され、すべてのゲジェットを積み終えた後に \texttt{append\_detectors()} が一括で \texttt{stim.target\_rec} 形式へ変換します。
+このメソッドは \texttt{self.\_detectors\_appended} フラグでべき等になっており、複数のシェルビルダから安全に呼べます。
+
+\subsection{MPP 測定との対応}\label{subsec:mpp_correspondence}
+
+第9章で見た MPP バックボーンは、1 パッチ内のスタビライザや論理演算子を測る道具でした。
+論理レベル LS の核心は、\textbf{2 つのパッチにまたがる論理演算子の積} $P_L(A)\cdot P_L(B)$ を、パッチ内の測定と同じ 1 回の \texttt{MPP} 命令で直接測ってしまう、という近道です。実際の格子手術ではこの joint parity を局所的な境界測定の merge/split から得ます\cite{horsman2012lattice,litinski2019game}。
+\texttt{joint\_measure} はこれを $d$ ラウンド（\texttt{merge\_rounds}）繰り返し、ラウンド間の一致を検出器として積み上げます。
+
+\begin{lstlisting}[language=Python, caption={joint 測定 $M_{PP}(A,B)$ の反復（src/stages/01\_mpp/src/ftqc/lattice\_surgery.py）}]
+def joint_measure(self, P, A, B):
+    ops = [(self.base(A) + l, p) for l, p in logical_ops(P)] + \
+          [(self.base(B) + l, p) for l, p in logical_ops(P)]
+    last = None
+    idxs = []
+    for r in range(self.mr):
+        idx = self._mpp(ops)
+        idxs.append(idx)
+        if last is not None:
+            self.detectors.append([idx, last])
+        last = idx
+        self.stab_round([A, B])
+    return idxs[-1]
+\end{lstlisting}
+
+この \texttt{joint\_measure} を土台に、LS CNOT と LS S のゲジェットが組まれます。
+補正は、測定結果のビットを XOR して読み出しを反転するかどうかを表す辞書 \verb|{"Z": [(qubit, [rec_idxs])], "X": [...]}| として返されます。
+
+\begin{lstlisting}[language=Python, caption={LS CNOT と LS S のゲジェット（src/stages/01\_mpp/src/ftqc/lattice\_surgery.py）}]
+def ls_cnot(self, ctrl, tgt, anc):
+    self.prep(anc, "+")
+    m_zz = self.joint_measure("Z", ctrl, anc)
+    m_xx = self.joint_measure("X", anc, tgt)
+    m_anc = self.measure_logical(anc, "Z")
+    return {"Z": [(ctrl, [m_xx])], "X": [(tgt, [m_zz, m_anc])]}
+
+def ls_s(self, tgt, anc):
+    m_prep = self.prep(anc, "Y")          # |Y_L=±1> の射影結果
+    m_zz = self.joint_measure("Z", tgt, anc)
+    m_x = self.measure_logical(anc, "X")
+    # 補正: Z_tgt if (m_zz xor m_x xor m_prep)  (m_prep は S vs S† を吸収)
+    return {"Z": [(tgt, [m_zz, m_x, m_prep])], "X": []}
+\end{lstlisting}
+
+LS CNOT は $M_{ZZ}(\mathrm{ctrl},\mathrm{anc})$、$M_{XX}(\mathrm{anc},\mathrm{tgt})$、アンシラの $Z_L$ 測定という 3 段の joint/単独測定から補正則を導きます。
+LS S はアンシラを $\ket{Y_L}=S\ket{+_L}$（Clifford なスタビライザ状態なので非 Clifford 魔法状態の蒸留は不要）へ射影してから使う点が異なり、その射影結果 \texttt{m\_prep} が $S$ と $S^\dagger$ のどちらがかかったかを吸収します\cite{horsman2012lattice}。
+これらの正しさは、\texttt{run\_validation} が参照用の理想 Clifford 回路（\texttt{stim.Circuit} で書いた $H,X,\mathrm{CX},S$ の列）とサンプル分布を比較し、全変動距離（TVD）で確認します。
+実際に \texttt{demo()} を実行すると、Bell 状態生成で TVD $\approx 0.02$、$\ket{1}\!\to\!\text{CNOT}$ や LS S 系列では TVD $= 0.000$ となり、\texttt{merge\_rounds=3} の 2 パッチ joint 測定だけで検出器が 58 個生成されることが確認できます。
+この段階の合否基準は「理想分布との一致」というシンプルな形であり、検出器を実際にデコードして論理誤り率を出す評価は後段（第 IV 部以降）まで持ち越されます。
+
+\section{シェルという抽象}\label{sec:shell_abstract}
+
+\subsection{ランタイムからのハンドオフ}\label{subsec:handoff}
+
+ハイブリッドランタイム（\texttt{hybrid\_ftqc\_runtime.py}）は、Clifford の塊を Stim + デコーダで処理し、非 Clifford な $T/T^\dagger$ を状態ベクトルバックエンドで処理する、という 2 つの経路を切り替えながら走ります（詳細は次章・第13章）。
+問題は、この切り替えの\textbf{境界}です。
+Stim は非スタビライザな魔法状態 $\ket{A}$ を表現できないため、$T$ そのものの更新は状態ベクトル側に委ねるしかありません。
+しかし、その境界を挟む論理パッチの安定化・joint 測定・検出器という「スタビライザ骨格」の部分は、Stim でそのまま検証可能です。
+\texttt{ls\_handoff\_shells.py} は、この骨格部分だけを切り出して「検出器付きの自己完結した Stim 回路」として包む役割を持ち、モジュール冒頭のコメントは次のように境界を明記します。
+
+\begin{lstlisting}[language=Python, caption={シェルの境界（src/stages/01\_mpp/src/ftqc/ls\_handoff\_shells.py）}]
+"""
+Stim cannot represent the non-stabilizer magic state |A>.  Therefore the true T
+state update is still performed by the logical state-vector backend.  The Stim
+circuit constructed here is the stabilizer/QEC skeleton around the handoff:
+logical patches, repeated joint measurements, detector constraints, decoding,
+and an observable on the data patch.  Magic-state quality is modeled separately
+by t_gate.py and sampled by the runtime.
+"""
+\end{lstlisting}
+
+このランタイムとシェルのハンドオフ構造を図\ref{fig:ch11_shell_blackbox}に示します。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[
+    scale=0.92,
+    every node/.style={transform shape},
+    box/.style={rectangle, draw=black!70, thick, rounded corners=4pt, align=center, font=\footnotesize},
+    runtimebox/.style={box, fill=blue!8, draw=blue!70!black, minimum width=9.6cm, minimum height=1.3cm},
+    shellbox/.style={box, fill=black!4, draw=black!80, line width=1.2pt, minimum width=9.6cm, minimum height=4.3cm},
+    innerbox/.style={box, fill=white, draw=black!40, thin, minimum width=8.8cm, align=left, font=\scriptsize},
+    outbox/.style={box, fill=green!8, draw=green!60!black, minimum width=9.6cm, minimum height=1.4cm},
+    arrow/.style={-{Stealth[scale=1.1]}, thick, line width=1.2pt},
+  ]
+    % 1. 入力: ランタイム（上段）
+    \node[runtimebox] (runtime) at (0, 4.0) {
+      \textbf{\normalsize ランタイムからのハンドオフ（論理演算の要求）}\\[2pt]
+      \texttt{build\_ls\_s\_shell(p, merge\_rounds, ...)} \quad / \quad \texttt{build\_ls\_t\_injection\_shell(...)}\\
+      {\scriptsize 入力パラメータ: \texttt{logical\_target}, \texttt{merge\_rounds}, 物理誤り率 \texttt{p}, ノイズ有無 \texttt{noise}}
+    };
+
+    % 2. シェル: ブラックボックス（中段）
+    \node[shellbox] (shell) at (0, 0.3) {};
+    \node[anchor=north, font=\normalsize\bfseries, text=black] at (shell.north) [yshift=-8pt] {シェル（\texttt{ShellCircuit}）};
+
+    \node[innerbox] (in1) at (0, 0.7) {
+      \textbf{隠蔽されるスタビライザ骨格（Stim 回路と検出器の束）:}\\
+      \textbullet\ 論理パッチの初期化とスタビライザ測定\\
+      \textbullet\ $M_{PP}$ joint 測定の反復（$d$ ラウンドのシンドローム抽出）\\
+      \textbullet\ 検出器制約の束（\texttt{DETECTOR}）と論理観測量（\texttt{OBSERVABLE\_INCLUDE}）\\
+      \textbullet\ メタデータ: \texttt{kind}, \texttt{note}, \texttt{observable\_to\_logical}
+    };
+
+    \node[innerbox, fill=yellow!8, draw=orange!60!black] (in2) at (0, -0.9) {
+      \textbf{デコードの実行（\texttt{decode\_shell}）:}\\
+      \textbullet\ 検出器・観測量のサンプリング $\to$ MWPM（失敗時は BP+OSD へフォールバック）\\
+      \textbullet\ 観測量予測値と反転の一致判定から残差を計算: \texttt{residuals = obs $\oplus$ pred}
+    };
+
+    % 3. 出力: デコード結果（下段）
+    \node[outbox] (out) at (0, -3.2) {
+      \textbf{\normalsize 出力（\texttt{ShellDecodeResult}）}\\[2pt]
+      残差データ: \texttt{residuals} (残差 Pauli ビット) \quad / \quad デコーダ種別: \texttt{decoder} ("MWPM" 等)\\
+      {\scriptsize \textbf{ランタイムへの反映:} \texttt{observable\_to\_logical} により該当論理量子ビットへ残差注入・状態ベクトル更新}
+    };
+
+    % 矢印
+    \draw[arrow, blue!70!black] (runtime.south) -- node[right=6pt, font=\scriptsize\bfseries, text=blue!70!black] {論理演算の要求} (shell.north);
+    \draw[arrow, green!60!black] (shell.south) -- node[right=6pt, font=\scriptsize\bfseries, text=green!60!black] {デコード結果の返却} (out.north);
+
+  \end{tikzpicture}
+  \caption{シェル抽象（\texttt{ShellCircuit}）のブラックボックス概念図。ランタイムは物理的な Stim 回路の構造や検出器配置を意識せず、論理演算の要求（\texttt{build\_ls\_s\_shell} など）をシェルへ渡します。シェル内部はスタビライザ骨格・反復 joint 測定・検出器制約の束としてカプセル化されており、\texttt{decode\_shell} を経てデコードされた残差（\texttt{residuals}）のみを \texttt{ShellDecodeResult} としてランタイムへ返します。}
+  \label{fig:ch11_shell_blackbox}
+\end{figure}
+
+\subsection{検出器付き Stim 回路の束}\label{subsec:shell_bundle}
+
+シェルは 1 個の \texttt{stim.Circuit} だけでなく、ランタイムが結果を論理量子ビットへ写し戻すためのメタデータを束ねたデータクラスとして定義されます。
+
+\begin{lstlisting}[language=Python, caption={ShellCircuit / ShellDecodeResult（src/stages/01\_mpp/src/ftqc/ls\_handoff\_shells.py）}]
+@dataclass
+class ShellCircuit:
+    circuit: object
+    observable_to_logical: List[int]
+    kind: str
+    note: str
+
+
+@dataclass
+class ShellDecodeResult:
+    residuals: np.ndarray
+    decoder: str
+    note: str
+\end{lstlisting}
+
+\texttt{observable\_to\_logical} は、シェル内部で \texttt{OBSERVABLE\_INCLUDE} に登録した観測量（列インデックス）が、システム全体のどの論理量子ビットの $X_L$ 残差に対応するかを示す写像です。
+\texttt{note} には、そのシェルがどこまで忠実で、どこを簡略化したかが必ず一言で記録されます（本章のスコープ外の議論もこの \texttt{note} を根拠にします）。
+シェルのデコードは \texttt{decode\_shell} に一本化されており、MWPM が失敗した場合に BP+OSD へフォールバックする構造を持ちます。
+
+\begin{lstlisting}[language=Python, caption={decode\_shell（src/stages/01\_mpp/src/ftqc/ls\_handoff\_shells.py）}]
+def decode_shell(shell: ShellCircuit, shots: int = 1000) -> ShellDecodeResult:
+    circ = shell.circuit
+    det, obs = circ.compile_detector_sampler().sample(shots, separate_observables=True)
+    try:
+        dem = circ.detector_error_model(decompose_errors=True)
+        matcher = pymatching.Matching.from_detector_error_model(dem)
+        pred = matcher.decode_batch(det)
+        decoder = "MWPM"
+    except ValueError:
+        from stimbposd import BPOSD
+        dem = circ.detector_error_model(decompose_errors=False)
+        pred = BPOSD(dem, max_bp_iters=40).decode_batch(det)
+        decoder = "BP+OSD"
+    residuals = (obs ^ pred).astype(np.uint8)
+    ...
+    return ShellDecodeResult(residuals=residuals, decoder=decoder, note=shell.note)
+\end{lstlisting}
+
+このシェル抽象のおかげで、ランタイムは「Stim を直接触る」代わりに「シェルを組み立て、サンプルし、\texttt{observable\_to\_logical} で写し戻す」という一様な手続きだけを知っていればよくなります。
+このパターンは後段（回路レベル・さらに発展的な符号）でも繰り返し使われる、本書の基本設計です。
+
+\section{mpp 版 ls\_handoff\_shells}\label{sec:mpp_shells}
+
+\subsection{提供 API}\label{subsec:mpp_api}
+
+\codepath{src/stages/01_mpp/src/ftqc/ls_handoff_shells.py} が提供する公開関数は次の 3 つです。
+
+\begin{itemize}
+  \item \texttt{build\_ls\_s\_shell(p=0.005, merge\_rounds=3, noise=True, logical\_target=0)}
+  \item \codeinline{build_ls_t_injection_shell(p=0.005, merge_rounds=3, noise=True, logical_target=0, include_s_correction_shell=True)}
+  \item \texttt{decode\_shell(shell, shots=1000)}
+\end{itemize}
+
+\texttt{build\_ls\_s\_shell} は、データパッチを $\ket{0_L}$ に初期化し、\texttt{ls\_s(0, anc=1)} を適用したあと $Z_L$ を測って観測量に登録するだけの、2 パッチのシェルです。
+
+\begin{lstlisting}[language=Python, caption={build\_ls\_s\_shell（src/stages/01\_mpp/src/ftqc/ls\_handoff\_shells.py）}]
+def build_ls_s_shell(p=0.005, merge_rounds=3, noise=True, logical_target=0) -> ShellCircuit:
+    from lattice_surgery import LatticeSurgery
+    ls = LatticeSurgery(2, merge_rounds=merge_rounds, p=p, noise=noise)
+    ls.prep(0, "0")
+    ls.ls_s(0, anc=1)
+    z_rec = ls.measure_logical(0, "Z")
+    _append_observable(ls, z_rec, obs_index=0)
+    ls.append_detectors()
+    return ShellCircuit(circuit=ls.c, observable_to_logical=[logical_target],
+                         kind="ls_s_shell", note="...")
+\end{lstlisting}
+
+$S\ket{0}=\ket{0}$ なので、ノイズなしの参照では $Z_L$ は決定論的に $0$ になります。
+つまりこの観測量は「$S$ 補正を挟んだ経路で $X_L$ 誤りがどれだけ紛れ込んだか」を測る残差推定器として機能します。
+\texttt{build\_ls\_t\_injection\_shell} は同じ発想を $T$ ハンドオフへ拡張し、データ $\ket{0_L}$ とプレースホルダ用の魔法パッチ $\ket{+_L}$ の間で LS CNOT を行い、魔法パッチを測定した後、\texttt{include\_s\_correction\_shell=True} なら追加のアンシラで \texttt{ls\_s} を常時適用します。
+
+\begin{lstlisting}[language=Python, caption={build\_ls\_t\_injection\_shell の骨格（src/stages/01\_mpp/src/ftqc/ls\_handoff\_shells.py）}]
+n_patches = 4 if include_s_correction_shell else 3
+ls = LatticeSurgery(n_patches, merge_rounds=merge_rounds, p=p, noise=noise)
+ls.prep(0, "0")
+ls.prep(1, "+")
+ls.ls_cnot(0, 1, anc=2)
+ls.measure_logical(1, "Z")
+if include_s_correction_shell:
+    ls.ls_s(0, anc=3)
+z_rec = ls.measure_logical(0, "Z")
+_append_observable(ls, z_rec, obs_index=0)
+\end{lstlisting}
+
+ここで \texttt{note} に明記されている通り、実際のゲートテレポーテーションでは注入測定の結果に応じて条件付きで $S$ をかけるべきですが、このシェルは常時オンの保守的な近似です。
+ハイブリッドランタイム側の \texttt{hybrid\_ftqc\_runtime.\_sample\_ls\_s\_shell\_residuals} は、この API を次のように呼び出し、観測量の残差をシステム全体の残差行列へ散らします。
+
+\begin{lstlisting}[language=Python, caption={ランタイムからの呼び出し（src/stages/01\_mpp/src/ftqc/hybrid\_ftqc\_runtime.py）}]
+from ls_handoff_shells import build_ls_s_shell, decode_shell
+shell = build_ls_s_shell(p=self.p_phys, merge_rounds=self.ls_merge_rounds,
+                          noise=True, logical_target=target)
+decoded = decode_shell(shell, shots=shots)
+full = np.zeros((shots, self.n), dtype=np.uint8)
+for col, logical_q in enumerate(shell.observable_to_logical):
+    full[:, int(logical_q)] ^= decoded.residuals[:, col].astype(np.uint8)
+\end{lstlisting}
+
+\subsection{回路レベル版との違いを予告}\label{subsec:preview_circuit_level}
+
+第19章「回路レベル Shell API」（\codepath{src/stages/02_circuit_level/src/ftqc/}）では \texttt{decode\_shell} が生き残りますが、次の点が強化されます。
+
+\begin{itemize}
+  \item \texttt{decode\_shell} は明示的に \texttt{allow\_gauge\_detectors} を使わないガードを持ち、非決定論的な検出器が混入したら例外として素通しします。
+  \item \texttt{seed} 引数によるサンプリングの再現性が加わります（本章の \texttt{decode\_shell(shell, shots)} にはまだ \texttt{seed} 引数がありません）。
+  \item LS CNOT 専用の \texttt{build\_ls\_cnot\_shell} など、ゲジェットごとの独立したシェルが増えます。
+  \item 論理レベルの joint 測定 $M_{PP}(A,B)$ という近道が、アンシラ経由の実際の回路レベル抽出（hook 誤りを含む）に置き換わります。
+\end{itemize}
+
+これらは \codepath{src/stages/01_mpp/src/ftqc/ls_handoff_shells.py} には\textbf{まだ存在しない}機能であり、本章ではそれを予告として述べるにとどめます。
+
+\section{まとめ}\label{ch11:summary}
+
+\begin{itemize}
+  \item \texttt{lattice\_surgery.py} は、パッチの論理演算子どうしの joint 測定 $M_{PP}(A,B)$ を核として LS CNOT と LS S を構成し、$d$ ラウンド反復と検出器で守ります。
+  \item この joint 測定は、2 パッチにまたがる論理演算子の積を 1 回の \texttt{MPP} で直接測る「論理レベルの近道」であり、回路レベルのアンシラ抽出（第 IV 部）とは別物です。
+  \item シェル（\texttt{ShellCircuit}/\texttt{ShellDecodeResult}）は、Stim が表現できない魔法状態の更新をランタイムの状態ベクトル側に委ねつつ、その周囲のスタビライザ骨格だけを検出器付き Stim 回路として切り出す抽象です。
+  \item mpp 版 \texttt{ls\_handoff\_shells} は \texttt{build\_ls\_s\_shell}、\texttt{build\_ls\_t\_injection\_shell}、\texttt{decode\_shell} の 3 関数を提供し、MWPM$\to$BP+OSD のフォールバックでデコードします。
+  \item \texttt{include\_s\_correction\_shell} の常時オン近似のように、簡略化した点は \texttt{note} フィールドに明記するという流儀が徹底されています。
+\end{itemize}
+
+\subsection*{合否基準での検証}
+
+この段階での正しさの確認は、\texttt{run\_validation} による\textbf{有限ショットの標本分布と理想分布の一致}（TVD が小さい）が中心です。したがって TVD は統計的検証量であり、厳密な恒等式の証明ではありません。
+実測では、Bell 状態生成で TVD $\approx 0.02$、$X$ 状態への CNOT や LS S 系列では TVD $=0.000$ となり、\texttt{merge\_rounds=3} の 2 パッチ構成で検出器が 58 個組まれることを確認できます。
+
+一方で、明記しておくべき制約もあります。
+\texttt{stab\_round} は「ラウンド 0 の $Z$ 型スタビライザは決定論的」という前提を、アンシラの初期化基底に関わらず適用しています。
+これは $\ket{0_L}$ 初期化には正しいのですが、\texttt{prep(anc, "+")} や \texttt{prep(anc, "Y")} のように $X/Y$ 基底で初期化するアンシラ（LS CNOT・LS S・両シェルの内部で使われます）には当てはまりません。
+実際に \texttt{LatticeSurgery(1).prep(0, "+")} だけを組んでノイズなし（$p=0$）でサンプルすると、round 0 の 4 個の検出器がいずれも約 50\% の確率で発火し、\texttt{build\_ls\_s\_shell}/\texttt{build\_ls\_t\_injection\_shell} 全体でも一部の検出器列が数 \% 発火します。
+つまり、\textbf{「ノイズなしで gauge 検出器ゼロ」という本書の合否基準は、この段階の実装ではまだ厳密には満たされていません}。
+graphlike 距離（\texttt{shortest\_graphlike\_error}）や \texttt{seed} 付き再現性のチェックも、この論理レベルのシェルにはまだ導入していません。
+また、joint MPP の反復は本章の現象論的な測定反転を検出しますが、それだけで回路レベルの符号距離やフック誤り耐性を保証しません。これらは局所アンシラ抽出まで展開した後に検証する必要があります\cite{horsman2012lattice,fowler2012surface}。
+これらは、基底に依存しない一様な検出器則と \texttt{allow\_gauge\_detectors} を使わない明示的なガードが整う回路レベル版（第 IV 部、特に第19章）で強化される点として、本章では明示するにとどめます。
+
+次章では、この節で境界として扱った魔法状態そのもの、すなわち $T$ ゲート・ゲートテレポーテーション・15-to-1 蒸留と、状態ベクトル経路と QPD 経路という 2 つの実現方法を見ていきます。
+
+\begin{exercise}
+  \begin{enumerate}
+    \item \texttt{joint\_measure("Z", A, B)} が測る演算子と、回路レベルの格子手術がアンシラ・CNOT を介して同じ情報をどのように抽出するかを比較し、論理レベルの joint 測定が「捨てている」情報（hook 誤りの起点になり得る中間過程）を 1 つ挙げなさい。
+    \item \texttt{ls\_cnot} の補正則 $\{Z_{\mathrm{ctrl}}\!\leftarrow\! m_{xx},\ X_{\mathrm{tgt}}\!\leftarrow\! m_{zz}\oplus m_{\mathrm{anc}}\}$ を、$M_{ZZ}(\mathrm{ctrl},\mathrm{anc})$、$M_{XX}(\mathrm{anc},\mathrm{tgt})$、$Z_L(\mathrm{anc})$ の測定結果から手で導出し、標準的なテレポーテーション型 CNOT の補正則と対応づけなさい。
+    \item 本章で示した \texttt{LatticeSurgery(1).prep(0, "+")} の最小再現コードを実際に実行し、round 0 の検出器がノイズなしでも確率的に発火することを確認しなさい。さらに、この挙動が \texttt{build\_ls\_s\_shell} のように $\ket{Y_L}$ 射影を含むシェル全体にどのような影響を与えうるかを議論しなさい。
+  \end{enumerate}
+\end{exercise}

@@ -1,0 +1,541 @@
+% Stage: 02 ／ 説明用コード: src/stages/02\_circuit\_level/src/ftqc
+\chapter{格子手術 CNOT}\label{ch:ls_cnot}
+
+\begin{chaptergoal}
+  \begin{itemize}
+  \item $M_{ZZ}$ と $M_{XX}$ の 2 種類の合流測定を組み合わせた測定ベース CNOT の仕組みを理解します。
+  \item アンシラパッチを挟んだ split–merge–split スケジュールで、3 パッチを使う格子手術 CNOT を構成できるようになります。
+  \item 物理的な補正ゲートの代わりに観測量そのものへ補正ビットを織り込む、フレーム補正観測量の考え方を理解します。
+  \item 計算基底の CNOT 真理値表・gauge 検出器ゼロ・回路レベル距離という 3 つの観点から実装を検証できるようになります。
+  \item 本章時点でまだ検証できない範囲（ノイズ付きデコード API・距離 2 バグの詳細）を把握し、後続章への見取り図を持ちます。
+  \end{itemize}
+\end{chaptergoal}
+
+前章では、2 パッチ間の合流測定を \texttt{CircuitLevelMerge} として回路レベルへ落とし込み、
+アンシラを介したシンドローム抽出と gauge 検出器ゼロ・距離 3 を確認しました。
+本章ではその手法を 3 パッチへ拡張し、制御パッチ $C$・アンシラパッチ $A$・標的パッチ $T$ の
+3 つの表面符号パッチを使って、測定だけで CNOT を実現する\textbf{格子手術 CNOT}を構成します。
+鍵となるのは、$M_{ZZ}$ による合流測定と $M_{XX}$ による合流測定を続けて行い、
+最後にアンシラを測定して得た古典ビットで論理観測量そのものを補正するという発想です。
+これは第5章で述べたソフトウェアのパウリフレーム追跡を、格子手術の文脈で具体化したものにあたります。
+
+\begin{notebox}
+  Stage: \textbf{02}。
+  説明用コードは主に \codepath{src/stages/02_circuit_level/src/ftqc/ls_cnot_ft.py} を用います。
+  クラス名は \texttt{LSCnotFT} で、この 1 ファイルに測定ベース CNOT の構成・フレーム補正観測量・
+  真理値表と距離の検証（\texttt{demo()} 関数）がまとまっています。
+\end{notebox}
+
+\section{測定ベース CNOT}\label{sec:mb_cnot}
+
+\subsection{アンシラを挟んだ 2 段階の合流測定}
+
+格子手術による CNOT は、次のレシピで実現できます
+（\codepath{src/stages/02_circuit_level/src/ftqc/ls_cnot_ft.py} の \texttt{LSCnotFT} クラスの冒頭コメントより）。
+
+\begin{itemize}
+  \item アンシラパッチ $A$ を論理状態 $\ket{+_L}$ に初期化する。
+  \item $M_{ZZ}(C,A)$：制御パッチ $C$ とアンシラ $A$ を $Z_L$ 方向に合流測定する。
+  \item $M_{XX}(A,T)$：アンシラ $A$ と標的パッチ $T$ を $X_L$ 方向に合流測定する。
+  \item アンシラ $A$ を $Z$ 基底で測定する。
+\end{itemize}
+
+$M_{ZZ}$ は $C$ と $A$ の論理演算子を一時的に量子もつれさせ、$Z_L(C)Z_L(A)$ という結合演算子の
+固有値を測定します。続く $M_{XX}$ は同様に $A$ と $T$ を量子もつれさせ、$X_L(A)X_L(T)$ を測定します。
+この 2 段階の合流測定を経ると、最終的に $C$ から $T$ へ CNOT がかかった状態が得られます。
+これは第11章で扱った論理レベルの格子手術ハンドオフを、$Z$ 型・$X$ 型の合流を連続して使うことで
+2 量子ビットゲートへ拡張したものにあたります。
+
+\subsection{L 字レイアウトと split–merge–split スケジュール}
+
+\texttt{LSCnotFT} は、この 3 パッチを次の L 字状に絶対座標で配置します。
+
+\begin{itemize}
+  \item $C$（制御）を上に置く。
+  \item $A$（アンシラ）を $C$ の下に置き、$C$–$A$ 間で $Z_L$ 方向の境界（seam）を共有する。
+  \item $T$（標的）を $A$ の右に置き、$A$–$T$ 間で $X_L$ 方向の境界を共有する。
+\end{itemize}
+
+言葉だけでは辺の対応が追いにくいので、図\ref{fig:ch16_ls_cnot_layout}に絶対座標での配置を起こしました。どの辺が $Z_L$ 方向で、どの辺が $X_L$ 方向かを、色で見分けられます。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[scale=0.58, font=\small, >=Stealth]
+    % 座標軸 (y は下向き: コードの row 方向に対応)
+    \draw[->, thick, gray!70] (0, 13) -- (13, 13) node[right, black] {$x$（列）};
+    \draw[->, thick, gray!70] (0, 13) -- (0, 0.2) node[below, black] {$y$（行）};
+    \foreach \v in {1, 3, 5, 7, 9, 11} {
+      \node[above, gray!80, font=\scriptsize] at (\v, 13) {\v};
+      \node[left, gray!80, font=\scriptsize] at (0, 13 - \v + 1) {\v};
+    }
+
+    % --- パッチ C (制御) ---
+    \fill[blue!4, rounded corners=2pt] (0.3, 8.5) rectangle (5.7, 13.5);
+    \draw[thick, blue!70!black, rounded corners=2pt] (0.3, 8.5) rectangle (5.7, 13.5);
+    \node[anchor=south, font=\bfseries\small, blue!70!black] at (3, 14.3) {パッチ $C$（制御）};
+
+    % --- パッチ A (論理アンシラ) ---
+    \fill[black!3, rounded corners=2pt] (0.3, 2.5) rectangle (5.7, 7.5);
+    \draw[logpatch, rounded corners=2pt] (0.3, 2.5) rectangle (5.7, 7.5);
+    \node[anchor=north, font=\bfseries\small, align=center] at (3, 1.7) {パッチ $A$\\（論理アンシラ $\ket{+_L}$）};
+
+    % --- パッチ T (標的) ---
+    \fill[red!4, rounded corners=2pt] (6.3, 2.5) rectangle (11.7, 7.5);
+    \draw[thick, red!70!black, rounded corners=2pt] (6.3, 2.5) rectangle (11.7, 7.5);
+    \node[anchor=north, font=\bfseries\small, red!70!black, align=center] at (9, 1.7) {パッチ $T$\\（標的）};
+
+    % 格子線 (各パッチ内のデータ量子ビットを結ぶ線)
+    \foreach \x in {1, 3, 5} {
+      \draw[gray!30, thin] (\x, 9) -- (\x, 13);
+      \draw[gray!30, thin] (\x, 3) -- (\x, 7);
+    }
+    \foreach \Y in {9, 11, 13} {
+      \draw[gray!30, thin] (1, \Y) -- (5, \Y);
+    }
+    \foreach \Y in {3, 5, 7} {
+      \draw[gray!30, thin] (1, \Y) -- (5, \Y);
+      \draw[gray!30, thin] (7, \Y) -- (11, \Y);
+    }
+    \foreach \x in {7, 9, 11} {
+      \draw[gray!30, thin] (\x, 3) -- (\x, 7);
+    }
+
+    % --- 接合面 (seam) ---
+    % M_ZZ seam: y=6 -> Y=8 (C と A の間)
+    \fill[blue!15, draw=blue!70!black, thick] (0.5, 7.6) rectangle (5.5, 8.4);
+    % ラベルは seam 中央に2行で配置（左右のアンシラと重ならないように）
+    \node[blue!85!black, font=\tiny\bfseries, align=center, fill=blue!10, inner sep=1pt, rounded corners=1pt] at (3, 8.0) {$M_{ZZ}$ seam\\($Z_L$ 境界)};
+
+    % M_XX seam: x=6 (A と T の間)
+    \fill[red!15, draw=red!70!black, thick] (5.6, 2.6) rectangle (6.4, 7.4);
+    \node[red!85!black, font=\scriptsize\bfseries, align=center] (xxlabel) at (8.5, 10.5) {$M_{XX}$ seam\\($X_L$ 境界)};
+    \draw[->, red!70!black, thick] (xxlabel) to[out=190, in=70] (6.1, 7.5);
+
+    % データ量子ビット (白丸)
+    \foreach \x in {1, 3, 5} {
+      \foreach \y in {1, 3, 5} {
+        \node[dataqubit] at (\x, 13 - \y + 1) {};
+      }
+      \foreach \y in {7, 9, 11} {
+        \node[dataqubit] at (\x, 13 - \y + 1) {};
+      }
+    }
+    \foreach \x in {7, 9, 11} {
+      \foreach \y in {7, 9, 11} {
+        \node[dataqubit] at (\x, 13 - \y + 1) {};
+      }
+    }
+
+    % シンドローム抽出アンシラ (灰丸)
+    % C バルク & 境界
+    \foreach \x/\y in {2/2, 4/2, 2/4, 4/4, 2/0, 4/0, 0/2, 0/4, 6/2, 6/4} {
+      \node[ancqubit] at (\x, 13 - \y + 1) {};
+    }
+    % A バルク & 境界
+    \foreach \x/\y in {2/8, 4/8, 2/10, 4/10, 0/8, 0/10, 2/12, 4/12} {
+      \node[ancqubit] at (\x, 13 - \y + 1) {};
+    }
+    % T バルク & 境界
+    \foreach \x/\y in {8/8, 10/8, 8/10, 10/10, 12/8, 12/10, 8/6, 10/6, 8/12, 10/12} {
+      \node[ancqubit] at (\x, 13 - \y + 1) {};
+    }
+
+    % seam 内のアンシラ
+    \node[ancqubit, fill=blue!80!black] at (1.0, 8) {};
+    \node[ancqubit, fill=blue!80!black] at (5.0, 8) {};
+    \node[ancqubit, fill=red!80!black] at (6, 5) {};
+    \node[ancqubit, fill=red!80!black] at (6, 3) {};
+
+    % --- 凡例 (Legend) ---
+    \begin{scope}[shift={(13.2, 2.5)}]
+      \draw[draw=black!25, fill=white, rounded corners=3pt] (-0.3, -0.4) rectangle (5.2, 7.6);
+      \node[anchor=north west, font=\bfseries\small] at (-0.1, 7.3) {【凡例】};
+      
+      \node[dataqubit] at (0.3, 6.2) {};
+      \node[right, font=\scriptsize] at (0.7, 6.2) {データ量子ビット ($3\times3$)};
+
+      \node[ancqubit] at (0.3, 5.2) {};
+      \node[right, font=\scriptsize] at (0.7, 5.2) {シンドローム抽出アンシラ};
+
+      \draw[logpatch] (0.0, 4.0) rectangle (0.6, 4.4);
+      \node[right, font=\scriptsize, align=left] at (0.7, 4.2) {論理アンシラパッチ $A$\\（破線枠）};
+
+      \draw[thick, blue!70!black] (0.0, 3.0) -- (0.6, 3.0);
+      \node[right, font=\scriptsize] at (0.7, 3.0) {$M_{ZZ}$ seam（青、$Z_L$ 境界）};
+
+      \draw[thick, red!70!black] (0.0, 2.0) -- (0.6, 2.0);
+      \node[right, font=\scriptsize] at (0.7, 2.0) {$M_{XX}$ seam（赤、$X_L$ 境界）};
+
+      \draw[thick, black!60] (0.0, 0.8) rectangle (0.6, 1.2);
+      \node[right, font=\scriptsize] at (0.7, 1.0) {データパッチ $C, T$（実線枠）};
+    \end{scope}
+  \end{tikzpicture}
+  \caption{3つの表面符号パッチのL字レイアウトと絶対座標配置。制御パッチ $C$（上）と論理アンシラパッチ $A$（下、破線枠）は $Z_L$ 境界（$M_{ZZ}$ seam）で接し、$A$ と標的パッチ $T$（右）は $X_L$ 境界（$M_{XX}$ seam）で接します。各パッチ内の白丸はデータ量子ビット、灰丸はシンドローム抽出用の補助量子ビットです。}
+  \label{fig:ch16_ls_cnot_layout}
+\end{figure}
+
+各パッチは $3\times3$ の格子点からなる 1 つの表面符号パッチで、\texttt{\_patch\_cells} 関数で
+座標が生成されます。3 パッチ分のデータ量子ビットとスタビライザのアンシラ（合流測定用の補助量子ビット、
+以下「シンドローム抽出アンシラ」と呼び、論理アンシラパッチ $A$ とは区別します）を
+すべて 1 つの絶対座標系に配置することで、$C$–$A$、$A$–$T$ という異なる境界のスタビライザを
+統一的に列挙できます（\texttt{\_enum\_stabs} 関数、第10章の plaquette 規則と同じ考え方です）。
+
+回路全体のスケジュールは、\texttt{build} メソッド内で次のように組まれています。
+
+\begin{lstlisting}[language=Python, caption={src/stages/02\_circuit\_level/src/ftqc/ls\_cnot\_ft.py の merge スケジュール}]
+schedule = ([("split", self.split_info)] * split_rounds +
+            [("zz", self.zz_info)] * merge_rounds +
+            [("split", self.split_info)] * split_rounds +
+            [("xx", self.xx_info)] * merge_rounds +
+            [("split", self.split_info)] * split_rounds)
+\end{lstlisting}
+
+このリストは 5 つのフェーズを並べたものですが、各フェーズでどのパッチが繋がり、どのパッチが離れているのかまでは読み取れません。図\ref{fig:ch16_ls_cnot_schedule}のコマ図が、その時間発展を 1 コマずつ展開したものです。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[scale=0.9, font=\small, >=Stealth]
+    % 時間軸矢印
+    \draw[->, thick, gray!60] (-0.1, 3.4) -- (12.2, 3.4) node[right, black, font=\scriptsize\bfseries] {時間（ラウンド進行）};
+
+    \foreach \i/\title/\subt/\detail in {
+      0/{コマ1: split}/{\texttt{split\_rounds} (2)}/{全パッチ分離},
+      1/{コマ2: zz merge}/{\texttt{merge\_rounds} (3)}/{$C$–$A$ 結合 ($M_{ZZ}$)},
+      2/{コマ3: split}/{\texttt{split\_rounds} (2)}/{全パッチ分離},
+      3/{コマ4: xx merge}/{\texttt{merge\_rounds} (3)}/{$A$–$T$ 結合 ($M_{XX}$)},
+      4/{コマ5: split}/{\texttt{split\_rounds} (2)}/{全パッチ分離}
+    } {
+      \begin{scope}[shift={(\i*2.45, 0)}]
+        % コマ外枠
+        \draw[black!25, rounded corners=3pt, fill=white] (-0.05, -1.15) rectangle (2.05, 3.0);
+        % コマタイトル
+        \node[font=\footnotesize\bfseries, align=center] at (1.0, 2.7) {\title};
+
+        % パッチ C (上)
+        \fill[blue!6] (0.15, 1.35) rectangle (0.95, 2.15);
+        \draw[thick, blue!70!black] (0.15, 1.35) rectangle (0.95, 2.15);
+        \node[font=\tiny\bfseries, blue!85!black] at (0.55, 1.75) {$C$};
+
+        % パッチ A (下、破線枠 logpatch)
+        \fill[black!3] (0.15, 0.15) rectangle (0.95, 0.95);
+        \draw[logpatch] (0.15, 0.15) rectangle (0.95, 0.95);
+        \node[font=\tiny\bfseries] at (0.55, 0.55) {$A$};
+
+        % パッチ T (右)
+        \fill[red!6] (1.15, 0.15) rectangle (1.95, 0.95);
+        \draw[thick, red!70!black] (1.15, 0.15) rectangle (1.95, 0.95);
+        \node[font=\tiny\bfseries, red!85!black] at (1.55, 0.55) {$T$};
+
+        % 接合面 (seam)
+        \ifnum\i=1
+          % C-A 結合 (青)
+          \fill[blue!35, draw=blue!80!black, thick] (0.15, 0.95) rectangle (0.95, 1.35);
+          \node[font=\tiny\bfseries, blue!90!black] at (0.55, 1.15) {$M_{ZZ}$};
+        \fi
+        \ifnum\i=3
+          % A-T 結合 (赤)
+          \fill[red!35, draw=red!80!black, thick] (0.95, 0.15) rectangle (1.15, 0.95);
+          \node[font=\tiny\bfseries, red!90!black, rotate=90] at (1.05, 0.55) {$M_{XX}$};
+        \fi
+
+        % コマ下部ラベル (ラウンド数)
+        \node[font=\scriptsize, align=center, text=black!85] at (1.0, -0.45) {\subt};
+        \node[font=\tiny, text=black!60, align=center] at (1.0, -0.85) {\detail};
+      \end{scope}
+
+      % コマ間の矢印
+      \ifnum\i<4
+        \draw[->, thick, black!35] (\i*2.45 + 2.1, 1.0) -- (\i*2.45 + 2.35, 1.0);
+      \fi
+    }
+  \end{tikzpicture}
+  \caption{格子手術 CNOT の split–merge–split スケジュール時系列コマ図。全5フェーズ（split $\to$ zz merge $\to$ split $\to$ xx merge $\to$ split）が順に実行されます。zz merge では制御 $C$ とアンシラ $A$ の接合面スタビライザ（青）が有効化され、xx merge ではアンシラ $A$ と標的 $T$ の接合面スタビライザ（赤）が有効化されます。各コマ下部にラウンド数（既定値: split は 2 ラウンド、merge は 3 ラウンド）を示しています。}
+  \label{fig:ch16_ls_cnot_schedule}
+\end{figure}
+
+つまり、3 パッチが分離した状態で符号サイクルを回す「split」フェーズと、
+$C$–$A$ を 1 つの符号として扱う「zz」フェーズ、$A$–$T$ を 1 つの符号として扱う「xx」フェーズを、
+split–merge–split–merge–split の順に並べています。前章の 2 パッチ合流を、
+$M_{ZZ}$ 用と $M_{XX}$ 用で 2 回繰り込んだ形になっている、と捉えると理解しやすくなります。
+各フェーズの切り替わりでは、シンドローム抽出アンシラをすべてリセットしてから
+1 ラウンド分の抽出回路（\texttt{\_round} メソッド、CX の順序は前章と同じ hook 誤り回避の
+4 ステップ順）を走らせます。
+
+初期化は次のように、$A$ のみを $\ket{+_L}$ にし、$C$・$T$ は $\ket{0_L}$（\texttt{control\_one} /
+\texttt{target\_one} を真にすると $\ket{1_L}$）にします。
+
+\begin{lstlisting}[language=Python, caption={src/stages/02\_circuit\_level/src/ftqc/ls\_cnot\_ft.py の初期化}]
+c.append("H", [self.id_of[cc] for cc in self.A])        # A -> |+> (全データ H)
+if control_one:
+    c.append("X", ...)   # C -> |1_L>
+if target_one:
+    c.append("X", ...)   # T -> |1_L>
+\end{lstlisting}
+
+最後に全データ量子ビットを $Z$ 基底で測定し（\texttt{c.append("M", ...)}）、
+その測定結果から論理観測量を組み立てます。次節ではその組み立て方を見ます。
+
+\section{フレーム補正観測量}\label{sec:frame_obs}
+
+\subsection{物理的な補正ゲートを避ける}
+
+理論上の測定ベース CNOT では、合流測定の結果に応じて物理的な補正ゲートを適用します。
+\texttt{LSCnotFT} のコメントに書かれた補正則は次のとおりです。
+
+\begin{quote}
+  補正: $Z_C$ if $m_{xx}$，\quad $X_T$ if ($m_{zz} \oplus m_{anc}$)
+\end{quote}
+
+ここで $m_{zz}$ は $M_{ZZ}(C,A)$ の合流測定結果、$m_{anc}$ はアンシラ $A$ を最終的に $Z$ 測定した
+結果、$m_{xx}$ は $M_{XX}(A,T)$ の合流測定結果です。
+この 3 つの測定結果が、どの線のどの補正へ流れ込むのか——図\ref{fig:ch16_ls_cnot_circuit}の古典制御線（二重線）がその経路です。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{quantikz}[row sep={1.3cm,between origins}, column sep=0.6cm]
+    \lstick{$C:\ \ket{0_L}$} & \gate[2,style={fill=blue!12,draw=blue!70!black}][1.1cm]{M_{ZZ}} & \qw & \gate{\substack{Z \\ \text{\scriptsize (if $m_{xx}$)} \phantom{i}}} & \qw & \qw & \qw & \rstick{$C$} \\
+    \lstick{$A:\ \ket{+_L}$} & & \gate[2,style={fill=red!12,draw=red!70!black}][1.1cm]{M_{XX}} & \ctrl[wire=c]{-1} & \meter{Z} & \ctrl[wire=c]{1} & \cw & \rstick{$A$} \\
+    \lstick{$T:\ \ket{0_L}$} & \qw & & \qw & \qw & \gate{\substack{X \\ \text{\tiny (if $m_{zz} \oplus m_{anc}$)\phantom{i}}}} & \qw & \rstick{$T$}
+  \end{quantikz}
+  \caption{測定ベース CNOT の回路図と古典フレーム補正。アンシラパッチ $A$ を $\ket{+_L}$ に初期化し、$C$–$A$ 間の $M_{ZZ}$ 合流測定、$A$–$T$ 間の $M_{XX}$ 合流測定を順に実行したのち、$A$ を $Z$ 測定します。$M_{XX}$ の結果 $m_{xx}$ に応じて制御側に $Z$ 補正が、$M_{ZZ}$ と $A$ の測定結果 $m_{zz}\oplus m_{anc}$ に応じて標的側に $X$ 補正が古典制御（二重線）されます。本章の実装ではこれらの補正を物理ゲートとして適用せず、論理観測量の定義（\texttt{obs0}/\texttt{obs1}）に畳み込みます。}
+  \label{fig:ch16_ls_cnot_circuit}
+\end{figure}
+
+しかし本章の実装では、これらの補正を実際に物理ゲートとして適用しません。
+どちらの補正もパウリ演算子であり、しかも最終読み出しが計算基底測定だけであれば、
+補正の効果は測定値に古典ビットを XOR するだけで再現できます。
+これは第5章で導入したソフトウェアのパウリフレーム追跡と同じ発想で、
+「補正ゲートを回路に足す」代わりに「観測量の定義を補正する」ことで等価な結果を得ています。
+
+\subsection{obs0 と obs1}
+
+\texttt{build} メソッドは、次の 2 つの観測量を \texttt{OBSERVABLE\_INCLUDE} として登録します。
+
+\begin{lstlisting}[language=Python, caption={src/stages/02\_circuit\_level/src/ftqc/ls\_cnot\_ft.py の観測量登録}]
+c.append("OBSERVABLE_INCLUDE", [rr(drec[q]) for q in self.ZL_C], 0)
+obs1 = [rr(drec[q]) for q in self.ZL_T]
+if obs1_mode in ("full", "zlt_manc"):
+    obs1 += [rr(drec[q]) for q in self.ZL_A]      # m_anc = Z_L(A)
+if obs1_mode in ("full", "zlt_mzz"):
+    obs1 += [rr(r) for r in zz_joint_recs]          # m_zz
+c.append("OBSERVABLE_INCLUDE", obs1, 1)
+\end{lstlisting}
+
+\texttt{obs0} は制御側の論理 $Z$，$Z_L(C)$ をそのまま読みます。
+CNOT は制御ビットを変化させないため、$C$ 側には補正が不要です。
+\texttt{obs1} は標的側の論理 $Z$，$Z_L(T)$ に、$m_{anc}=Z_L(A)$（最終測定から直接読める）と
+$m_{zz}$（$M_{ZZ}$ 合流測定の結果）を XOR したものです。
+\texttt{obs1\_mode} 引数は既定で \texttt{"full"} であり、両方の補正項を含めます
+（\texttt{"zlt\_manc"}／\texttt{"zlt\_mzz"} は補正項を片方だけにした場合の挙動を確認するための
+デバッグ用オプションで、通常の利用では \texttt{"full"} を使います）。
+
+$m_{zz}$ は 1 個のアンシラ測定値ではなく、最初の $M_{ZZ}$ ラウンドにおける
+シンドローム抽出アンシラ測定値の GF2 線形和として得られます。これは第10章で導入した
+\texttt{\_compose\_in}（GF2 span への分解）と同じロジックを \texttt{\_decompose} メソッドとして
+再利用したものです。
+
+\begin{lstlisting}[language=Python, caption={src/stages/02\_circuit\_level/src/ftqc/ls\_cnot\_ft.py の m\_zz の構成}]
+self.zz_joint_idx = self._decompose(self._lvec("Z", self.ZL_C + self.ZL_A), self.zz_info)
+...
+zz_joint_recs = [first_zz[i] for i in self.zz_joint_idx]
+\end{lstlisting}
+
+つまり、論理演算子 $Z_L(C)Z_L(A)$ を $M_{ZZ}$ フェーズのスタビライザ集合の張る空間の中で
+GF2 上で分解し、その分解に現れるスタビライザに対応するシンドローム抽出アンシラの測定値だけを
+XOR すれば、$m_{zz}$ が得られます。物理演算子を直接測るのではなく、
+既に測定済みのシンドローム抽出アンシラから合流測定の結果を「読み出す」という点は、
+前章の joint 測定の扱いと同じです。
+
+\section{検証（真理値表・距離）}\label{sec:verify_cnot}
+
+\texttt{ls\_cnot\_ft.py} の \texttt{demo()} 関数は、次の 4 つの観点で \texttt{LSCnotFT} を検証します。
+
+\subsection{gauge 検出器ゼロ}
+
+ノイズなし（\texttt{noise=False}）で回路を組み、検出器のサンプルがすべて決定論的（常に同じ値）に
+なることを確認します。
+
+\begin{lstlisting}[language=Python, caption={src/stages/02\_circuit\_level/src/ftqc/ls\_cnot\_ft.py の gauge 検査}]
+c0, _, _ = g.build(noise=False)
+det, _ = c0.compile_detector_sampler().sample(3000, separate_observables=True)
+nd = int(det.any(axis=0).sum())
+\end{lstlisting}
+
+実行すると検出器数 288 に対し非決定論的な検出器は 0 です。
+これは \texttt{allow\_gauge\_detectors} を使わずに済むことを意味し、
+\texttt{\_common.md} で定めた合否基準のうち「ノイズなしで gauge 検出器ゼロ」を満たしています。
+
+\subsection{計算基底 CNOT 真理値表}
+
+制御・標的の初期値 $(c,t)\in\{0,1\}^2$ をすべて試し、$(\mathrm{obs0},\mathrm{obs1})$ が
+期待値 $(c,\ c\oplus t)$ に一致するかを確認します。
+
+\begin{lstlisting}[language=Python, caption={src/stages/02\_circuit\_level/src/ftqc/ls\_cnot\_ft.py の真理値表検証（要約）}]
+for ci in (0, 1):
+    for ti in (0, 1):
+        c, drec, zzj = g.build(control_one=bool(ci), target_one=bool(ti), noise=False)
+        s = c.compile_sampler().sample(300).astype(int)
+        o0 = s[:, [drec[q] for q in g.ZL_C]].sum(1) % 2
+        o1 = (s[:, [drec[q] for q in g.ZL_T]].sum(1) +
+              s[:, [drec[q] for q in g.ZL_A]].sum(1) +
+              s[:, list(zzj)].sum(1)) % 2
+\end{lstlisting}
+
+実行結果は 4 通りすべてで一致し、$(c,t)=(1,1)$ のとき $(\mathrm{obs0},\mathrm{obs1})=(1,0)$ と
+なることも含め、計算基底での CNOT の真理値表と完全に一致します。
+これは合否基準の「計算基底の CNOT 真理値表一致」に対応します。
+
+\subsection{回路レベル距離の graphlike 上界}
+
+距離が保たれているかどうかは、1 つのフェーズを見ても分かりません。誤り鎖は merge と split をまたいで時間方向に伸びるからです。そこで、ここまでの配置とスケジュールを時空として 1 枚に重ねます。図\ref{fig:ch16_ls_cnot_spacetime}は、3 パッチの結合関係がラウンドとともにどう変わるかと、$A$ の角で 2 つの seam が交差する箇所に入る後ろ向き閉包検出器の位置を示したものです。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[scale=0.88, font=\small, >=Stealth]
+    % 時間軸 (横軸)
+    \draw[->, thick, gray!70] (0, -0.7) -- (10.6, -0.7) node[right, black, font=\scriptsize\bfseries] {ラウンド ($r$)};
+
+    % 各フェーズの上部バーとラベル
+    \foreach \xstart/\xend/\lbl/\sublbl in {
+      0.0/1.6/split/2 rounds,
+      1.6/4.2/zz merge/3 rounds,
+      4.2/5.8/split/2 rounds,
+      5.8/8.4/xx merge/3 rounds,
+      8.4/10.0/split/2 rounds
+    } {
+      \draw[thick, gray!60] (\xstart+0.05, 3.7) -- (\xend-0.05, 3.7);
+      \draw[thick, gray!60] (\xstart+0.05, 3.6) -- (\xstart+0.05, 3.7);
+      \draw[thick, gray!60] (\xend-0.05, 3.6) -- (\xend-0.05, 3.7);
+      \node[font=\footnotesize\bfseries, anchor=south] at ({(\xstart+\xend)/2}, 3.75) {\lbl};
+      \node[font=\tiny, text=black!60, anchor=south] at ({(\xstart+\xend)/2}, 4.15) {\sublbl};
+    }
+
+    % フェーズ境界破線
+    \foreach \x in {1.6, 4.2, 5.8, 8.4, 10.0} {
+      \draw[gray!30, dashed, thin] (\x, -0.6) -- (\x, 3.6);
+    }
+
+    % ラウンド目盛り
+    \node[below, font=\scriptsize, gray!80] at (0.8, -0.7) {$r=0,1$};
+    \node[below, font=\scriptsize, gray!80] at (2.9, -0.7) {$r=2,3,4$};
+    \node[below, font=\scriptsize, gray!80] at (5.0, -0.7) {$r=5,6$};
+    \node[below, font=\scriptsize, gray!80] at (7.1, -0.7) {$r=7,8,9$};
+    \node[below, font=\scriptsize, gray!80] at (9.2, -0.7) {$r=10,11$};
+
+    % --- レーンの描画 ---
+    % パッチ C レーン (青系)
+    \fill[blue!6] (0, 2.4) rectangle (10.0, 3.2);
+    \draw[thick, blue!70!black] (0, 2.4) -- (10.0, 2.4);
+    \draw[thick, blue!70!black] (0, 3.2) -- (10.0, 3.2);
+    \node[anchor=east, font=\footnotesize\bfseries, blue!80!black] at (-0.3, 2.8) {パッチ $C$（制御）};
+
+    % パッチ A レーン (論理アンシラ、logpatch 破線枠)
+    \fill[black!3] (0, 1.2) rectangle (10.0, 2.0);
+    \draw[thick, dashed, black!70] (0, 1.2) -- (10.0, 1.2);
+    \draw[thick, dashed, black!70] (0, 2.0) -- (10.0, 2.0);
+    \node[anchor=east, font=\footnotesize\bfseries] at (-0.3, 1.6) {パッチ $A$（アンシラ）};
+
+    % パッチ T レーン (赤系)
+    \fill[red!6] (0, 0.0) rectangle (10.0, 0.8);
+    \draw[thick, red!70!black] (0, 0.0) -- (10.0, 0.0);
+    \draw[thick, red!70!black] (0, 0.8) -- (10.0, 0.8);
+    \node[anchor=east, font=\footnotesize\bfseries, red!80!black] at (-0.3, 0.4) {パッチ $T$（標的）};
+
+    % --- 結合帯 (Merge 領域) ---
+    % zz merge: C と A を結合 (y: 2.0 ~ 2.4, x: 1.6 ~ 4.2)
+    \fill[blue!25, draw=blue!80!black, thick] (1.6, 2.0) rectangle (4.2, 2.4);
+    \node[font=\scriptsize\bfseries, blue!90!black] at (2.9, 2.2) {$M_{ZZ}$ seam 結合帯};
+
+    % xx merge: A と T を結合 (y: 0.8 ~ 1.2, x: 5.8 ~ 8.4)
+    \fill[red!25, draw=red!80!black, thick] (5.8, 0.8) rectangle (8.4, 1.2);
+    \node[font=\scriptsize\bfseries, red!90!black] at (7.1, 1.0) {$M_{XX}$ seam 結合帯};
+
+    % 初期化・測定の境界
+    \draw[thick, black!70] (0, -0.2) -- (0, 3.4);
+    \node[anchor=south, font=\tiny\bfseries, align=center] at (0, 3.4) {初期化};
+
+    \draw[thick, black!70] (10.0, -0.2) -- (10.0, 3.4);
+    \node[anchor=south, font=\tiny\bfseries, align=center] at (10.0, 3.4) {データ測定};
+
+    % 後ろ向き閉包検出器の注記
+    \draw[->, thick, blue!80!black] (4.2, 3.1) -- (4.2, 2.45);
+    \node[above, font=\tiny\bfseries, blue!80!black, align=center] at (4.2, 3.1) {後ろ向き閉包検出器\\($C$–$A$ 分裂境界)};
+
+    \draw[->, thick, red!80!black] (8.4, 0.1) -- (8.4, 0.75);
+    \node[below, font=\tiny\bfseries, red!80!black, align=center] at (8.4, 0.1) {後ろ向き閉包検出器\\($A$–$T$ 分裂境界)};
+  \end{tikzpicture}
+  \caption{格子手術 CNOT の時空図。横軸は誤り訂正ラウンド（時間発展）、縦軸は 3 つのパッチレーン（空間配置）を表します。zz merge 区間（$r=2\sim4$）では制御 $C$ とアンシラ $A$ が青い帯（$M_{ZZ}$ seam）で結ばれ、xx merge 区間（$r=7\sim9$）ではアンシラ $A$ と標的 $T$ が赤い帯（$M_{XX}$ seam）で結ばれます。merge から split へ戻るラウンド境界で後ろ向き閉包検出器を張ることで、回路レベル距離 3 が維持されます。}
+  \label{fig:ch16_ls_cnot_spacetime}
+\end{figure}
+
+ノイズあり（\texttt{noise=True}）の回路に対して非 graphlike 誤りを無視することを明示して
+\texttt{shortest\_graphlike\_error()} を呼ぶと、長さ 3 の最短 graphlike 論理エラーが得られます。
+
+\begin{lstlisting}[language=Python, caption={src/stages/02\_circuit\_level/src/ftqc/ls\_cnot\_ft.py の距離検証}]
+cn, _, _ = g.build(p=0.005, noise=True)
+bound = len(cn.shortest_graphlike_error(ignore_ungraphlike_errors=True))
+\end{lstlisting}
+
+$\mathrm{shortest\_graphlike\_error}=3$ はパッチ距離（各パッチが $3\times3$、つまり距離 3）と
+整合する\textbf{上界}です。未分解 DEM に高次誤り機構があるため、これだけでは厳密距離 3 の証明にはなりません。この値は、$C$–$A$ の seam と $A$–$T$ の seam が
+$A$ の角で交差する箇所を正しく閉じる「後ろ向き閉包検出器」が入っているために達成されています。
+この閉包検出器を入れずに素朴に検出器を張ると、この角の縮退により距離が 2 に落ちてしまいます。
+その症状の詳細と修正の経緯は、次の第17章のケーススタディに譲ります。
+
+\begin{warningbox}
+  \texttt{demo()} の最後のブロック（ノイズ付きデコードで論理エラー率を出す部分）は、
+  内部で \texttt{g.decode(...)} を呼び出しますが、\texttt{LSCnotFT} クラス自体には
+  \texttt{decode} メソッドが定義されていません（同ファイル内の \texttt{LSTeleportFT} クラスにのみ
+  実装されています）。そのため \texttt{demo()} を実際に実行すると、この呼び出しで
+  \texttt{AttributeError} が発生します。
+  つまり本章時点で機械的に確認できるのは、gauge 検出器ゼロ・真理値表一致・
+  $\mathrm{shortest\_graphlike\_error}=3$ という決定論的な性質までであり、
+  ノイズ付きデコードによる論理エラー率の評価まで \texttt{LSCnotFT} から直接呼び出す
+  インタフェースは、この段階ではまだ提供されていません。
+  この機能は第19章で扱う回路レベル Shell API（\texttt{ls\_handoff\_shells.py} の
+  \texttt{build\_ls\_cnot\_shell} と \texttt{decode\_shell}）で初めて提供され、
+  \texttt{decode\_shell} は \texttt{allow\_gauge\_detectors} を使わずにデコードできる形に
+  整理されます。これが「後段で強化される点」です。
+\end{warningbox}
+
+\section{まとめ}\label{ch16:summary}
+
+\begin{itemize}
+  \item 格子手術 CNOT は、アンシラパッチ $A$ を $\ket{+_L}$ にして、$M_{ZZ}(C,A)$ と
+    $M_{XX}(A,T)$ を続けて行い、最後にアンシラを測定する構成で実現できます。
+  \item この構成は、L 字レイアウトに配置した 3 パッチに対する
+    split–merge–split–merge–split というスケジュールで、回路レベルの符号サイクルとして
+    実装されます。
+  \item 物理的な補正ゲートの代わりに、標的側の観測量 $Z_L(T)$ に $m_{zz}$ と $m_{anc}$ を
+    XOR するフレーム補正観測量を使うことで、ソフトウェアのパウリフレーム追跡と同じ発想で
+    補正を扱えます。
+  \item 本章時点では gauge 検出器ゼロ・計算基底 CNOT 真理値表一致・
+    \codeinline{shortest_graphlike_error = 3} の 3 点を確認できますが、
+    ノイズ付きデコードの API 化は第19章まで持ち越されます。
+\end{itemize}
+
+\subsection*{合否基準での検証}
+
+本章で確認した内容は、\codepath{src/stages/02_circuit_level/src/ftqc/ls_cnot_ft.py} の \texttt{demo()} が示す
+[A]–[D] の範囲、すなわち gauge 検出器ゼロ・計算基底 CNOT 真理値表一致・
+回路レベル距離 $\mathrm{shortest\_graphlike\_error}=3$ に対応します。
+[E] のノイズ付きデコードによる論理エラー率評価は、上記のとおり本章のコードでは
+\texttt{AttributeError} で止まり、第19章の Shell API 化まで持ち越されます。
+
+次章では、この格子手術 CNOT の距離を意図的に壊し、距離 2 から距離 3 へ戻す
+ケーススタディを通じて、後ろ向き閉包検出器がなぜ必要なのかを詳しく見ていきます。
+
+\begin{exercise}
+  \begin{enumerate}
+    \item $M_{ZZ}(C,A)$ と $M_{XX}(A,T)$ を続けて行うと、なぜ最終的に $C$ から $T$ への CNOT
+      が実現されるのかを、$C,A,T$ の初期状態と合流測定が固定する結合演算子の観点から説明しなさい。
+    \item 本章の補正則「$X_T$ if ($m_{zz}\oplus m_{anc}$)」を物理的な $X$ ゲートとして
+      \texttt{build} 内に実装する場合、どこに、どのような条件分岐を追加する必要があるかを、
+      \texttt{obs1} の定義と対比して説明しなさい。
+    \item \texttt{demo()} の \texttt{obs1\_mode="zlt\_manc"}（$m_{zz}$ を含めない）で
+      $(c,t)=(1,0)$ の場合の真理値表がどう変わるかを予想し、その理由を述べなさい。
+    \item \texttt{shortest\_graphlike\_error} が 3 ではなく 2 になってしまうケースが
+      どのような検出器の欠落によって起こり得るかを、$A$ の角における seam の交差に着目して
+      考察しなさい（詳細な答えは第17章で確認できます）。
+  \end{enumerate}
+\end{exercise}

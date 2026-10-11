@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "Please cite the book and software using the metadata below."
+title: "Fault-Tolerant Quantum Computation: Chapters 1–25"
+type: software
+authors:
+  - family-names: Mori
+    given-names: Toshio
+version: 0.1.0
+abstract: >-
+  Japanese educational material and simulation software for fault-tolerant
+  quantum computation, covering chapters 1–25 and a distance-3 integrated stage.
+license:
+  - MIT
+  - CC-BY-4.0

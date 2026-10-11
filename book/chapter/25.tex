@@ -1,0 +1,257 @@
+% Stage: 03 ／ 説明用コード: src/ftqc（合否基準の言語は src/ftqc 整合）
+\chapter{テストと性能評価}\label{ch:testing_perf}
+
+\begin{chaptergoal}
+  \begin{itemize}
+  \item ノイズなしでの gauge 検出器ゼロ・回路レベル距離・真理値表・$35p^3$ という、Stage 03 が満たすべき不変条件テストを理解します。
+  \item 固定シードと閾値で統計テストを安定化し、回帰（リグレッション）として運用する考え方を理解します。
+  \item transversal 操作と格子手術のコストの違いと、距離 $d=3$ での論理エラー率の $\sim p^2$ スケーリングの直感を理解します。
+  \item デコード遅延・ストールという性能ボトルネックの簡易モデルを理解します。
+  \item Stage 03 の到達点（$d=3$ 統合の完成）と、残差が $X_L$ 中心であるという限界を確認し、読了マーカー C を宣言します。
+  \end{itemize}
+\end{chaptergoal}
+
+前章までで、$d=3$ に固定した統合シミュレータ \texttt{HybridFTQCRuntime} の全体像——命令計画、トラジェクトリ実行と残差注入、状態ベクトルバックエンド、可視化とレポート——が出そろいました。
+本章では、この Stage 03 の成果物が「正しく動いている」ことをどう機械的に確かめるかを整理します。
+検証は大きく 2 系統に分かれます。ひとつは入力に対して決定論的に成り立つべき\textbf{不変条件テスト}、もうひとつはモンテカルロ由来のばらつきを固定シードと閾値で押さえた\textbf{統計テスト}です。
+最後に性能と誤差収支の見取り図を与え、Stage 03 の限界（残差が $X_L$ 中心であること）を明示します。
+
+\begin{notebox}
+  Stage: \textbf{03}。
+  説明用コードは主に \codepath{src/ftqc/} の各モジュールの \texttt{demo()} / \texttt{main()} を用います。
+  検査コードはリポジトリ直下の \codepath{tests/} にあります。
+\end{notebox}
+
+\section{不変条件テスト}\label{sec:invariants}
+
+不変条件テストは、乱数に依存せず、ノイズなしの理想入力に対して必ず成り立つべき性質を検査します。
+Stage 03 の中心的な不変条件は次の 4 つです。
+
+\subsection{gauge 検出器ゼロ}
+
+最も重要なのは、\textbf{ノイズなしなら検出器がひとつも発火しない}ことです。
+発火する検出器が残っていれば、それはゲージ自由度が測定回路に漏れていることを意味し、その検出器を \texttt{allow\_gauge\_detectors} で無視して回避するとデコードの距離が崩れます。
+本書の合否基準では、シェルはすべて gauge 検出器がゼロになるように構成し、\texttt{decode\_shell} は \texttt{allow\_gauge\_detectors} を\textbf{使わない}ことを要求します。
+\codepath{src/ftqc/ls_handoff_shells.py} の \texttt{demo()} は、各シェルについてノイズなしの検出器サンプルを取り、発火した検出器の本数を数えて確認します。
+
+\begin{lstlisting}[language=Python, caption={gauge 検出器ゼロの確認（src/ftqc/ls\_handoff\_shells.py の demo() から要約）}]
+clean = builder(p=0.0, noise=False)
+det, _ = clean.circuit.compile_detector_sampler().sample(2000, separate_observables=True)
+nd = int(det.any(axis=0).sum())   # 一度でも発火した検出器の本数
+# nd == 0 であること = gauge 検出器ゼロ = allow_gauge_detectors 不要
+\end{lstlisting}
+
+\subsection{回路レベル距離の graphlike 上界}
+
+次に、ノイズありの回路から検出器誤りモデル（DEM）を構築し、非 graphlike 誤りを無視した \texttt{shortest\_graphlike\_error()} の長さを測ります。
+ここで \texttt{decompose\_errors=True} は、分解可能な複合誤りを graphlike な成分へ分解する要求です。gauge detector を許可するかどうかは独立した \texttt{allow\_gauge\_detectors} 引数で指定し、その既定値は \texttt{False}（非決定論的 detector を拒否）です。以下では二つの意図を別々の引数として明示します。
+独立シェル API（LS-S・LS-CNOT・LS-T）は距離 $d=3$ のパッチを意図しており、公開テストは graphlike 上界を検査します。ただし、未分解 DEM に高次誤り機構がある場合、これは FT 性の厳密な証明ではありません。
+
+\begin{lstlisting}[language=Python, caption={回路レベル距離の確認（src/ftqc/ls\_handoff\_shells.py の demo() から要約）}]
+noisy = builder(p=0.005, noise=True)
+noisy.circuit.detector_error_model(
+    decompose_errors=True,        # 分解可能な複合誤りを graphlike 成分へ分解
+    allow_gauge_detectors=False,  # 非決定論的 detector を拒否（既定値）
+)
+bound = len(noisy.circuit.shortest_graphlike_error(ignore_ungraphlike_errors=True))
+# bound == 3: パッチ距離 3 と整合する回路距離の上界
+\end{lstlisting}
+
+未分解 DEM の全物理誤り機構が graphlike であることまで確認できたシェルに限り、この値を厳密距離と呼べます。単に \texttt{decompose\_errors=True} が成功しただけでは、graphlike 成分数と物理 fault 数が一致する保証はありません。
+
+\subsection{真理値表一致}
+
+論理演算そのものが正しいかは、計算基底の真理値表で確かめます。
+たとえば LS-CNOT では、制御と対象を $\ket{0_L}/\ket{1_L}$ の 4 通りに準備し、生サンプルから得た論理値の絶対値（フレーム補正後の観測量）が CNOT の真理値表と全一致することを検査します。
+
+\begin{lstlisting}[language=Python, caption={CNOT 真理値表の確認（src/ftqc/ls\_cnot\_ft.py の demo() の [C] から要約）}]
+# 制御・対象を |0_L>,|1_L> の 4 通りに準備し、
+# フレーム補正した観測量が CNOT 真理値表と一致するかを検査する。
+print(f"    真理値表: {'全一致 OK (CNOT を正しく実装)' if ok_all else 'NG'}")
+\end{lstlisting}
+
+この例では gauge 検出器ゼロ・graphlike 距離上界 $3$・真理値表一致が、選んだ入力の論理動作と整合します。これらの確認だけで一般の fault-tolerance 性が証明されるわけではなく、その主張には追加の検証が必要です。
+
+\subsection{$35p^3$：蒸留の 3 次抑圧}
+
+非クリフォード側の不変条件は magic state 蒸留にあります。
+$[[15,1,3]]$ Reed--Muller 符号を使った 15-to-1 蒸留では、検出されない論理 $X$ 誤りのうち重み 3 のものがちょうど 35 個あり、出力誤り率が入力誤り率 $p$ の 3 次で $p_{\mathrm{out}} \sim 35\,p^3$ と抑圧されます。
+\codepath{src/ftqc/t_gate.py} の符号重み分布から、重み 3 の未検出論理誤りが 35 個あることを数えられます。この組合せ論的な係数は小さい $p$ における先頭項であり、一般の有限 $p$ で出力誤り率が厳密に $35p^3$ になるという主張ではありません。
+
+\begin{lstlisting}[language=Python, caption={蒸留の 3 次抑圧の確認（src/ftqc/t\_gate.py の demo() から要約）}]
+# 重み3 の undetected-logical X 誤りがちょうど 35 個 -> 出力誤り ~ 35 p^3
+for p in (0.01, 0.02, 0.05):
+    acc, pout = distill(HX, HZ, p)
+    print(f"{p:.3f} | accept={acc:.3f} | p_out={pout:.2e} | 35 p^3={35*p**3:.2e} | ratio={pout/(35*p**3):.2f}")
+# => ratio が 1 付近 = 3 次抑圧を確認
+\end{lstlisting}
+
+ランタイム側では、\texttt{magic\_distillation\_shots=0}（既定）のとき、この決定論的な先頭項 $35\,p_{\mathrm{phys}}^3$ をそのまま magic fault 率として使います（\texttt{\_estimate\_magic\_error()} が \texttt{min(1.0, 35.0 * self.p\_phys ** 3)} を返す）。
+\texttt{magic\_distillation\_shots} を正の値にすればモンテカルロ推定に切り替わりますが、いずれにせよ「$p^3$ で抑圧される」という不変条件は変わりません。
+
+\section{統計テストの安定化}\label{sec:stats}
+
+不変条件テストと違い、論理分布や残差率はモンテカルロで推定するため、実行のたびに数値がわずかに揺れます。
+これをテストとして運用するには、揺れを再現可能にし、合否の閾値を明示する必要があります。
+
+\subsection{固定シード}
+
+\texttt{HybridFTQCRuntime} は \texttt{seed} をコンストラクタ引数に取り、\texttt{run(program, shots, seed=...)} でもシードを渡せます。公開テストでは同じプログラム・同じ seed で出力が一致するかを比較します。ただし、このテストは \texttt{qec\_mode="off"} で実行され、QEC sampling の再現性を対象にしていません。runtime の Stim sampler 呼び出しは seed を受け取らないため、QEC を有効にした実行の再現性は未確認です。
+
+\begin{lstlisting}[language=Python, caption={固定シードでの再現（src/ftqc/hybrid\_ftqc\_runtime.py の demo() から要約）}]
+rt = HybridFTQCRuntime(n_logical=1, p_phys=0.0, seed=31, qec_mode="off")
+first = rt.run(program, shots=600, seed=91)
+second = rt.run(program, shots=600, seed=91)
+assert first.measurement_counts == second.measurement_counts
+\end{lstlisting}
+
+\subsection{閾値}
+
+固定シードで数値が決まっても、統計テストは「厳密一致」ではなく「許容誤差内」で判定します。
+たとえば前章で見たバックエンド間比較では、理想分布どうしの全変動距離（TVD）が十分小さいことを閾値で判定しました。
+残差率であれば、ノイズなしなら\textbf{厳密にゼロ}（不変条件）、ノイズありなら\textbf{ゼロでない}（存在するかどうかの真偽）という質的な閾値の立て方が安定です。
+残差モードの挙動を追加評価する場合は、同梱コードが実際に提供する API を確認し、ノイズなしでのゼロ残差とノイズありでの残差分布を分けて測定します。
+
+\subsection{リグレッション例}
+
+こうしたテストは、実装をいじったときに壊れていないかを見張る回帰（リグレッション）として働きます。
+回帰テストでは、対象 API の既定値や実行経路など、再現可能な構造的性質を検査します。検査を追加した場合は、その実行結果と対象バージョンを合わせて記録してください。
+
+\begin{notebox}
+  公開版に含む Stage 03 のテストは import、境界条件、スモーク動作、例の実行可能性を対象にします。ここで述べた追加の数値評価は、実行結果を記録するまでは未確認として扱います。
+\end{notebox}
+
+\section{性能と誤差収支}\label{sec:perf}
+
+\subsection{transversal と格子手術のコスト}
+
+論理演算の実現手段には、生成子追跡で済む transversal 操作と、補助パッチ・複数ラウンドの測定を要する独立シェル API（LS-CNOT・LS-S・LS-T）があります。Stage 03 runtime が格子手術イベントとして扱うのは LS-CNOT です。
+前者はスタビライザ生成子の書き換えだけで完結し、追加の QEC ラウンドや補助量子ビットをほとんど必要としません。
+後者は merge/split のために \texttt{ls\_merge\_rounds} 分の追加ラウンドと seam 上の安定化子を要し、そのぶんショットあたりのコストと、注入される残差の機会が増えます。
+Stage 03 の \texttt{HybridFTQCRuntime} は、可能な操作を transversal 側で処理し、CNOT や $T$ のように格子手術が必要な箇所だけシェルを呼び出す構成になっています。
+
+\subsection{論理エラー率のスケーリング}
+
+距離 $d$ の表面符号は、重み $\lceil d/2 \rceil$ 以上の誤りで初めて論理故障に至ります。
+$d=3$ なら 2 個の物理誤りがそろって初めて論理が飛ぶため、論理エラー率は先頭項で
+\[
+  p_L \;\sim\; \binom{N_{\mathrm{opp}}}{2}\, p^2 \;=\; O(p^2)
+\]
+のように物理誤り率 $p$ の 2 次で立ち上がります（$N_{\mathrm{opp}}$ は誤りの機会数。一般には $p_L \sim p^{\lceil d/2 \rceil}$）。
+一方、magic state 経由の $T$ ゲートは前節の蒸留により $O(p^3)$ で抑圧されるため、概念的な誤差収支では「距離 3 の回路レベル fault 組合せの $O(p^2)$」と「蒸留の先頭項 $35p^3$」を別々に扱います。これらは本書のコードで測定した性能ベンチマークではありません。
+この $p^2$／$p^3$ の別勘定は、どこがボトルネックかを $p$ の大きさに応じて切り分ける指針になります。
+
+\section{3 大ボトルネックのモデル化}\label{sec:bottlenecks}
+
+性能面では、シミュレータの外側にある実機由来のボトルネックも簡易にモデル化しておくと、結果の読み方が変わります。
+とくに重要なのが\textbf{デコード遅延}と、それに起因する\textbf{ストール}です。
+
+論理サイクルごとにシンドロームが生成され、デコーダがそれを処理して補正を返すまでに遅延 $t_{\mathrm{dec}}$ がかかります。
+論理サイクル時間を $t_{\mathrm{cycle}}$ とすると、遅延がサイクルに追いつかない場合、すなわち $t_{\mathrm{dec}} > t_{\mathrm{cycle}}$ のとき、後続の論理演算は待たされます。
+この待ち（ストール）を最小限にモデル化すると、実効的な論理サイクル時間はおよそ
+\[
+  t_{\mathrm{eff}} \;\approx\; \max(t_{\mathrm{cycle}},\, t_{\mathrm{dec}})
+\]
+となり、$T$ ゲートのように結果に依存した補正（測定してから $S$ 補正を決める）を挟む箇所では、デコード結果を待つぶんの直列化がさらに乗ります。
+Stage 03 のシミュレータ自体はこの実時間を扱いませんが、「格子手術のラウンド数」「$T$ テレポートの測定→補正の直列依存」という構造は、そのままデコード遅延・ストールが効く箇所を指し示しています。
+
+\begin{notebox}
+  ここでの遅延・ストールのモデルは\textbf{簡易な見取り図}であり、Stage 03 の数値には反映されません。窓デコード（windowed decoding）による遅延の隠蔽など、より本格的なスケジューリングは本書の対象外です。
+\end{notebox}
+
+\section{Stage 03 の到達点}\label{sec:stage_c_marker}
+
+\subsection{$d=3$ 統合の完成}
+
+ここまでで、Stage 03 の目標であった「$d=3$ に固定した、QEC とトラジェクトリと状態ベクトルを貫くハイブリッドシミュレータ」が完成しました。
+具体的には、\texttt{HybridFTQCRuntime} が
+
+\begin{itemize}
+  \item クリフォード操作を生成子追跡または runtime の LS-CNOT 経路へ振り分け、S/T の汎用 handoff と独立した LS-S／LS-T シェル API を区別し、
+  \item 各シェルが gauge 検出器ゼロ・\texttt{shortest\_graphlike\_error}$=3$・真理値表一致を満たし、
+  \item 非 Clifford $T$ を状態ベクトルまたは QPD で扱い、magic fault 率のモデルに $35p^3$ の先頭項を使い、
+  \item QEC シェルから得た残差をパウリフレームとして論理状態へ注入する、
+\end{itemize}
+
+という一連の流れを同一シードで再現できるかを、公開テストで検査します。
+
+\subsection{残差が $X_L$ 中心であるという限界}
+
+一方で、Stage 03 の残差経路には本質的な限界があります。
+現状の Stim コンパイラが物理的に露出させているのは $Z$ 観測量のフリップ、すなわち残差 $X_L$ フォールトが中心です。
+$Z_L$ 側の残差は、\texttt{mirror\_z\_residuals} のように「$X_L$ と同じ率で独立に $Z_L$ を振る」近似で補うか、公開 API では独立な近似チャネル \texttt{mirror\_z\_residuals} を選ぶことができます。
+つまり Stage 03 のフレームは、$X_L$ と $Z_L$ を対等・相関ありに扱う完全なパウリフレームには\textbf{まだなっていません}。
+シンプレクティックなパウリフレームへの一般化は本書の対象外です。
+
+\subsection{読了マーカー C}
+
+\begin{notebox}
+  \textbf{読了マーカー C を宣言します。}
+  ここまでで Stage 01（現象論 MPP）・Stage 02（回路レベル）・Stage 03（$d=3$ 統合）を通読し、$d=3$ に固定した誤り耐性ハイブリッドシミュレータを、合否基準つきで動かせる状態に到達しました。
+  本書ではこのモデル範囲を明記し、結果の解釈に含めます。
+\end{notebox}
+
+\section{合否基準チートシート（再掲）}\label{sec:cheatsheet_c}
+
+Stage 03 のモデル範囲で確認すべき性質を整理します。
+
+\begin{itemize}
+  \item \textbf{gauge 検出器ゼロ}：ノイズなしで発火する検出器が 1 本もない。したがって \texttt{decode\_shell} は \texttt{allow\_gauge\_detectors} を\textbf{使わない}。
+  \item \textbf{graphlike 上界}：公開テスト対象のシェルで \texttt{shortest\_graphlike\_error()} の値を検査します。これだけで厳密距離が証明されるわけではありません。
+  \item \textbf{真理値表一致}：計算基底で論理演算の真理値表が全一致する（フレーム補正後）。
+  \item \textbf{$35p^3$ の先頭項}：15-to-1 蒸留符号で重み 3 の未検出論理誤りが 35 個あります。これは低確率での先頭項です。
+  \item \textbf{シード再現性}：QEC を含む経路で Stim sampler に seed が渡ることを含めて確認する（現行公開 runtime では未達）。
+  \item \textbf{残差モデルの制限}：ノイズなしのシェルで残差が生じないことを確認し、$X_L$ 中心というモデル範囲を結果に添える。
+\end{itemize}
+
+\section{やること・スコープ外}\label{ch25:scope}
+
+\subsection{やること}
+
+\begin{itemize}
+  \item Stage 03 で検査すべき不変条件と、実行前に結果を断定しない報告方法を説明する。
+  \item モンテカルロ由来のばらつきを固定シードと閾値で押さえ、回帰として運用する考え方を示す。
+  \item transversal と格子手術のコスト差、$p_L \sim p^2$ のスケーリング、デコード遅延・ストールの簡易モデルを示す。
+  \item Stage 03 の到達点と、残差が $X_L$ 中心である限界を明示する。
+\end{itemize}
+
+\subsection{スコープ外}
+
+\begin{itemize}
+  \item シンプレクティックフレーム、qLDPC、窓デコード、消失ノイズのテスト詳細。これらは本書の対象外です。
+  \item デコード遅延・ストールの本格的なスケジューリングと窓デコードによる隠蔽（本書の対象外）。
+  \item 実時間・実機データを用いた性能ベンチマーク。本章の性能評価はあくまで構造的な見取り図にとどめます。
+\end{itemize}
+
+\section{まとめ}\label{ch25:summary}
+
+\begin{itemize}
+  \item 不変条件テストは、ノイズなし検出器、graphlike 上界、CNOT 真理値表、および蒸留符号の組合せ論的性質を検査します。
+  \item 再現性テストは QEC を無効にした runtime 経路で固定 seed の出力を比較します。QEC sampling の再現性は今後の検証課題です。
+  \item 最小重みの議論から、距離 3 では低確率領域の論理誤りが概ね $O(p^2)$、15-to-1 蒸留の先頭項は $35p^3$ と見積もれます。デコード遅延・ストールは $t_{\mathrm{eff}} \approx \max(t_{\mathrm{cycle}}, t_{\mathrm{dec}})$ という簡易モデルで見取り図が描けます。
+  \item Stage 03 は $d=3$ 統合の完成をもって読了マーカー C に到達しますが、残差が $X_L$ 中心であるという限界を残しており、この制限を付録Cで明示します。
+\end{itemize}
+
+\subsection*{合否基準での検証}
+
+公開テストが対象にする性質は次のとおりです。これらをここで再実行したという意味ではありません。
+
+\begin{itemize}
+  \item \texttt{tests/test\_ls\_invariants.py} は LS-S／LS-CNOT／LS-T のノイズなし検出器と graphlike 上界を検査し、LS-CNOT の計算基底真理値表も確認します。
+  \item \texttt{tests/test\_magic\_state.py} は蒸留符号の距離と重み 3 の未検出論理誤り数（35）を検査します。有限確率でのモンテカルロ比の評価は含みません。
+  \item \texttt{tests/test\_runtime\_reproducibility.py} は同じ seed での runtime 出力再現性を検査します。
+\end{itemize}
+
+$X_L$ と $Z_L$ を相関付きで対等に扱う論理パウリフレームは、本書では実装していません。
+
+本章で示した $d=3$ 固定の統合ランタイムが、本書の到達点です。
+
+\begin{exercise}
+  \begin{enumerate}
+    \item ノイズなしで発火する検出器が 1 本でも残っている場合、なぜそれを \texttt{allow\_gauge\_detectors} で無視するとデコード距離が崩れるのかを、本章の不変条件テストの意図に沿って説明しなさい。
+    \item $d=3$ の表面符号で論理エラー率が $\sim p^2$ になる理由を、論理故障に必要な最小誤り重みの観点から述べなさい。$d=5$ ではどうなるか、$p^{\lceil d/2\rceil}$ の式に当てはめて答えなさい。
+    \item 15-to-1 蒸留の出力誤りが $35p^3$ になるときの「35」が何を数えた数かを、\texttt{t\_gate.py} の \texttt{demo()} が印字する重み分布に基づいて説明しなさい。
+    \item デコード遅延 $t_{\mathrm{dec}}$ が論理サイクル時間 $t_{\mathrm{cycle}}$ を超える場合、$T$ ゲートのテレポート（測定→$S$ 補正の直列依存）がなぜとくにストールを受けやすいかを、本章のボトルネックモデルに沿って述べなさい。
+    \item Stage 03 の残差が $X_L$ 中心であることを、\texttt{mirror\_z\_residuals} が「近似」であるという本文の記述と結びつけて説明し、これを完全なパウリフレームにするには何が足りないかを述べなさい。
+  \end{enumerate}
+\end{exercise}

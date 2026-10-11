@@ -1,0 +1,591 @@
+% Stage: —（理論）／ 説明用コード: —
+\chapter{FTQC とは}\label{ch:ftqc}
+
+\begin{chaptergoal}
+  \begin{itemize}
+  \item FTQC の目的——エラーのないデバイスを実効的に実現すること——を理解します。
+  \item 量子計算に特有の 4 つの制約（符号距離・No-Cloning・メモリ寿命・古典/量子協調）を理解します。
+  \item Basic Block と実行トレース、制御装置と量子デバイスの対話を俯瞰します。
+  \item 3 大ボトルネック（魔法状態・リアクション時間・符号サイクル）を把握し、本書が何をモデル化するかを整理します。
+  \end{itemize}
+\end{chaptergoal}
+
+第1章で NISQ と FTQC のギャップを見ました。
+本章では誤り耐性量子計算を、記号の定義ではなく\textbf{計算機アーキテクチャ}として整理します。
+「論理量子ビットを守る」だけでは計算は進まず、命令の翻訳・エラー推定・古典制御との対話まで含めて一つのシステムになる、というのが本章の主張です。
+後の実装（特に第20章の全体像、第21--22章の plan とトラジェクトリ）は、ここで描く部品の対応物として読めます。
+
+\begin{warningbox}
+  本章の構成は、誤り耐性量子計算アーキテクチャの解説\cite{suzuki2026ftqc}の論点の並びに負っています。
+  本文・図・例は、本書のシミュレータの語彙で書き直したものです。
+  同文献の詳細や数値は付録\ref{app:references}の参考文献を参照してください。
+\end{warningbox}
+
+\section{FTQC の目的}\label{sec:purpose}
+
+FTQC の目的を一言で言えば、\textbf{エラーのない量子デバイスとの対話を、エラーのあるデバイス上で実効的に再現すること}です。
+物理量子ビットはノイズを免れませんが、多数を束ねて誤りを訂正し続けることで、上位の\textbf{論理量子ビット}があたかも誤りのないように振る舞う——これが目指す姿です。
+
+ここで重要なのは、目的が「状態を保護する」こと\textbf{だけ}ではない点です。
+保護（符号サイクルの繰り返し）と、論理ゲートによる\textbf{計算の進行}は両立しなければなりません。
+前者だけではプログラムは前に進まず、後者だけだと誤りが積み上がって論理が破綻します。
+第5章で見るエラー訂正フローは、この両立を時間軸で描き直したものです。
+
+理想化された見方では、制御装置が「エラーなしの量子デバイス」と測定結果をやり取りしながらプログラムを進めます。
+実際にはそのデバイスを所持していないので、
+\begin{itemize}
+  \item エラーのある量子デバイス、
+  \item 論理命令を物理操作へ落とす\textbf{命令翻訳器}、
+  \item シンドローム（検出器）から誤りを推定する\textbf{エラー推定器}
+\end{itemize}
+の組で理想デバイスを\textbf{代替}します。
+この代替系が、理想デバイスと同じ実行トレースを十分高い確率で生み出せるなら、プログラムは正しく実行できたことになります。
+追加の物理量子ビットというオーバーヘッドを払って、その成功確率を任意に 1 に近づけられるシステムを作る——それが FTQC の工学的な目標です。
+
+\begin{notebox}
+  理論解析ではしばしば局所的なパウリ誤りを仮定します。
+  現実のノイズはパウリとは限りませんが、パウリ耐性のある設計が実務上も一定の信頼性を与える、という期待のもとで議論が進むのが通例です。
+  本書のシミュレータも、まずパウリ／脱分極型のモデルで合否を切ります（第8章）。
+\end{notebox}
+
+\section{量子計算に特有の 4 つの制約}\label{sec:four_constraints}
+
+FTQC のアーキテクチャは、古典計算機にはない 4 つの制約のうえに立ちます。
+それぞれが後章の実装判断に直結します。
+
+\paragraph{符号距離.}
+論理量子ビットは多数の物理量子ビットに情報を非局在化して守ります。
+守れる誤りの規模は\textbf{符号距離} $d$ で決まります\cite{fowler2012surface}（第4章）。
+距離を上げると論理エラー率は下がりますが、物理量子ビット数・検査回数・デコード負荷が増えます。
+本書が回路やシェルごとに $\mathrm{shortest\_graphlike\_error}=d$ を合否に据えるのは、この制約を実装レベルで見張るためです（第8章）。
+
+\paragraph{No-Cloning.}
+任意の未知量子状態を非破壊に複製することはできません。
+古典のように「バックアップを取って多数決」ができないため、誤り訂正はデータそのものを読むのではなく、補助量子ビットを介した\textbf{間接測定}（シンドローム）で行います（第3章）。
+
+\paragraph{メモリ寿命とゲート時間.}
+量子状態の寿命（緩和時間 $T_1$ など）は有限で、ゲートや測定にかかる時間と大きく離れないことがあります。
+そのため、計算をしていないアイドル中も、寿命より十分短い周期でパリティ検査（スタビライザ測定）を回し続けなければなりません。
+「検査一回から次の検査まで」を\textbf{符号サイクル}と呼ぶと、処理の大半がこのサイクルで占められ、論理演算もサイクル列に埋め込まれます（第5章）。
+
+\paragraph{古典/量子協調.}
+シンドロームのデコード、測定結果に基づく分岐（フィードフォワード）、スケジュール更新は古典コンピュータが担います。
+量子側の命令レイテンシは長い一方、古典側の処理が遅れると論理測定の返答が遅れ、プログラム全体が止まります。
+FTQC は本質的に\textbf{二つの計算機の協調}であり、性能は量子ハードウェアだけでは決まりません。
+
+\begin{notebox}
+  上記は「量子を古典のアクセラレータとして足す」という単純な図式とも違います。
+  量子側に優位性のない部分を古典に押し、量子側は寿命と誤り耐性の制約の中で符号サイクルを回す——という役割分担が設計の出発点になります。
+\end{notebox}
+
+\section{Basic Block と実行トレース}\label{sec:basic_block}
+
+\subsection{プログラムの見え方}
+
+量子プログラムはしばしば一つの静的な量子回路として書かれますが、FTQC では測定結果に応じた分岐が本質的です。
+より一般には、初期化・論理ゲート・測定からなる\textbf{Basic Block} のフローとして実行を記述します。
+ある Block が終わると、これまでに得た測定値に基づいて次の Block を選びます。
+測定値は本質的にランダムなので、\textbf{エラーが無くても実行トレースは非決定的}です。
+
+\subsection{制御装置と量子デバイスの対話}
+
+理想デバイスがある場合、実行は\textbf{制御装置}と\textbf{量子デバイス}の対話として見えます。
+制御装置は次に実行すべき Block を送り、量子デバイスはゲートと測定を行い、測定値を返します。
+分岐判定に必要な値が揃うまで、制御装置は待機します。
+
+実際の FTQC では、理想デバイスの代わりに「エラーのあるデバイス + 命令翻訳 + エラー推定」が入ります。
+論理命令は符号の規則に従って物理回路（符号サイクル列）へ翻訳され、測定レコードから検出器・オブザーバブルが構成され、エラー推定器が論理結果の反転を補正してから制御装置へ返します。
+クリフォード層ではパウリ誤りを右へ伝搬させて\textbf{パウリフレーム}として古典追跡できる、という性質がこのパイプラインの心臓部です（第5章で再論）。
+
+
+\section{論理演算の翻訳とエラー推定グラフ}\label{sec:error_graph}
+
+前節で見たように、FTQC において量子プログラムは Basic Block のフローとして表現され、制御装置・命令翻訳器・エラー推定器・量子デバイスの協調によって実行されます。
+では、命令翻訳器は高レベルな論理演算をどのように物理命令（符号サイクル列）へと翻訳し、エラー推定器はその背後で生じる誤りをどのように追跡するのでしょうか。
+本節では、論理演算の翻訳によって得られる物理回路の特性を整理し、誤り追跡の統一的な表現である\textbf{エラー推定グラフ}を導入します。
+
+\subsection{翻訳される論理演算の 3 類型}
+
+量子誤り訂正符号で保護された論理量子ビットに対しては、物理量子ビットのように任意のユニタリゲートを直接かけることはできません。
+符号空間を壊さず、かつ誤りが無制限に伝搬しないように論理演算を行う手法は、大きく次の 3 つの類型に大別されます。
+
+\paragraph{1. トランスバーサル操作.}
+符号ブロック内の各物理量子ビットに対し、ビットごとに独立かつ並列なゲートを適用する手法です。
+ブロック内部で誤りが横に広がることが原理的に起きないため誤り耐性が高く、かつ 1 符号サイクル（定数の回路深さ）で完了するという理想的な性質を持ちます。
+しかし、トランスバーサル操作のみで万能（ユニバーサル）な計算を行える量子誤り訂正符号は存在しないことが Eastin-Knill の定理\cite{eastin2009transversal}によって証明されています。
+したがって、万能性を得るには他の手法と組み合わせる必要があります。
+表面符号におけるトランスバーサル操作の限界とスタビライザ生成子の追跡については第\ref{ch:transversal}章で詳しく扱います。
+
+\paragraph{2. code deformation（符号変形）.}
+パリティ検査（スタビライザ測定）の対象となる演算子をステップごとに段階的に変形し、符号空間を連続的に遷移させることで論理演算を起こす手法です。
+途中の符号状態は次のステップの符号空間へ射影されるため、慎重に射影を重ねることで目的のユニタリ操作を実効的に実現します。
+符号サイクルの深さを定数に保ったままトランスバーサルには不可能な操作を実行できる利点がある反面、符号の切り替えに複数の符号サイクルを要し、補助的な符号領域（パッチ）を必要とします。
+この手法の最も代表的な例が、符号ブロック間で境界を結合（merge）および分離（split）して多体パウリ測定を行う\textbf{格子手術}です。
+格子手術による論理多体パウリ測定の結果は、結合境界における所定の物理測定値の XOR（排他的論理和）として得られます。
+格子手術の幾何と GF(2) 合成の基礎は第\ref{ch:ls_basics}章で解説します。
+
+\paragraph{3. 初期化と測定.}
+スタビライザ符号の一種である CSS 符号では、すべての物理データ量子ビットを $\ket{0}$ に初期化してからパリティ検査を行うことで、誤り耐性を保ったまま論理 $\ket{0}$ 状態を用意できます。
+また、全データ量子ビットをパウリ $Z$ 測定し、その測定値の XOR を取ることで論理 $Z$ 測定が完了します。
+しかし、このような決定論的かつ高忠実度な初期化は計算基底などの一部の状態に限られます。
+任意の状態（例えば万能量子計算に不可欠な魔法状態 $\ket{T}$ など）を符号化するには、確率的かつ低忠実度な注入手法\cite{li2015magic}を用いざるを得ません。
+低忠実度に注入された魔法状態は、その後に\textbf{魔法状態蒸留}（第\ref{ch:t_gate}章）といった誤り検出プロトコルを通すことで、計算に必要な高い忠実度へと引き上げられます。
+
+以上の 3 類型の帰結として重要なのは、\textbf{論理演算から翻訳された物理回路は、物理量子ビットに対する「初期化（魔法状態の注入を含む）」「Clifford 操作」「パウリ測定」の 3 つだけで構成される}という点です。
+非 Clifford ゲートであっても、魔法状態を用いたゲートテレポーテーションによって Clifford 操作と測定分岐へ帰着されるため、非 Clifford 性は注入される魔法状態に押し込まれ、回路の操作そのものは Clifford の枠内に収まります。
+この帰結が、次小節で述べる「パウリ誤りを古典的に追跡できる」という強力な性質の基礎となります。
+
+\subsection{パウリ誤りを右へ押す}
+
+物理回路が初期化・Clifford 操作・パウリ測定だけでできていることには、誤り追跡の観点から大きな利点があります。
+回路の合間に確率的に挿入されたパウリ誤りは、次の 3 つの簡明な規則に従って、時間方向（回路の右方向）へ押し出すことができるからです。
+\begin{enumerate}
+  \item \textbf{Clifford 操作の前の誤り} $\to$ 操作を通過すると、操作後の別のパウリ誤りに共役変換される。
+  \item \textbf{測定の前の誤り} $\to$ 測定演算子と反交換する誤りは測定値を反転させ、測定後にも同じ誤りとして残る。
+  \item \textbf{初期化の前の誤り} $\to$ 初期化操作によって消滅する（状態がリセットされる）。
+\end{enumerate}
+これらの規則を繰り返し適用すると、回路の途中で発生したすべてのパウリ誤りを、測定値の反転として記録しながら、現在実行中の回路の右端（最新時刻）へと移動させることができます。
+この操作はパウリ演算子の文字列置換（共役規則のルックアップ）にすぎないため、古典計算機上で高速に追従可能です。
+この追跡機構を\textbf{パウリフレーム}と呼びます。
+パウリ誤り伝搬の厳密な数学的根拠と古典ソフトウェア追跡の詳細は§\ref{sec:pauli_frame}、シンプレクティック表現を用いた代数的な定式化は本書では詳述しません。
+本章の段階では、パウリ誤りが「測定値を反転させながら右へ押し出せる」というイメージを掴んでおけば十分です。
+
+\subsection{エラー推定グラフ}
+
+パウリ誤りの伝搬規則を用いると、符号サイクル中に生じる誤りの検出と論理測定値の補正を、統一的なグラフ構造として定式化できます。
+このグラフを\textbf{エラー推定グラフ}と呼びます。
+エラー推定グラフは、次の 5 種類のノードから構成されます。
+
+\begin{itemize}
+  \item \textbf{エラーイベント}: 回路の特定の場所で「確率 $p$ でパウリ誤りが挿入される」という独立な抽選イベントです。抽選の結果として実際に誤りが挿入されることを、エラーイベントが\textbf{発火}したと呼びます。
+  \item \textbf{レコード}: 物理パウリ測定 1 回によって得られる測定結果（$0$ または $1$）です。
+  \item \textbf{ディテクタ}: 誤りが存在しなければ必ず $0$（決定論的な値）になることが保証されたレコードの部分集合の XOR です。例えば、同じパリティ検査を 2 回連続して行った場合、その間に誤りが起きなければ両者の値は一致するため、2 つのレコードの XOR はディテクタとなります。
+  \item \textbf{オブザーバブル}: 制御装置へ返送される論理パウリ測定値であり、物理レコードの XOR として定義されます。もし途中のエラーイベントによって反転していた場合は、\textbf{反転を補正してから}制御装置へ返さなければなりません。
+  \item \textbf{事後選択フラグ}: 魔法状態の注入・蒸留・培養といった確率的プロトコルの成否を表す値です。命令翻訳器が内部の制御フローを判断するために使う値であり、依存するレコードが確定し次第、\textbf{補正することなくそのまま翻訳器へ返送}されます。失敗であれば、翻訳器はそのプロトコルを再試行します。
+\end{itemize}
+
+この 5 種類のノードの関係は、図\ref{fig:ch2_error_graph}のような二部グラフとして可視化できます。
+左列のエラーイベントと中央列のレコードの間、およびレコードと右列の各値（ディテクタ・オブザーバブル・事後選択フラグ）の間にエッジが張られます。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[
+    scale=0.88,
+    every node/.style={transform shape},
+    >=Stealth,
+    % ノードスタイル定義
+    errnode/.style={circle, draw=black!70, fill=white, thick, minimum size=18pt, inner sep=0pt, font=\small},
+    errnode_fired/.style={circle, draw=black, fill=black!25, ultra thick, minimum size=18pt, inner sep=0pt, font=\small\bfseries},
+    recnode/.style={rectangle, draw=black!70, fill=white, thick, minimum size=17pt, inner sep=0pt, font=\small},
+    recnode_flipped/.style={rectangle, draw=black, fill=black!25, ultra thick, minimum size=17pt, inner sep=0pt, font=\small\bfseries},
+    detnode/.style={diamond, draw=black!70, fill=white, thick, minimum size=26pt, inner sep=0pt, font=\small},
+    detnode_flipped/.style={diamond, draw=black, fill=black!25, ultra thick, minimum size=26pt, inner sep=0pt, font=\small\bfseries},
+    obsnode/.style={circle, draw=black!70, fill=white, thick, double, double distance=1.5pt, minimum size=18pt, inner sep=0pt, font=\small},
+    obsnode_flipped/.style={circle, draw=black, fill=black!25, ultra thick, double, double distance=1.5pt, minimum size=18pt, inner sep=0pt, font=\small\bfseries},
+    flagnode/.style={regular polygon, regular polygon sides=3, draw=black!70, fill=white, thick, minimum size=26pt, inner sep=0pt, font=\footnotesize},
+    flagnode_flipped/.style={regular polygon, regular polygon sides=3, draw=black, fill=black!25, ultra thick, minimum size=20pt, inner sep=0pt, font=\footnotesize\bfseries},
+    % エッジスタイル
+    edge_norm/.style={draw=black!35, thick},
+    edge_err/.style={draw=black, line width=1.8pt},
+    % ラベル用スタイル
+    groupheader/.style={font=\bfseries\small, align=center},
+  ]
+    % 列ヘッダ
+    \node[groupheader] at (0, 3.8) {エラーイベント\\(確率的パウリ挿入)};
+    \node[groupheader] at (4.0, 3.8) {レコード\\(物理測定値)};
+    \node[groupheader] at (8.5, 3.8) {ディテクタ・オブザーバブル・\\事後選択フラグ};
+
+    % 左列: エラーイベント (x=0)
+    \node[errnode] (e1) at (0, 2.7) {$E_1$};
+    \node[errnode_fired] (e2) at (0, 1.35) {$E_2$};
+    \node[errnode] (e3) at (0, 0.0) {$E_3$};
+    \node[errnode] (e4) at (0, -1.35) {$E_4$};
+
+    % 中央列: レコード (x=4.0)
+    \node[recnode] (r1) at (4.0, 2.7) {$R_1$};
+    \node[recnode_flipped] (r2) at (4.0, 1.8) {$R_2$};
+    \node[recnode_flipped] (r3) at (4.0, 0.9) {$R_3$};
+    \node[recnode] (r4) at (4.0, 0.0) {$R_4$};
+    \node[recnode] (r5) at (4.0, -1.35) {$R_5$};
+
+    % 右列: ディテクタ、オブザーバブル、フラグ (x=8.5)
+    \node[detnode_flipped] (d1) at (8.5, 2.7) {$D_1$};
+    \node[detnode] (d2) at (8.5, 1.5) {$D_2$};
+    \node[obsnode_flipped] (o1) at (8.5, 0.3) {$O_1$};
+    \node[flagnode] (f1) at (8.5, -1.1) {$F_1$};
+
+    % 右列の種別ラベル
+    \node[right=8pt of d1, font=\footnotesize, text=black!80] {ディテクタ ($=1$ 反転)};
+    \node[right=8pt of d2, font=\footnotesize, text=black!80] {ディテクタ ($=0$ 正常)};
+    \node[right=8pt of o1, font=\footnotesize, text=black!80] {オブザーバブル (反転)};
+    \node[right=8pt of f1, font=\footnotesize, text=black!80] {事後選択フラグ (正常)};
+
+    % エラーイベント -> レコード のエッジ
+    \draw[edge_norm] (e1) -- (r1);
+    \draw[edge_norm] (e1) -- (r2);
+    
+    % 発火した E2 からのエッジ（太線）
+    \draw[edge_err] (e2) -- (r2);
+    \draw[edge_err] (e2) -- (r3);
+    
+    \draw[edge_norm] (e3) -- (r3);
+    \draw[edge_norm] (e3) -- (r4);
+    \draw[edge_norm] (e4) -- (r4);
+    \draw[edge_norm] (e4) -- (r5);
+
+    % レコード -> 右列 のエッジ
+    % D1 = R1 ^ R2 (R2反転 -> D1反転)
+    \draw[edge_norm] (r1) -- (d1);
+    \draw[edge_err] (r2) -- (d1);
+
+    % D2 = R2 ^ R3 (R2, R3ともに反転 -> D2=0 キャンセル)
+    \draw[edge_err] (r2) -- (d2);
+    \draw[edge_err] (r3) -- (d2);
+
+    % O1 = R3 ^ R4 (R3反転 -> O1反転)
+    \draw[edge_err] (r3) -- (o1);
+    \draw[edge_norm] (r4) -- (o1);
+
+    % F1 = R4 ^ R5 (反転なし)
+    \draw[edge_norm] (r4) -- (f1);
+    \draw[edge_norm] (r5) -- (f1);
+
+    % 凡例 (Legend)
+    \begin{scope}[shift={(0.0, -2.6)}]
+      \draw[rounded corners=4pt, draw=black!30, fill=black!3] (-1.2, -0.6) rectangle (11.5, 0.6);
+      
+      % ノード種別
+      \node[errnode, minimum size=11pt] at (-0.7, 0.2) {};
+      \node[right=2pt, font=\scriptsize] at (-0.5, 0.2) {エラーイベント};
+
+      \node[recnode, minimum size=10pt] at (1.8, 0.2) {};
+      \node[right=2pt, font=\scriptsize] at (2.0, 0.2) {レコード};
+
+      \node[detnode, minimum size=11pt] at (3.8, 0.2) {};
+      \node[right=2pt, font=\scriptsize] at (4.0, 0.2) {ディテクタ};
+
+      \node[obsnode, minimum size=11pt] at (6.0, 0.2) {};
+      \node[right=2pt, font=\scriptsize] at (6.2, 0.2) {オブザーバブル};
+
+      \node[flagnode, minimum size=11pt] at (8.7, 0.2) {};
+      \node[right=2pt, font=\scriptsize] at (8.9, 0.2) {事後選択フラグ};
+
+      % 状態
+      \node[errnode, minimum size=11pt] at (-0.7, -0.25) {};
+      \node[right=2pt, font=\scriptsize] at (-0.5, -0.25) {正常 / 未発火};
+
+      \node[errnode_fired, minimum size=11pt] at (1.8, -0.25) {};
+      \node[right=2pt, font=\scriptsize] at (2.0, -0.25) {発火 / 反転 ($1$)};
+
+      \draw[edge_norm] (4.6, -0.25) -- (5.1, -0.25);
+      \node[right=2pt, font=\scriptsize] at (5.1, -0.25) {依存};
+
+      \draw[edge_err] (6.6, -0.25) -- (7.1, -0.25);
+      \node[right=2pt, font=\scriptsize] at (7.1, -0.25) {反転の伝わる経路};
+    \end{scope}
+  \end{tikzpicture}
+  \caption{エラー推定グラフの構造とパウリ誤りの伝搬。左からエラーイベント（円）、測定レコード（四角）、そしてディテクタ（ひし形）・オブザーバブル（二重円）・事後選択フラグ（三角）の各ノードが接続されます。エラーイベント $E_2$ が発火すると、接続されたレコード $R_2, R_3$ が反転し、その影響が奇数個伝わったディテクタ $D_1$ とオブザーバブル $O_1$ が反転します（太枠・網掛け）。$D_2$ は反転レコードを偶数個（2個）含むため打ち消し合って $0$ のままとなります。エラー推定器はディテクタの値から発火パターンを推定し、$O_1$ の反転を補正して制御装置へ返送します。}
+  \label{fig:ch2_error_graph}
+\end{figure}
+
+図\ref{fig:ch2_error_graph}のグラフは次のように読み解きます。
+あるエラーイベントが発火したとき、前小節の伝搬規則を適用することで、どのレコードが反転するかが一意に決まります。
+各レコードは、接続されたエラーイベントのうち\textbf{奇数個が発火した場合に値が反転}（$1$ が加算）されます。
+同様に、ディテクタ、オブザーバブル、事後選択フラグは、それぞれが参照するレコードのうち\textbf{奇数個が反転した場合に値が反転}します。
+図\ref{fig:ch2_error_graph}の例では、エラーイベント $E_2$ が発火したことでレコード $R_2, R_3$ が反転しています。
+その結果、$R_1$（正常）と $R_2$（反転）を参照するディテクタ $D_1$ は奇数個の反転を受けて $1$ に反応し、誤りの発生を検出します。
+一方、$R_2$ と $R_3$ の両方を参照するディテクタ $D_2$ は偶数個の反転を受けて打ち消し合い、$0$（正常）のままとなります。
+そして、$R_3$ を含むオブザーバブル $O_1$ は誤りによって反転しています。
+
+ここで解くべき課題が\textbf{デコード問題}です。
+エラー推定器は、観測されたディテクタの値から「どのエラーイベントが発火したと考えるのがもっともらしいか」を推定し、最終的にオブザーバブルが反転したかどうかを判定します。
+このとき本質的なのは、\textbf{推定した発火パターンが実際に発火したパターンと物理的に一致していなくても、オブザーバブルの反転の有無さえ正しく判定できればよい}という点です。
+推定された誤りと真の誤りの差がスタビライザ（符号空間の状態を変化させない演算子）である限り、論理情報は破壊されません。
+この「残差（\texttt{obs \textasciicircum\ pred}）の反転判定が合っていれば合格」という考え方は、本書のデコード評価（第\ref{ch:decoding}章）およびシミュレータのトラジェクトリ実行（第\ref{ch:trajectory}章）の根幹をなす設計思想です。
+
+本章で導入したエラー推定グラフの語彙は、本書のシミュレータが中核に据えるツール Stim\cite{gidney2021stim} の語彙にほぼそのまま対応します（事後選択フラグだけは Stim に対応する命令がありません）（表\ref{tab:ch2_error_graph_stim}）。
+Stim における各命令の具体的な構文や検出器エラーモデル（DEM）の扱いは、第\ref{ch:stim}章で実践的に学びます。
+
+\begin{table}[htbp]
+  \centering
+  \caption{エラー推定グラフの語彙と Stim の語彙の対応関係}
+  \label{tab:ch2_error_graph_stim}
+  \begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}p{0.22\textwidth}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{0.24\textwidth}}
+    \hline
+    \textbf{本章の語} & \textbf{Stim での表現} & \textbf{本書で詳しく扱う章} \\
+    \hline
+    エラーイベント & ノイズ命令（\texttt{DEPOLARIZE1} など）と、DEM の \texttt{error(p)} 項 & 第\ref{ch:stim}章、第\ref{ch:decoding}章 \\
+    レコード & 測定命令（\texttt{M}, \texttt{MPP} など）の結果、\texttt{rec[-k]} で参照 & §\ref{sec:detectors_obs} \\
+    ディテクタ & \texttt{DETECTOR} & §\ref{sec:detectors_obs} \\
+    オブザーバブル & \texttt{OBSERVABLE\_INCLUDE} & §\ref{sec:detectors_obs} \\
+    事後選択フラグ & Stim の直接の命令にはなく、ディテクタの部分集合の OR として本書側で計算 & §\ref{sec:distill} \\
+    \hline
+  \end{tabularx}
+\end{table}
+
+\begin{notebox}
+  \paragraph{事後選択フラグの 2 つの形態.}
+  本書において事後選択は次の 2 つの形で現れます。
+  \begin{enumerate}
+    \item[(a)] \textbf{ディテクタ（レコードの XOR）の論理和（OR）}: 15-to-1 魔法状態蒸留（§\ref{sec:distill}）において全検査シンドロームが 0 であることの確認や、これらは物理レコードのパリティから直接決定されます。
+    \item[(b)] \textbf{デコーダの出力（2 つの仮説の重みの差）}: デコーダの出力を用いる事後選択の方式もありますが、本書の実装では扱いません。
+  \end{enumerate}
+  (b) の gap 事後選択は、文献\cite{suzuki2026ftqc}における「物理レコードから計算される値」という狭義の定義の枠組みを超えた拡張である点に留意してください。
+\end{notebox}
+
+\subsection{グラフを有界に保つ}
+
+エラー推定グラフは、符号サイクルが進むたびに新たなエラーイベントやレコードが追加されるため、そのままでは時間とともに無制限に肥大化してしまいます。
+しかし、エラー推定が完了した過去のエラーイベントは、すべて回路の現在時刻（右端）まで伝搬させてパウリフレームへと畳み込むことができます。
+パウリフレームに統合が済んだ過去のレコード情報はもはや保持する必要がないため、グラフから安全に破棄できます。
+
+したがって、エラー推定器が符号サイクルよりも高速にデコードを完了できる限り、\textbf{メモリ上に保持すべきエラー推定グラフのサイズは実行時間によらず一定（有界）に保たれます}。
+
+もしデコード処理が追いつかず遅延が生じると、未解決のグラフは際限なく伸び続け、制御装置へ論理測定結果を返すまでの待ち時間（リアクション時間）も累積していきます。
+このリアクション時間が全体の実行速度を律速する問題については、§\ref{sec:three_bottlenecks}の 3 大ボトルネックで取り上げます。
+第25章ではデコード遅延を簡易な解析モデルで説明します。窓デコードの実装は本書では扱いません。
+
+\section{表面符号アーキテクチャの具体例}\label{sec:surface_arch}
+
+前節までに、FTQC システムにおける理想デバイスの代替という枠組みと、誤り追跡のためのエラー推定グラフを導入しました。
+本節ではこれを踏まえ、2 次元正方格子上に配置された物理量子ビットと最近接相互作用を持つデバイス上で、表面符号を用いて誤り訂正を行う場合の具体的なシステム構成と論理命令セットを整理します。
+
+\subsection{構成要素とデータの流れ}
+
+表面符号を基盤とする FTQC アーキテクチャの全体像と、構成要素間を行き交うデータの流れを図\ref{fig:ch2_surface_arch}に示します。
+計算は、古典計算機上で動作する制御装置と命令翻訳器、誤り訂正を担うエラー推定器、そして物理的な量子デバイスの協調によって進行します。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[
+    scale=0.90,
+    every node/.style={transform shape},
+    >=Stealth,
+    proc/.style={rectangle, draw=black, fill=white, thick, rounded corners=2pt, minimum width=2.0cm, minimum height=1.2cm, align=center, font=\small},
+    bufnode/.style={rectangle, draw=black!70, fill=black!6, rounded corners=4pt, minimum width=1.1cm, minimum height=1.6cm, align=center, font=\scriptsize},
+    hwproc/.style={rectangle, draw=black!80, fill=white, thick, rounded corners=2pt, minimum width=1.9cm, minimum height=1.1cm, align=center, font=\small},
+    qdevnode/.style={rectangle, draw=black, fill=black!10, thick, rounded corners=3pt, minimum width=1.6cm, minimum height=2.6cm, align=center, font=\small},
+  ]
+    % デバイス依存エリアの破線枠（コントローラと識別器）
+    \draw[dashed, thick, draw=black!50, fill=black!2, rounded corners=5pt] (8.9, -0.9) rectangle (11.3, 3.2);
+    \node[font=\scriptsize\bfseries, text=black!70, align=center] at (10.1, 3.5) {デバイス依存\\（本書のスコープ外）};
+
+    % ノード配置 (上段: y = 2.4)
+    \node[proc] (ctrl) at (0.8, 2.4) {\textbf{制御装置}\\[1pt]\scriptsize 実行ループ};
+    \node[bufnode] (libuf) at (3.0, 2.4) {論理\\命令\\バッファ};
+    \node[proc] (trans) at (5.4, 2.4) {\textbf{命令翻訳器}\\[1pt]\scriptsize \lstinline{plan()}};
+    \node[bufnode] (pibuf) at (7.8, 2.4) {物理\\命令\\バッファ};
+    \node[hwproc] (ctrl_hw) at (10.1, 2.4) {コントローラ\\[1pt]\scriptsize パルス生成};
+
+    % 量子デバイス (中央右: y = 1.2)
+    \node[qdevnode] (qdev) at (12.8, 1.2) {\textbf{量子デバイス}\\[2pt]\scriptsize 2次元正方格子\\物理量子ビット};
+
+    % ノード配置 (下段: y = 0.0)
+    \node[hwproc] (disc) at (10.1, 0.0) {アナログ識別器\\[1pt]\scriptsize 信号判定};
+    \node[bufnode] (recbuf) at (7.8, 0.0) {レコード\\バッファ};
+    \node[proc] (est) at (5.4, 0.0) {\textbf{エラー推定器}\\[1pt]\scriptsize デコーダ群};
+
+    % 矢印: 上段の順方向
+    \draw[->, thick] (ctrl) -- (libuf);
+    \draw[->, thick] (libuf) -- (trans);
+    \draw[->, thick] (trans) -- (pibuf);
+    \draw[->, thick] (pibuf) -- (ctrl_hw);
+    \draw[->, thick] (ctrl_hw.east) -- ++(0.4, 0) |- ([yshift=12pt]qdev.west);
+
+    % 矢印: デバイスから下段
+    \draw[->, thick] ([yshift=-12pt]qdev.west) -- ++(-0.4, 0) -| (disc.east);
+    \draw[->, thick] (disc) -- (recbuf);
+    \draw[->, thick] (recbuf) -- (est);
+
+    % 矢印: 命令翻訳器 <-> エラー推定器
+    \draw[->, thick] ([xshift=-14pt]trans.south) -- ([xshift=-14pt]est.north)
+      node[midway, left, font=\scriptsize, align=right] {グラフ形状の\\先行通知};
+    \draw[->, thick] ([xshift=14pt]est.north) -- ([xshift=14pt]trans.south)
+      node[midway, right, font=\scriptsize, align=left] {事後選択フラグ／\\補正済みオブザーバブル};
+
+    % 矢印: 命令翻訳器 -> 制御装置 (補正済みオブザーバブルの返送)
+    \draw[->, thick] (trans.north) to[out=140, in=40]
+      node[midway, above, font=\scriptsize] {補正済みオブザーバブルの返送} (ctrl.north);
+
+  \end{tikzpicture}
+  \caption{表面符号アーキテクチャにおける構成要素とデータの流れ。制御装置が発行した論理命令は論理命令バッファを経て命令翻訳器により物理回路へ翻訳され、エラー推定器には事前にエラー推定グラフの形状が通知されます。コントローラとアナログ識別器（破線枠内）は物理デバイス依存のアナログ処理であり、本書のスコープ外です。物理測定値はレコードバッファを経てエラー推定器へ送られ、事後選択フラグおよび補正済みオブザーバブルが命令翻訳器経由で制御装置へと返送されます。}
+  \label{fig:ch2_surface_arch}
+\end{figure}
+
+図\ref{fig:ch2_surface_arch}における処理の流れは次の順序で進みます。
+\begin{enumerate}
+  \item \textbf{論理命令の発行とバッファリング}:
+    制御装置はプログラムを読み出し、エントリーポイントとなる Basic Block から順に実行を開始します。
+    先行する測定値に依存せず確定している論理命令は、容量の許す限り\textbf{論理命令バッファ}へ先行して投入されます。
+  \item \textbf{物理命令への翻訳とグラフ形状の通知}:
+    命令翻訳器は論理命令バッファから命令を順次取り出し、表面符号のルールに従って符号サイクルごとの物理回路（初期化・Clifford 操作・パウリ測定）へと翻訳して\textbf{物理命令バッファ}へ書き込みます。
+    同時に、これから実行する回路に対応するエラー推定グラフのトポロジー（エラーイベント・レコード・ディテクタ・オブザーバブルの接続関係）をエラー推定器へ先行通知します。
+    この時点では物理測定が行われていないためレコード値は存在しませんが、エラー推定器はデコードグラフの構築などの準備を進めることができます。
+  \item \textbf{物理操作の実行と測定レコードの蓄積}:
+    物理命令バッファに積まれた操作は、コントローラ（マイクロ波パルス等のアナログ制御信号生成器）へと送られ、物理量子デバイスに対してゲートや測定パルスが印加されます。
+    物理測定によってデバイスから読み出されたアナログ信号は、アナログ識別器によって $0$ または $1$ の古典ビットへと判定され、\textbf{レコードバッファ}に蓄積されます。
+    なお、コントローラからアナログ識別器に至るアナログ処理やパルス制御は物理デバイス固有の層であり、本書のシミュレータの対象外（スコープ外）として扱います（§\ref{sec:ftqc_scope}）。
+  \item \textbf{事後選択フラグの早期通知}:
+    エラー推定器は、レコードバッファから測定値を順次取り出し、依存するレコードが揃ったノードの値を計算します。
+    魔法状態の注入など確率的プロトコルの成否を表す\textbf{事後選択フラグ}は、値が確定し次第ただちに命令翻訳器へ通知されます。
+    フラグが失敗を示していれば、命令翻訳器は直ちにそのプロトコルの再試行を指示します。
+  \item \textbf{リアルタイム推定と補正済みオブザーバブルの返送}:
+    並行して、エラー推定器は取得されたディテクタの値から発火したエラーイベントのパターンをリアルタイムに推定します。
+    制御装置が要求する論理測定（オブザーバブル）について反転の有無が確定すると、エラー推定器はその反転を正しく補正したうえで、命令翻訳器を経由して制御装置へと返送します。
+    これにより制御装置の待機状態が解除され、後続の条件分岐が確定して次の Basic Block の実行へと進みます。
+\end{enumerate}
+
+\subsection{論理命令セットと本書での実体}
+
+表面符号パッチに対して万能な量子計算を行うための命令セットとして、文献\cite{suzuki2026ftqc}では表\ref{tab:ch2_isa}に示す 6 種類の論理命令が定義されています。
+\begin{table}[htbp]
+  \centering
+  \caption{表面符号の論理命令セットと本書（Stage 01--03）における実装実体}
+  \label{tab:ch2_isa}
+  \begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}p{0.12\textwidth}>{\raggedright\arraybackslash}p{0.22\textwidth}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{0.18\textwidth}}
+    \hline
+    \textbf{命令} & \textbf{意味} & \textbf{本書での実体（Stage 01--03）} & \textbf{章} \\
+    \hline
+    \texttt{INITZ} & 論理 $\ket{0}$ への初期化 & \codeinline{CliffordFTCompiler.compile()} 冒頭の全データへの \texttt{R} と最初の検査ラウンド（\codepath{src/ftqc/clifford_ft_full.py}） & 第\ref{ch:surface_patch}章・第\ref{ch:transversal}章 \\
+    \texttt{INITT} & 低忠実度の $\ket{T}$ 状態を用いる命令 & Stage 03 runtime は \texttt{T} を \codeinline{SpecialGate} として状態ベクトルへ適用し、magic fault の推定を \codeinline{MagicReport} に記録します。独立 API \codeinline{build\_ls\_t\_injection\_shell()} は runtime の通常経路では呼び出しません。 & 第\ref{ch:t_gate}章・第\ref{ch:ls_t}章 \\
+    \texttt{MEAS1} & 論理 $Z$ 測定 & 共役済みの論理 $Z$ を \texttt{MPP} で測り \codeinline{OBSERVABLE_INCLUDE} に入れる（\codepath{src/ftqc/clifford_ft_full.py}） & 第\ref{ch:surface_patch}章・第\ref{ch:transversal}章 \\
+    \texttt{MEAS2} & 格子手術による $M_{ZZ}$ & merge / split のシェル。LS-CNOT では \codeinline{LSCnotEvent} $\to$ \codeinline{build_ls_cnot_shell()}、\codeinline{LSCnotFT} & 第\ref{ch:ls_basics}章・第\ref{ch:ls_cnot}章 \\
+    \texttt{UNITH} & 論理 $H$ & \codeinline{CliffordChunk} 内の \texttt{H}: データへの横断的 $H$ ＋ 生成子の共役（文献\cite{suzuki2026ftqc}の code deformation による実現とは異なる） & 第\ref{ch:transversal}章 \\
+    \texttt{UNITS} & 論理 $S$ & \codeinline{plan()} は \texttt{S}/\texttt{SDG} を \codeinline{SpecialGate} にします。通常の statevector 経路では汎用 memory handoff を使い、QPD の S/SDG 分岐は設定に応じて LS-S シェルへ送ります。 & 第\ref{ch:ls_logical}章 \\
+    \hline
+  \end{tabularx}
+\end{table}
+
+ここで、2 量子ビットゲートの代表である CNOT が基本命令セットに含まれていない点に注目してください。
+表面符号において CNOT は、1 つの補助論理パッチを介して 2 体パウリ測定 $M_{ZZ}$（\texttt{MEAS2}）と $M_{XX}$（および局所的な $H$ 操作）の積へと分解して実行されます。
+格子手術を用いたこの CNOT の分解構造とパウリフレーム補正の詳細は、第\ref{ch:ls_cnot}章で具体的に実装します。
+また、任意の 1 量子ビット回転ゲートは、Ross-Selinger の合成法\cite{ross2016synthesis}と魔法状態のゲートテレポーテーションを用いることで、高品質な魔法状態 $\ket{T}$ の供給、Clifford ゲート、およびパウリ測定による古典分岐へと分解されます。
+任意角回転の合成やリソース工場の設計は本書では扱いません。
+
+\paragraph{文献の命令セットと本書の実装の違い.}
+文献\cite{suzuki2026ftqc}の論理命令セットと、本書の Stage 01--03 におけるシミュレータ実装との間には、設計判断に基づく次の 2 つの重要な差異があります。
+
+\begin{enumerate}
+  \item \textbf{\texttt{UNITH} の実現手法}:
+    同文献は論理 $H$ を code deformation で実現する構成を想定しています。
+    これに対して本書の \lstinline{CliffordFTCompiler}（第\ref{ch:transversal}章）では、データ量子ビット群に対する横断的 $H$ 操作の適用と、後続のスタビライザ生成子および論理演算子の古典的な共役変換（パウリフレーム追跡）の組み合わせによって論理 $H$ を処理します。
+    横断的 $H$ をかけると X 型と Z 型の境界の向きが入れ替わりますが、本書はこれを生成子の共役として帳簿上で吸収し、パッチを元の向きへ戻す操作（実機では code deformation や補助パッチが要る部分）はモデル化していません。
+  \item \textbf{\texttt{INITT} の供給モデル}: 文献の命令セットでは、低忠実度な魔法状態を確率的に注入し、事後選択の失敗時には成功するまで物理初期化を繰り返す動的ループを想定しています。
+    本書の Stage 01--03 runtime はこの再試行ループをモデル化しません。論理 $T$ は \lstinline{SpecialGate} として状態ベクトルに適用し、magic-state fault 率を \lstinline{MagicReport} に記録します。独立 API \lstinline{build_ls_t_injection_shell()} は Stage 03 runtime の通常経路では呼び出されません。
+    動的な再試行と供給レートのモデル化は本書の対象外です。
+\end{enumerate}
+
+\subsection{本書の実装への対応}
+
+本節で示した表面符号アーキテクチャの骨格は、本書のハイブリッドシミュレータにおいて次のように各コンポーネントへ写像されます。
+§\ref{sec:basic_block} で見た制御装置と量子デバイスの対話を、図\ref{fig:ch2_surface_arch}の各箱に対応づけ直したものです。
+
+\begin{itemize}
+  \item \textbf{制御装置} $\leftrightarrow$ 実行ループ（\lstinline{HybridFTQCRuntime.run()}）。
+    Basic Block に相当する論理ゲート列を受け取り、次にどのイベントを処理すべきかを判定しながらトラジェクトリの進行を管理します。
+  \item \textbf{命令翻訳器} $\leftrightarrow$ 計画部（\lstinline{HybridFTQCRuntime.plan()}）。
+    論理ゲート列を解析し、Clifford のまとまり（\lstinline{CliffordChunk}）、特殊ゲート（\lstinline{SpecialGate}）、格子手術 CNOT（\lstinline{LSCnotEvent}）という 3 種類のイベントへと分解します。
+  \item \textbf{エラー推定器} $\leftrightarrow$ 復号パイプライン（\lstinline{decode_shell()} および \lstinline{CliffordFTCompiler.decode()}）。
+    Stim 回路内の \texttt{DETECTOR} 制約から検出器エラーモデルを抽出し、MWPM や BP+OSD デコーダを用いて論理残差（オブザーバブルの反転の有無）を推定します。
+  \item \textbf{量子デバイス} $\leftrightarrow$ ハイブリッドバックエンド。
+    Clifford 誤り訂正部を担う Stim 上の物理 QEC シェルと、非 Clifford の状態更新を担う論理状態ベクトルバックエンドの 2 層構造で理想デバイスを代替します。
+\end{itemize}
+
+このように、本書はアーキテクチャの抽象的な「箱」を概念にとどめず、すべて動作する Python コードとして切り出しています。
+各箱に対応する具体的なクラス構成、ファイル間の依存関係、および関数のシグネチャの詳細は、統合ランタイムを解説する第\ref{ch:architecture}章 §\ref{sec:ftqc_arch}（表\ref{tab:arch_map}）で包括的に解説します。
+本章の段階では、これら 4 つの役割がブロック図（図\ref{fig:ch2_surface_arch}）のどの位置を占め、どのようなデータを受け渡しているかという全体構造を把握してください。
+
+\section{3 大ボトルネック}\label{sec:three_bottlenecks}
+
+論理エラー率だけが性能指標ではありません。
+実行時間を大づかみに支配しうる要素として、次の 3 つを押さえておくと設計や最適化の議論が整理されます。
+
+\paragraph{魔法状態の供給.}
+万能量子計算に必要な非 Clifford 操作（典型的には $T$ ゲート）は、魔法状態の注入・蒸留やゲートテレポーテーションを介して実現されます。
+魔法状態を継続的に生成する工場領域の供給速度がプログラムの需要に追いつかない場合、実行時間は工場のスループットによって律速されます。
+プログラム全体で必要となる魔法状態の数を $N_M$、蒸留済みの魔法状態を 1 つ生成する周期を $T_M$ とすると、実行時間は $N_M T_M$ と近似されます。
+この供給律速を緩和するには、工場を並列に複数構築して供給レートを上げるか、コンパイル最適化によって非 Clifford 操作の総数を削減することが有効です。
+本書では、蒸留モデル（第\ref{ch:t_gate}章）と、シミュレータならではの「理想に近い魔法状態を直接注入する」検証経路の両方を扱います。
+
+\paragraph{リアクションの連鎖.}
+制御装置が論理パウリ測定（\texttt{MEAS1} 命令など）を発行してから、物理測定とデコードを経て確定した論理測定値が制御装置へ返送されるまでの時間を\textbf{リアクション時間}と呼びます。
+物理的なパウリ測定自体は 1 符号サイクル程度で完了しますが、レコード蓄積からエラー推定器によるデコード完了までに要する古典処理の遅延が支配的になり得ます。
+例えば超伝導量子ビットでは符号サイクルが約 $1\,\mu\mathrm{s}$ であるのに対し、Google による実験\cite{google2025belowthreshold}ではリアクション時間として $63\,\mu\mathrm{s}$ が報告されています（これは桁感を示す例示であり、特定ハードウェアの数値表の再現を意図したものではありません）。
+プログラム中に「測定値に依存して次の分岐や補正が決まる」という依存関係が存在する場合、分岐のたびにこの古典遅延が累積します。
+測定値依存の分岐グラフにおける最長経路の長さを $N_R$、リアクション時間を $T_R$ とすると、分岐が多くリアクションが遅い場合の実行時間は $N_R T_R$ と近似されます。
+$T$ ゲートテレポーテーションで測定結果に応じて $S$ 補正をかけるかどうかを決める分岐は、この連鎖の代表例です。
+
+\paragraph{符号サイクルの繰り返し.}
+魔法状態の供給もリアクション時間も支配的でない場合、実行時間は純粋に必要な符号サイクルの回数によって決まります。
+計算全体を完了するのに必要な符号サイクル数を $N_C$、1 符号サイクルの物理時間を $T_C$ とすると、実行時間は $N_C T_C$ と近似されます。
+この領域では、回路深さの削減、論理命令の並列化、そして物理的な符号サイクル時間 $T_C$ そのものの短縮が有効です。
+また、実行時間が符号サイクル律速であることは魔法状態の供給能力が過剰であることを意味するため、工場の規模を縮小して浮いた物理量子ビットを論理ゲートの並列化へ回すという逆向きの最適化も考えられます。
+
+\begin{notebox}
+  3 つのボトルネックのうちどれか 1 つだけが突出して長い状態は、ハードウェアの構成とアプリケーションの要求が噛み合っていないサインと読めます。
+  バランスを取るには、ハードウェア資源の配分（工場の規模やデコード計算力）と、コンパイラによる最適化（命令の並列化や依存関係の解消）の双方から手当てすることが求められます。
+\end{notebox}
+
+\subsection{本書がモデル化するもの／しないもの}
+
+本章は地図であり、実機のタイミング表ではありません。
+本書のシミュレータが主に扱うのは次です。
+
+\begin{itemize}
+  \item 論理回路から物理 QEC シェル／チャンクへの分解と、合否判定を伴う誤り耐性検証。
+  \item Clifford 層のスタビライザサンプリングと、非 Clifford 操作の状態ベクトル／QPD による検証。
+  \item シェル残差の合成という\textbf{論理的妥当性}の側からのボトルネック切り分け。
+\end{itemize}
+
+一方、アナログ制御波形、特定デバイスの $\mu\mathrm{s}$ 単位の実測レイテンシ表、工場スケジューラの本番運用などは対象外です（§\ref{sec:ftqc_scope}）。
+第25章では遅延の簡易モデルを示しますが、実測量や運用方法は本書の対象外です。
+
+\section{本書の範囲}\label{sec:book_scope}
+
+本書では、回転表面符号を用いた小規模な FTQC シミュレーションを題材にします。符号の選択、論理操作、復号、トラジェクトリ実行を一つずつ導入し、距離 $d=3$ に固定した Stage 03 でまとめます。qLDPC 符号、異なる符号間の変換、実時間スケジューラ、デバイス固有の制御は重要な研究領域ですが、本書の実装対象には含めません。関連研究の出典は付録Dに挙げています。
+
+
+\section{やること・スコープ外}\label{sec:ftqc_scope}
+
+\subsection{やること}
+
+\begin{itemize}
+  \item FTQC を「理想デバイスの代替シミュレーション」として定義する。
+  \item 4 制約と Basic Block／制御パイプラインを、後章の語彙として固定する。
+  \item エラー推定グラフの語彙（5 種のノード）を後章の共通語彙として固定する。
+  \item 表面符号アーキテクチャの命令セットと本書の実体を対応づける。
+  \item 3 大ボトルネックの地図と、本書が論理層で切り分ける範囲を示す。
+  \item 本書後半への地図を示す。
+\end{itemize}
+
+\subsection{スコープ外}
+
+\begin{itemize}
+  \item 実機制御スタック（DAC/ADC、アナログ識別、組み込みリアルタイム OS）の詳細実装。
+  \item 特定ハードウェアの符号サイクル時間・リアクション時間の数値表の再現。
+  \item 本章段階でのコード実装（実装は第~II~部以降）。
+  \item 分散量子計算（もつれ生成の蒸留）。
+\end{itemize}
+
+\section{まとめ}\label{sec:ftqc_summary}
+
+\begin{itemize}
+  \item FTQC の目的は、エラーのあるデバイス上でエラーのないデバイスとの対話を実効的に再現することです。
+  \item 符号距離・No-Cloning・メモリ寿命・古典/量子協調が設計を古典と分岐させます。
+  \item プログラムは Basic Block のフローとして進み、測定のため実行トレースは非決定的です。
+  \item 命令翻訳器とエラー推定器が理想デバイスを代替し、本書の plan / decode に対応します。
+  \item エラー推定グラフは 5 種のノードで誤り伝搬を表現し、オブザーバブルは補正して制御装置へ返し、事後選択フラグはそのまま命令翻訳器へ返します。
+  \item 性能の壁は魔法状態・リアクション時間・符号サイクルの三つで大づかみできます。
+\end{itemize}
+
+次章（第\ref{ch:qec_intro}章）では、誤り訂正そのもの——なぜ古典の冗長化が使えず、シンドローム測定が必要なのか——を整理します。
+
+\begin{exercise}
+  \begin{enumerate}
+    \item 4 つの制約それぞれについて、本書の後続のどの話題（符号距離の合否、シンドローム、符号サイクル、デコード遅延など）に効くかを一文で対応づけなさい。
+    \item 「エラーがなくても実行トレースが非決定的」である理由を、Basic Block の分岐の言葉で説明しなさい。
+    \item 3 大ボトルネックのうち、シミュレータで評価しやすいもの／実機タイミングなしには語りにくいものを分け、その理由を述べなさい。
+    \item 事後選択フラグとオブザーバブルの扱いの違いと、その理由を述べなさい。
+    \item ディテクタ 2 個にまたがるエラーイベントと、3 個以上にまたがるエラーイベントとで、デコード問題の難しさがどう変わるか（MWPM に帰着できるか）を説明しなさい。
+  \end{enumerate}
+\end{exercise}

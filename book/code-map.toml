@@ -1,0 +1,302 @@
+[meta]
+version = "2.0"
+updated = "2026-10-11"
+description = "公開版の第1–25章と付録A–Dのコード対応"
+
+[stages."01_mpp"]
+name = "01_mpp"
+display_name = "Stage 01: MPP Only"
+description = "現象論 MPP の独立環境"
+source_root = "src/stages/01_mpp/src/ftqc"
+is_canonical = false
+current_chapters = [6, 7, 8, 9, 10, 11, 12, 13]
+logical_chapters = [6, 7, 8, 9, 10, 11, 12, 13]
+
+[stages."02_circuit_level"]
+name = "02_circuit_level"
+display_name = "Stage 02: Circuit Level Extension"
+description = "回路レベルの独立環境"
+source_root = "src/stages/02_circuit_level/src/ftqc"
+is_canonical = false
+current_chapters = [14, 15, 16, 17, 18, 19]
+logical_chapters = [14, 15, 16, 17, 18, 19]
+
+[stages."03_d3_integrated"]
+name = "03_d3_integrated"
+display_name = "Stage 03: d=3 Integrated Simulator"
+description = "d=3 固定の統合版。リポジトリ直下の実装を正本とします。"
+source_root = "src/ftqc"
+is_canonical = true
+current_chapters = [20, 21, 22, 23, 24, 25]
+logical_chapters = [20, 21, 22, 23, 24, 25]
+
+[chapters."1"]
+current_chapter = 1
+logical_chapter = 1
+file = "book/chapter/1.tex"
+stage = ""
+title = "第1章: 量子コンピュータ概要"
+legacy_modules = []
+stage_modules = []
+canonical_modules = []
+
+[chapters."2"]
+current_chapter = 2
+logical_chapter = 2
+file = "book/chapter/2.tex"
+stage = ""
+title = "第2章: FTQC とは"
+legacy_modules = []
+stage_modules = []
+canonical_modules = []
+
+[chapters."3"]
+current_chapter = 3
+logical_chapter = 3
+file = "book/chapter/3.tex"
+stage = ""
+title = "第3章: エラー訂正とは"
+legacy_modules = []
+stage_modules = []
+canonical_modules = []
+
+[chapters."4"]
+current_chapter = 4
+logical_chapter = 4
+file = "book/chapter/4.tex"
+stage = ""
+title = "第4章: エラー訂正符号とは"
+legacy_modules = []
+stage_modules = []
+canonical_modules = []
+
+[chapters."5"]
+current_chapter = 5
+logical_chapter = 5
+file = "book/chapter/5.tex"
+stage = ""
+title = "第5章: エラー訂正フロー"
+legacy_modules = []
+stage_modules = []
+canonical_modules = []
+
+[chapters."6"]
+current_chapter = 6
+logical_chapter = 6
+file = "book/chapter/6.tex"
+stage = "01_mpp"
+title = "第6章: Stim の使いかた"
+legacy_modules = []
+stage_modules = ["src/stages/01_mpp/src/ftqc/ftqc_toy.py", "src/stages/01_mpp/src/ftqc/hybrid_ftqc_runtime.py"]
+canonical_modules = []
+
+[chapters."7"]
+current_chapter = 7
+logical_chapter = 7
+file = "book/chapter/7.tex"
+stage = "01_mpp"
+title = "第7章: 表面符号パッチを作る（MPP）"
+legacy_modules = []
+stage_modules = ["src/stages/01_mpp/src/ftqc/surface_patch.py"]
+canonical_modules = []
+
+[chapters."8"]
+current_chapter = 8
+logical_chapter = 8
+file = "book/chapter/8.tex"
+stage = "01_mpp"
+title = "第8章: デコードと評価の基準"
+legacy_modules = []
+stage_modules = ["src/stages/01_mpp/src/ftqc/clifford_ft_full.py", "src/stages/01_mpp/src/ftqc/ls_handoff_shells.py"]
+canonical_modules = []
+
+[chapters."9"]
+current_chapter = 9
+logical_chapter = 9
+file = "book/chapter/9.tex"
+stage = "01_mpp"
+title = "第9章: トランスバーサル操作と生成子追跡"
+legacy_modules = []
+stage_modules = ["src/stages/01_mpp/src/ftqc/clifford_ft_full.py", "src/stages/01_mpp/src/ftqc/logical_clifford_ftqc.py"]
+canonical_modules = []
+
+[chapters."10"]
+current_chapter = 10
+logical_chapter = 10
+file = "book/chapter/10.tex"
+stage = "01_mpp"
+title = "第10章: 格子手術の基礎（幾何と GF2 合成）"
+legacy_modules = []
+stage_modules = ["src/stages/01_mpp/src/ftqc/geom_lattice_surgery.py"]
+canonical_modules = []
+
+[chapters."11"]
+current_chapter = 11
+logical_chapter = 11
+file = "book/chapter/11.tex"
+stage = "01_mpp"
+title = "第11章: 論理レベル格子手術と LS ハンドオフ"
+legacy_modules = []
+stage_modules = ["src/stages/01_mpp/src/ftqc/lattice_surgery.py", "src/stages/01_mpp/src/ftqc/ls_handoff_shells.py"]
+canonical_modules = []
+
+[chapters."12"]
+current_chapter = 12
+logical_chapter = 12
+file = "book/chapter/12.tex"
+stage = "01_mpp"
+title = "第12章: T ゲート・蒸留・2 経路（statevector / QPD）"
+legacy_modules = []
+stage_modules = ["src/stages/01_mpp/src/ftqc/t_gate.py", "src/stages/01_mpp/src/ftqc/qpd_backend.py", "src/stages/01_mpp/src/ftqc/hybrid_ftqc_runtime.py"]
+canonical_modules = []
+
+[chapters."13"]
+current_chapter = 13
+logical_chapter = 13
+file = "book/chapter/13.tex"
+stage = "01_mpp"
+title = "第13章: Stage 01 のハイブリッドランタイム"
+legacy_modules = []
+stage_modules = ["src/stages/01_mpp/src/ftqc/hybrid_ftqc_runtime.py"]
+canonical_modules = []
+
+[chapters."14"]
+current_chapter = 14
+logical_chapter = 14
+file = "book/chapter/14.tex"
+stage = "02_circuit_level"
+title = "第14章: なぜ回路レベルが必要か"
+legacy_modules = []
+stage_modules = ["src/stages/02_circuit_level/src/ftqc/circuit_level_merge.py"]
+canonical_modules = []
+
+[chapters."15"]
+current_chapter = 15
+logical_chapter = 15
+file = "book/chapter/15.tex"
+stage = "02_circuit_level"
+title = "第15章: 回路レベル merge を実装する"
+legacy_modules = []
+stage_modules = ["src/stages/02_circuit_level/src/ftqc/circuit_level_merge.py"]
+canonical_modules = []
+
+[chapters."16"]
+current_chapter = 16
+logical_chapter = 16
+file = "book/chapter/16.tex"
+stage = "02_circuit_level"
+title = "第16章: 格子手術 CNOT"
+legacy_modules = []
+stage_modules = ["src/stages/02_circuit_level/src/ftqc/ls_cnot_ft.py", "src/stages/02_circuit_level/src/ftqc/circuit_level_merge.py"]
+canonical_modules = []
+
+[chapters."17"]
+current_chapter = 17
+logical_chapter = 17
+file = "book/chapter/17.tex"
+stage = "02_circuit_level"
+title = "第17章: ケーススタディ：距離2バグを距離3に直す"
+legacy_modules = []
+stage_modules = ["src/stages/02_circuit_level/src/ftqc/ls_cnot_ft.py"]
+canonical_modules = []
+
+[chapters."18"]
+current_chapter = 18
+logical_chapter = 18
+file = "book/chapter/18.tex"
+stage = "02_circuit_level"
+title = "第18章: T テレポートの格子手術実装（LS-T）"
+legacy_modules = []
+stage_modules = ["src/stages/02_circuit_level/src/ftqc/ls_cnot_ft.py", "src/stages/02_circuit_level/src/ftqc/ls_handoff_shells.py"]
+canonical_modules = []
+
+[chapters."19"]
+current_chapter = 19
+logical_chapter = 19
+file = "book/chapter/19.tex"
+stage = "02_circuit_level"
+title = "第19章: 回路レベル Shell API"
+legacy_modules = []
+stage_modules = ["src/stages/02_circuit_level/src/ftqc/circuit_level_ls.py", "src/stages/02_circuit_level/src/ftqc/ls_handoff_shells.py"]
+canonical_modules = []
+
+[chapters."20"]
+current_chapter = 20
+logical_chapter = 20
+file = "book/chapter/20.tex"
+stage = "03_d3_integrated"
+title = "第20章: アーキテクチャ全体像"
+legacy_modules = []
+stage_modules = []
+canonical_modules = ["src/ftqc/hybrid_ftqc_runtime.py", "src/ftqc/circuit_level_merge.py", "src/ftqc/ls_cnot_ft.py", "src/ftqc/ls_handoff_shells.py", "src/ftqc/geom_lattice_surgery.py", "src/ftqc/clifford_ft_full.py"]
+
+[chapters."21"]
+current_chapter = 21
+logical_chapter = 21
+file = "book/chapter/21.tex"
+stage = "03_d3_integrated"
+title = "第21章: 命令計画とイベント分解"
+legacy_modules = []
+stage_modules = []
+canonical_modules = ["src/ftqc/hybrid_ftqc_runtime.py"]
+
+[chapters."22"]
+current_chapter = 22
+logical_chapter = 22
+file = "book/chapter/22.tex"
+stage = "03_d3_integrated"
+title = "第22章: トラジェクトリ実行と残差注入"
+legacy_modules = []
+stage_modules = []
+canonical_modules = ["src/ftqc/hybrid_ftqc_runtime.py", "src/ftqc/ls_handoff_shells.py"]
+
+[chapters."23"]
+current_chapter = 23
+logical_chapter = 23
+file = "book/chapter/23.tex"
+stage = "03_d3_integrated"
+title = "第23章: 状態ベクトルバックエンドと tsim"
+legacy_modules = []
+stage_modules = []
+canonical_modules = ["src/ftqc/hybrid_ftqc_runtime.py", "src/ftqc/ftqc_tsim_backend.py"]
+
+[chapters."24"]
+current_chapter = 24
+logical_chapter = 24
+file = "book/chapter/24.tex"
+stage = "03_d3_integrated"
+title = "第24章: 可視化とレポート"
+legacy_modules = []
+stage_modules = []
+canonical_modules = ["src/ftqc/viz/ftqc_mapping_visualizer.py", "src/ftqc/viz/stim_timeline_visualizer.py", "src/ftqc/viz/t_branch_visualizer.py", "src/ftqc/viz/ftqc_integrated_report.py", "src/ftqc/viz/ftqc_run_visualizer.py", "src/ftqc/viz/ftqc_run_report.py", "src/ftqc/hybrid_ftqc_runtime.py"]
+
+[chapters."25"]
+current_chapter = 25
+logical_chapter = 25
+file = "book/chapter/25.tex"
+stage = "03_d3_integrated"
+title = "第25章: テストと性能評価"
+legacy_modules = []
+stage_modules = []
+canonical_modules = ["src/ftqc/hybrid_ftqc_runtime.py", "src/ftqc/ls_handoff_shells.py", "src/ftqc/ls_cnot_ft.py", "src/ftqc/t_gate.py"]
+
+[appendices."aa"]
+id = "aa"
+file = "book/chapter/aa.tex"
+title = "付録A: 開発環境セットアップ"
+
+[appendices."ab"]
+id = "ab"
+file = "book/chapter/ab.tex"
+title = "付録B: モジュール地図と依存関係"
+
+[appendices."ac"]
+id = "ac"
+file = "book/chapter/ac.tex"
+title = "付録C: 検証基準と制限"
+
+[appendices."ad"]
+id = "ad"
+file = "book/chapter/ad.tex"
+title = "付録D: 参考文献"
+

@@ -1,0 +1,56 @@
+id = "02"
+name = "circuit_level"
+display_name = "Stage 02: Circuit Level Extension"
+description = "MPP を回路レベルへ拡張した版（アンシラ、4-step CX、hook、回路レベルmerge、LS-CNOT、LS-T、Shell API）"
+logical_chapters = [14, 15, 16, 17, 18, 19]
+current_chapters = [14, 15, 16, 17, 18, 19]
+current_files = [
+  "book/chapter/14.tex",
+  "book/chapter/15.tex",
+  "book/chapter/16.tex",
+  "book/chapter/17.tex",
+  "book/chapter/18.tex",
+  "book/chapter/19.tex"
+]
+source_root = "src/ftqc"
+inherits = "01_mpp"
+
+added = [
+  "circuit_level_merge.py",
+  "ls_cnot_ft.py",
+  "circuit_level_ls.py"
+]
+changed = [
+  "ls_handoff_shells.py",
+  "hybrid_ftqc_runtime.py"
+]
+unchanged = [
+  "__init__.py",
+  "surface_patch.py",
+  "clifford_ft_full.py",
+  "ftqc_toy.py",
+  "transversal_cnot.py",
+  "logical_clifford_ftqc.py",
+  "geom_lattice_surgery.py",
+  "lattice_surgery.py",
+  "t_gate.py",
+  "qpd_backend.py",
+  "viz/__init__.py",
+  "viz/ftqc_mapping_visualizer.py",
+  "viz/stim_timeline_visualizer.py",
+  "viz/t_branch_visualizer.py"
+]
+removed = []
+
+forbidden_import_prefixes = [
+  "ref.",
+  "ftqc.core.surface_code_d",
+  "ftqc.runtime.symplectic_frame"
+]
+
+acceptance_tests = [
+  "tests/test_imports.py",
+  "tests/test_smoke.py",
+  "tests/test_boundaries.py",
+  "tests/test_examples.py"
+]

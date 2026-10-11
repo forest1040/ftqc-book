@@ -1,0 +1,272 @@
+% Stage: 03 ／ 説明用コード: src/ftqc
+\chapter{アーキテクチャ全体像}\label{ch:architecture}
+
+\begin{chaptergoal}
+  \begin{itemize}
+  \item 第2章で導入した FTQC アーキテクチャの4要素（制御装置・命令翻訳器・エラー推定器・量子デバイス）が、\codepath{src/ftqc} のどのクラス・関数に対応するかを理解します。
+  \item \codepath{src/ftqc} の主要モジュールの役割と呼び出し関係を概観します。
+  \item 外部依存パッケージ（Stim・PyMatching・NumPy・stimbposd・Qulacs）の必須／任意の区別を理解します。
+  \item 論理回路が「plan（計画）$\to$ イベント $\to$ 残差サンプリング $\to$ トラジェクトリ」という一本の流れで実行されることを理解します。
+  \item 第V部（第21–25章）で何を掘り下げるかの地図を得ます。
+  \end{itemize}
+\end{chaptergoal}
+
+第IV部（Stage 02）では、\codepath{src/stages/02_circuit_level/src/ftqc} を舞台に、回路レベルの格子手術 merge（\texttt{circuit\_level\_merge.py}）、格子手術 CNOT（\texttt{ls\_cnot\_ft.py}）、T テレポート（\texttt{LSTeleportFT}）、そしてそれらを束ねる Shell API（\texttt{ls\_handoff\_shells.py}）を個別に組み上げてきました。
+第V部（Stage 03）は、これらの部品を \textbf{1 個の司令塔}のもとに統合し、Clifford + T の任意の論理回路を、符号距離 $d=3$ に固定した表面符号パッチ上で最初から最後まで走らせる段階です。
+その司令塔が \codepath{src/ftqc/hybrid_ftqc_runtime.py} の \lstinline{HybridFTQCRuntime} であり、本章はこの統合シミュレータの「地図」を先に描いておくことを目的とします。
+細部の実装（イベント分解の規則、残差注入の数式、バックエンドの選び方、可視化とレポート、テストの合否基準）は第21–25章に譲り、本章では
+\begin{enumerate}
+  \item FTQC アーキテクチャの抽象的な4要素と実装の対応、
+  \item 7 ファイルという最小構成とその依存関係、
+  \item 実行フローの骨格
+\end{enumerate}
+の3点だけに絞って見通しをつけます。
+
+\begin{notebox}
+  Stage: \textbf{03}。
+  説明用コードは主に \codepath{src/ftqc/} を用います。
+  この段階の残差モデルは論理 $X_L$ 反転（Z 基底オブザーバブルの反転）が中心であり、この制限を本章の結果の解釈に含めます。
+\end{notebox}
+
+\section{FTQC アーキテクチャとの対応}\label{sec:ftqc_arch}
+
+\subsection{理想デバイスの代替という枠組みの再確認}
+
+第\ref{ch:ftqc}章では、FTQC の目的を「エラーのない量子デバイスとの対話を、エラーのあるデバイス上で実効的に再現すること」と定義しました。
+理想デバイスを直接持てない以上、実際の系はエラーのある量子デバイス、論理命令を物理操作へ落とす\textbf{命令翻訳器}、シンドロームから誤りを推定する\textbf{エラー推定器}の組で代替し、それらの対話を\textbf{制御装置}が仕切る、という4要素構成になります。
+第\ref{ch:ftqc}章 §\ref{sec:surface_arch} ではアーキテクチャの箱と役割を整理しましたが、本節では \codepath{src/ftqc} の具体的なクラスと関数まで踏み込んで対応づけます。
+
+\subsection{4要素と \texttt{HybridFTQCRuntime} の対応}
+
+\lstinline{HybridFTQCRuntime}（\codepath{src/ftqc/hybrid_ftqc_runtime.py}）は、論理回路（ゲート列）を受け取り、雑音付きトラジェクトリを大量にサンプリングして最終的な論理測定分布を返す、Stage 03 の中枢オブジェクトです。
+4要素との対応は次のとおりです。
+
+\begin{itemize}
+  \item \textbf{制御装置} $\leftrightarrow$ \lstinline{HybridFTQCRuntime.run()} 内のイベントループ。
+    \lstinline{plan()} が返したイベント列を先頭から処理し、イベントの種類ごとに次の処理（残差サンプリング・状態更新）へ振り分けます。
+  \item \textbf{命令翻訳器} $\leftrightarrow$ \lstinline{HybridFTQCRuntime.plan()}。
+    論理ゲート列を、Clifford のまとまり（\lstinline{CliffordChunk}）、S/T などの特殊ゲート（\lstinline{SpecialGate}）、格子手術 CNOT（\lstinline{LSCnotEvent}）という3種類の\textbf{イベント}へ分解します。
+  \item \textbf{エラー推定器} $\leftrightarrow$ Stim 回路の検出器と、それを読むデコーダ群。
+    \lstinline{CliffordFTCompiler.decode()}（\texttt{clifford\_ft\_full.py}）や \lstinline{decode_shell()}（\texttt{ls\_handoff\_shells.py}）が、検出器のサンプルから PyMatching（MWPM）または stimbposd（BP+OSD）でシンドロームを解釈し、論理残差（$X_L$ 反転の有無）を推定します。
+  \item \textbf{量子デバイス} $\leftrightarrow$ 2 層構造。
+    Clifford 部分は Stim 上の物理表面符号回路（QEC シェル）が「エラーのある量子デバイス」の役を演じ、非 Clifford 部分（T/Tdag の実際の状態更新）は状態ベクトルバックエンド（\lstinline{NumpyStateBackend} / \lstinline{QulacsStateBackend} / \lstinline{StimCliffordBackend}、あるいは \texttt{ftqc\_tsim\_backend.py} の \lstinline{TsimStateBackend}）が担います。
+\end{itemize}
+
+\begin{table}[htbp]
+  \centering
+  \caption{FTQC アーキテクチャの4要素と \codepath{src/ftqc} の対応}
+  \label{tab:arch_map}
+  \begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}p{0.24\textwidth}>{\raggedright\arraybackslash}X}
+    \hline
+    アーキテクチャ要素 & \codepath{src/ftqc} での実体 \\
+    \hline
+    制御装置 & \lstinline{HybridFTQCRuntime.run()} のイベントループ \\
+    命令翻訳器 & \lstinline{HybridFTQCRuntime.plan()} \\
+    エラー推定器 & \lstinline{CliffordFTCompiler.decode()}、\lstinline{decode_shell()}（MWPM $\to$ BP+OSD フォールバック） \\
+    量子デバイス & Stim 上の QEC シェル ＋ 状態ベクトルバックエンド \\
+    \hline
+  \end{tabularx}
+\end{table}
+
+この対応で重要なのは、第2章で述べた「クリフォード層ではパウリ誤りを右へ伝搬させてパウリフレームとして古典追跡できる」という性質が、ここでは\textbf{デコーダが返す論理残差を状態ベクトル側へ後から適用する}という形で現れている点です。
+つまり量子デバイス側（Stim の QEC シェル）とエラー推定器（デコーダ）が先に走り、その結果である古典ビット（論理 $X_L$ 反転の有無）だけが状態ベクトル側に渡されます。
+これがハイブリッド型シミュレータの核心であり、次章以降でイベントごとに具体的に確認していきます。
+
+\begin{lstlisting}[language=Python, caption={イベントを表す3つのデータクラス（\codepath{src/ftqc/hybrid_ftqc_runtime.py}）}, label={lst:planevents}]
+@dataclass
+class CliffordChunk:
+    gates: List[Gate]
+    label: str
+
+@dataclass
+class SpecialGate:
+    name: str
+    target: int
+    label: str
+
+@dataclass
+class LSCnotEvent:
+    """A logical CNOT routed through the circuit-level LS CNOT shell."""
+    control: int
+    target: int
+    label: str
+
+PlanEvent = Any
+\end{lstlisting}
+
+\lstinline{CliffordChunk} は $\{X, Y, Z, H, \mathrm{CNOT}\}$ のまとまりを表し、命令翻訳器はこれをそのまま1つの Stim 物理回路へコンパイルします。
+\lstinline{SpecialGate} は S/SDG/T/Tdag を表し、状態ベクトル側での直接適用（あるいは QPD 分岐）と、その前後の QEC シェルサンプリングを引き起こします。
+\lstinline{LSCnotEvent} は \lstinline{cnot_mode="lattice_surgery"} を選んだときにだけ生成され、CNOT を transversal ではなく格子手術 CNOT シェル経由で実行することを命令翻訳器が決定した結果です。
+
+\section{モジュールと依存関係}\label{sec:seven_files}
+
+公開版の Stage 03 は \codepath{src/ftqc/} 直下に Python モジュールを配置します。旧版のような \texttt{core/}・\texttt{runtime/}・\texttt{viz/} のサブパッケージ構成ではありません。統合ランタイムを入口に、Clifford シェル、格子手術、状態バックエンドを組み合わせます。図式化した主要な依存関係は次のとおりです。
+
+\begin{lstlisting}[language=Python, caption={Stage 03 の主要モジュール間の呼び出し関係}]
+hybrid_ftqc_runtime.py
+  |-- clifford_ft_full.py
+  |-- ls_handoff_shells.py
+  |     |-- ls_cnot_ft.py
+  |     |-- circuit_level_merge.py
+  |     `-- geom_lattice_surgery.py
+  |-- t_gate.py
+  |-- ftqc_tsim_backend.py  # 試作 adapter
+  `-- qpd_backend.py
+\end{lstlisting}
+\label{lst:dep_tree}
+
+この図は主要な呼び出し関係を示す概略であり、全 import 関係や完全な依存 DAG を表すものではありません。可視化・レポート用モジュールも同じ \codepath{src/ftqc/} 直下にあり、実行結果を入力として扱います。個々の API と適用範囲は第21–24章で説明します。
+
+\subsection{外部依存パッケージ}
+
+表~\ref{tab:extdeps} は \codepath{src/ftqc} が前提とする外部パッケージです。
+必須のものが欠けると \lstinline{qec_mode="required"} では例外が飛び、\lstinline{qec_mode="optional"} では該当する QEC シェルのサンプリングがゼロ残差でスキップされます（この挙動は第22章で詳しく扱います）。
+
+\begin{table}[htbp]
+  \centering
+  \caption{外部依存パッケージ}
+  \label{tab:extdeps}
+  \begin{tabular}{lll}
+    \hline
+    パッケージ & 必須度 & 用途 \\
+    \hline
+    \texttt{stim} & 必須 & 表面符号回路生成・検出器サンプリング・デコード \\
+    \texttt{pymatching} & 必須 & MWPM デコード（graphlike な誤り） \\
+    \texttt{numpy} & 必須 & 状態ベクトル・線形代数・確率計算 \\
+    \texttt{stimbposd} & 推奨 & BP+OSD フォールバック（非 graphlike な誤り） \\
+    \texttt{qulacs} & 任意 & 高速状態ベクトルバックエンド（無ければ NumPy） \\
+    \hline
+  \end{tabular}
+\end{table}
+
+Stim と PyMatching が「エラー推定器」の実装基盤であり、NumPy（と任意で Qulacs）が「量子デバイス」の非 Clifford 側を担う、という点は前節の対応表とも整合しています。
+
+\section{実行フロー：plan \texorpdfstring{$\to$}{→} イベント \texorpdfstring{$\to$}{→} 残差 \texorpdfstring{$\to$}{→} トラジェクトリ}\label{sec:flow}
+
+\subsection{4段のパイプライン}
+
+\lstinline{HybridFTQCRuntime.run()} が1回呼ばれてから最終的な \lstinline{HybridRunResult} が返るまでの流れは、次の4段に整理できます。
+
+\begin{lstlisting}[language=Python, caption={実行フローの骨格（概念図）}, label={lst:flow_ascii}]
+論理回路（ゲート列）
+     |
+     v  plan()  ---------------------------- 命令翻訳器
+List[PlanEvent]
+  (CliffordChunk / SpecialGate / LSCnotEvent)
+     |
+     v  イベントごとの残差サンプリング ------ エラー推定器
+  _sample_qec_residuals()          (Clifford チャンク)
+  _sample_ls_s_shell_residuals()   (S / SDG)
+  _sample_ls_cnot_shell_residuals()(格子手術 CNOT)
+     |
+     v  デコード結果 = 論理残差 (x_residuals, z_residuals)
+     |
+     v  トラジェクトリ再生（shot ごと） ------ 量子デバイス（状態ベクトル側）
+  _apply_chunk_to_state() / _apply_logical_residuals()
+     |
+     v  終端 Z 基底測定
+HybridRunResult（measurement_counts, qec_reports, ...）
+\end{lstlisting}
+
+\subsection{plan：命令翻訳器の出力}
+
+\lstinline{plan()} は、ゲート列を先頭から読み、Clifford ゲートは \lstinline{chunk} にため込み、S/SDG/T/Tdag に出会うたびに（あるいは \lstinline{cnot_mode="lattice_surgery"} で CNOT に出会うたびに）そこまでの \lstinline{chunk} を \lstinline{CliffordChunk} として確定（flush）し、続けて \lstinline{SpecialGate} または \lstinline{LSCnotEvent} を追加します。
+最後まで読み終えたら残りの \lstinline{chunk} も \lstinline{"tail"} という理由で確定します。
+
+\begin{lstlisting}[language=Python, caption={\texttt{plan()} の骨格（\codepath{src/ftqc/hybrid_ftqc_runtime.py}、抜粋）}]
+def plan(self, qc_or_gates: Any) -> List[PlanEvent]:
+    gates = parse_qulacs_or_gate_list(qc_or_gates)
+    events: List[PlanEvent] = []
+    chunk: List[Gate] = []
+    chunk_id = 0
+
+    def flush(reason: str) -> None:
+        nonlocal chunk, chunk_id
+        if chunk:
+            events.append(CliffordChunk(gates=chunk, label=f"clifford_chunk_{chunk_id}_{reason}"))
+            chunk = []
+            chunk_id += 1
+
+    for gi, (name, a, b) in enumerate(gates):
+        name = normalize_gate_name(name)
+        if name in ("CNOT", "CX") and self.cnot_mode == "lattice_surgery":
+            flush(f"before_CNOT_{gi}")
+            events.append(LSCnotEvent(control=a, target=b, label=f"CNOT_{gi}"))
+        elif name in CLIFFORD_CHUNK_GATES:
+            chunk.append((name, a, b))
+        elif name in ("S", "SDG"):
+            flush(f"before_{name}_{gi}")
+            events.append(SpecialGate(name=name, target=a, label=f"{name}_{gi}"))
+        elif name in ("T", "T_DAG"):
+            flush(f"before_{name}_{gi}")
+            events.append(SpecialGate(name=name, target=a, label=f"{name}_{gi}"))
+        else:
+            raise ValueError(f"Unsupported gate in hybrid plan: {name}")
+    flush("tail")
+    return events
+\end{lstlisting}
+\label{lst:plan_body}
+
+この \lstinline{plan()} の出力はイベントの\textbf{系列}であり、まだ雑音もデコードも含みません。
+命令翻訳器の役割が「論理命令を、後段の物理層が処理できる単位に切り分けること」に限定されている点が、第2章の抽象的な説明を裏づけています。
+
+\subsection{イベント $\to$ 残差：エラー推定器の出力}
+
+\lstinline{run()} は \lstinline{plan()} が返したイベント列を1本のループで処理します。
+イベントの種類に応じて、対応する残差サンプリング関数を呼びます。
+
+\begin{itemize}
+  \item \lstinline{CliffordChunk} $\to$ \lstinline{_sample_qec_residuals()}：\lstinline{clifford_ft_full.CliffordFTCompiler} でチャンクを物理回路にコンパイルし、検出器をサンプリングして PyMatching（失敗すれば stimbposd の BP+OSD）でデコードします。
+  \item \lstinline{SpecialGate} の S/SDG/T/Tdag $\to$ 空の Clifford チャンクによる汎用 memory シェルをサンプリングします。QPD の T 分岐では I/Z 分岐が memory シェル、S/SDG 分岐が LS-S シェルを通ります。
+  \item \lstinline{LSCnotEvent} $\to$ \lstinline{_sample_ls_cnot_shell_residuals()}：格子手術 CNOT シェルをデコードします。
+\end{itemize}
+
+いずれの経路でも出力は共通の形をしています。すなわち、shots 行 $\times$ 論理量子ビット数列の 0/1 行列 \lstinline{x_residuals}（必要なら \lstinline{z_residuals} も）です。
+1 が立っている位置が、その shot・その論理量子ビットに論理 $X_L$ 残差（Z 基底オブザーバブルの反転）が生じたことを意味します。
+この段階の残差モデルが「主に $X_L$」に限られる点は、本書で扱うモデル上の制限です。
+
+\lstinline{run()} は、これらの残差サンプリングを\textbf{全イベントについて一度だけまとめて実行}してから、shot ごとの状態ベクトル更新に移ります。
+コメントにあるとおり「\textit{Batch-sample all stochastic data once, then replay per shot}」という設計です。
+Stim のバッチサンプリングは shots をまとめて処理する方が高速なので、乱数の消費を先に済ませておき、状態ベクトル側の再生だけを shot ループに残す、という分離が性能上の要点になります。
+
+\subsection{残差 $\to$ トラジェクトリ：量子デバイス側の再生}
+
+サンプリング済みの残差が揃ったら、\lstinline{run()} は shot ごとに状態ベクトル（あるいは \lstinline{StimCliffordBackend} / \lstinline{TsimStateBackend}）を初期化し、イベント列をもう一度先頭から辿ります。
+\lstinline{CliffordChunk} の内容は \lstinline{_apply_chunk_to_state()} でそのままゲートとして適用され、続けてデコード済みの論理残差が \lstinline{_apply_logical_residuals()} によってパウリフレーム補正として適用されます。
+\lstinline{SpecialGate} の T/Tdag は、\lstinline{nonclifford_mode="statevector"} なら状態ベクトルへ直接作用し、\lstinline{nonclifford_mode="qpd"} なら $I/S/Z$ の符号付き分岐としてサンプリングされます（詳細は第22章）。
+全イベントを処理し終えると、最後に終端の Z 基底測定を行い、\lstinline{HybridRunResult.measurement_counts} に積み上げます。
+
+\lstinline{HybridRunResult} は測定分布だけでなく、各イベントで得られた \lstinline{QECReport}（デコーダ名・残差率）、\lstinline{MagicReport}（magic state の fault 率）、\lstinline{QPDBranchReport}（QPD 分岐の重み）も保持しています。
+これらのレポート群は「制御装置がエラー推定器から受け取った内部情報をどこまで記録するか」に相当し、第24章の可視化・レポート層と第25章の合否基準検証がこの情報をそのまま利用します。
+
+\begin{notebox}
+  本章では「骨格」だけを示しました。
+  \begin{itemize}
+    \item イベント分解の細則（どのゲートがどう \lstinline{flush} を誘発するか、\lstinline{cnot_mode} の切り替え）は第21章。
+    \item 残差注入の数式的な扱い（パウリフレーム補正、QPD 分岐の重み）は第22章。
+    \item バックエンドの選択（NumPy / Qulacs / Stim / tsim）は第23章。
+    \item 可視化とレポート（依存グラフ SVG、マッピング図、タイムライン、T-branch 図）は第24章。
+    \item 不変条件・合否基準・性能評価は第25章。
+  \end{itemize}
+\end{notebox}
+
+\section{まとめ}\label{ch20:summary}
+
+\begin{itemize}
+  \item FTQC アーキテクチャの4要素（制御装置・命令翻訳器・エラー推定器・量子デバイス）は、\codepath{src/ftqc} では \lstinline{HybridFTQCRuntime.run()} のイベントループ、\lstinline{plan()}、\lstinline{decode_shell()} などのデコーダ、Stim の QEC シェル＋状態ベクトルバックエンドに、それぞれ対応します。
+  \item Stage 03 の実装は \codepath{src/ftqc/} 直下のモジュールで構成されます。第IV部で扱った格子手術の各モジュールを統合ランタイムから呼び出します。
+  \item 外部依存は Stim・PyMatching・NumPy が必須、stimbposd が推奨、Qulacs が任意です。
+  \item 実行フローは「\lstinline{plan()} でイベント列に分解する $\to$ イベントごとに残差をサンプリング・デコードする $\to$ その残差を shot ごとに状態ベクトルへ再生する」という一本道であり、雑音サンプリングと状態ベクトル再生を分離することで性能を確保しています。
+  \item \codepath{src/ftqc/} のバックエンド・可視化・レポート用モジュールは第23–24章で扱います。
+\end{itemize}
+
+次章では、本章で骨格だけを示した \lstinline{plan()} に立ち返り、イベント分解の規則と \lstinline{CliffordChunk} / \lstinline{SpecialGate} / \lstinline{LSCnotEvent} それぞれの意味を詳しく検討します。
+
+\begin{exercise}
+  \begin{enumerate}
+    \item 表~\ref{tab:arch_map} の4要素それぞれについて、対応する \codepath{src/ftqc} のクラス名または関数名を1つ挙げ、その理由を一文で説明しなさい。
+    \item ある論理回路が Clifford ゲートのみで構成される場合と、CNOT を1個含み \lstinline{cnot_mode="lattice_surgery"} を指定した場合とで、\lstinline{plan()} が生成するイベント列がどう変わるかを、リスト~\ref{lst:plan_body} を参考に説明しなさい。
+    \item \lstinline{run()} が「残差サンプリングを先にまとめて行い、状態ベクトル再生を shot ごとに行う」という順序を採用している理由を、Stim のバッチサンプリングの性質から説明しなさい。
+    \item \texttt{ls\_handoff\_shells.py} の \lstinline{decode_shell()} が \lstinline{allow_gauge_detectors} を使わない設計であることは、第19章（Shell API）の主題でした。本章の呼び出し関係図（リスト~\ref{lst:dep_tree}）を踏まえ、この設計方針が \lstinline{ls_cnot_ft.py} や \lstinline{circuit\_level_merge.py} の graphlike 上界 3 という検証結果とどう関係するか、またなぜそれだけでは厳密距離の証明にならないかを述べなさい。
+  \end{enumerate}
+\end{exercise}

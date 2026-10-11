@@ -1,0 +1,317 @@
+% Stage: 02 ／ 説明用コード: src/stages/02\_circuit\_level/src/ftqc
+\chapter{回路レベル merge を実装する}\label{ch:circuit_merge}
+
+\begin{chaptergoal}
+  \begin{itemize}
+  \item アンシラと 4 ステップの CX を使ったシンドローム抽出の仕組みを理解します。
+  \item \texttt{GeomMerge} の幾何を再利用しつつ、局所スタビライザの測定を MPP からアンシラベースの回路レベル抽出へ置き換える \texttt{CircuitLevelMerge} を実装します。
+  \item joint 測定（$Z_L(A)Z_L(B)$ または $X_L(A)X_L(B)$）が、split → merge → split のスケジュールの中でどの記録の排他的論理和として得られるかを理解します。
+  \item ノイズなしで gauge 検出器ゼロ、回路レベルノイズありで \texttt{shortest\_graphlike\_error} が符号距離 3 に保たれることを確認します。
+  \end{itemize}
+\end{chaptergoal}
+
+第14章では、MPP によるスタビライザ測定が「1 回の測定で複数の量子ビットにまたがるパリティを瞬時に読む」という抽象化であり、実機の回路では成り立たないことを確認しました。
+実際のハードウェアでは、スタビライザはアンシラを介して CX ゲートを何回か重ねて読み出すほかなく、そのたびに回路レベルのノイズ（ゲート誤り、初期化誤り、測定誤り）が積み重なります。
+さらに、CX を重ねる順序を誤ると\textbf{hook 誤り}――1 回の CX ゲート誤りが 2 個のデータ量子ビットへ同時に伝播し、単独では検知できない誤りへ育ってしまう現象――が生じ、符号距離を実質的に落としてしまうことも見ました。
+
+本章では、第10章で構築した幾何的 lattice surgery（\codepath{src/stages/02_circuit_level/src/ftqc/geom_lattice_surgery.py} の \texttt{GeomMerge}）を土台に、そこで MPP に任せていた局所スタビライザ測定を、アンシラと 4 ステップの CX からなる回路レベルのシンドローム抽出に置き換えます。
+この置き換えを行うクラスが \codepath{src/stages/02_circuit_level/src/ftqc/circuit_level_merge.py} の \texttt{CircuitLevelMerge} です。
+幾何（データ配置、スタビライザ集合、joint 演算子の分解、論理演算子）は \texttt{GeomMerge} からそのまま引き継ぎ、変わるのは「どうやってスタビライザ固有値を測るか」だけです。
+そのうえで、noise なしなら gauge 検出器がゼロであること、noise ありでも \texttt{shortest\_graphlike\_error} が符号距離 3 に保たれることを、本章末で確認します。
+
+\begin{notebox}
+  Stage: \textbf{02}。
+  説明用コードは主に \codepath{src/stages/02_circuit_level/src/ftqc/circuit_level_merge.py} と、その土台である \codepath{src/stages/02_circuit_level/src/ftqc/geom_lattice_surgery.py} を用います。
+\end{notebox}
+
+\section{アンシラとシンドローム抽出}\label{sec:ancilla}
+
+\subsection{4-step CX}
+
+表面符号の各スタビライザ（$X$ 型または $Z$ 型のプラケット）は、4 個のデータ量子ビットを頂点とする正方形の中心にアンシラを 1 個置き、CX を 4 回重ねて測ります。
+$Z$ 型スタビライザ $Z_1Z_2Z_3Z_4$ を測る場合、アンシラを $\ket{0}$ に初期化し、4 個のデータ量子ビットそれぞれから CX（制御: データ、標的: アンシラ）を 1 回ずつかけたのち、アンシラを測定します。
+$X$ 型スタビライザの場合はアダマールでアンシラを $\ket{+}$ にしてから CX（制御: アンシラ、標的: データ）を 4 回かけ、再びアダマールを挟んで測定します。
+
+問題は、この 4 回の CX を\textbf{どの順序で}かけるかです。
+1 個のアンシラは 4 個のデータ量子ビットと隣接しますが、逆に 1 個のデータ量子ビットも（バルクでは）最大 4 個のスタビライザに共有されます。
+したがって、全アンシラを同時並列に動かすには、各アンシラ・各データ量子ビットが同じタイムステップで重複しないように、CX を 4 つの離散的なステップへ割り当てる必要があります。
+さらに、この割り当て順序は任意ではありません。
+順序を誤ると、CX ゲート 1 回分の誤り（$X$ 誤りや $Z$ 誤り）が伝播した結果、2 個のデータ量子ビットに同時に誤りが乗り、それが単一の検出イベントとして観測されてしまう\textbf{hook 誤り}が生じ、符号距離を実質的に下げてしまいます。
+
+\subsection{X/Z 型スケジュール}
+
+\texttt{circuit\_level\_merge.py} では、この CX 順序を手で導出せず、\texttt{surface\_patch.py} が Stim の生成する回路（\texttt{surface\_code:rotated\_memory\_z}）から機械的に抽出した「hook 誤りを避ける順序」を、merge した符号全体に一様に適用します。
+その順序は、中心からデータ量子ビットへの相対方向（東西南北）を鍵にしたテーブルとして次のように与えられます。
+
+\begin{lstlisting}[language=Python, caption={CX 方向とステップの対応（\codepath{src/stages/02_circuit_level/src/ftqc/circuit_level_merge.py}）}]
+# CX 方向 -> 4 ステップ割当 (surface_patch で Stim から抽出した FT 順)
+_XSTEP = {(1, 1): 0, (-1, 1): 1, (1, -1): 2, (-1, -1): 3}    # NE,NW,SE,SW
+_ZSTEP = {(1, 1): 0, (1, -1): 1, (-1, 1): 2, (-1, -1): 3}    # NE,SE,NW,SW
+\end{lstlisting}
+
+$X$ 型アンシラ（制御側）は北東 → 北西 → 南東 → 南西の順に、$Z$ 型アンシラ（標的側）は北東 → 南東 → 北西 → 南西の順に、それぞれ隣接データ量子ビットへ CX をかけます。
+$Z$ 型の順序は $X$ 型の順序を転置した形になっており、この非対称性こそが hook 誤りを避ける鍵です。
+本章ではこの順序を導出済みの事実として採用し、なぜこの並びが正しいかの検証は \texttt{surface\_patch.py}（Stim の生成回路との座標対応の検証）の役割として扱います。
+ここで大切なのは、\textbf{CX の順序を手で考案するのではなく、実機に近い Stim の生成回路から機械的に抽出し、それを流用する}という方針です。
+この $X$ 型および $Z$ 型プラケットにおける 4 ステップの CX スケジュールを図\ref{fig:ch15_cx_schedule}に示します。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[scale=0.98, every node/.style={transform shape}]
+    % ---- (a) X 型プラケット ----
+    \begin{scope}[shift={(0,0)}]
+      \node[font=\bfseries] at (0, 2.1) {(a) $X$ 型プラケット（制御: アンシラ $\to$ 標的: データ）};
+
+      % プラケット背景
+      \filldraw[xplaq] (-1.5,-1.5) rectangle (1.5,1.5);
+
+      % 4つのデータ量子ビット (標的)
+      \node[dataqubit, minimum size=16pt] (NW) at (-1.3, 1.3) {};
+      \node[font=\tiny] at (-1.3, 1.3) {NW};
+      \node[dataqubit, minimum size=16pt] (NE) at ( 1.3, 1.3) {};
+      \node[font=\tiny] at ( 1.3, 1.3) {NE};
+      \node[dataqubit, minimum size=16pt] (SW) at (-1.3,-1.3) {};
+      \node[font=\tiny] at (-1.3,-1.3) {SW};
+      \node[dataqubit, minimum size=16pt] (SE) at ( 1.3,-1.3) {};
+      \node[font=\tiny] at ( 1.3,-1.3) {SE};
+
+      % 中央アンシラ (制御)
+      \node[ancqubit, minimum size=18pt] (ANC) at (0,0) {};
+      \node[font=\tiny\bfseries, text=white] at (0,0) {$A_X$};
+
+      % CX 矢印 (1: NE, 2: NW, 3: SE, 4: SW)
+      \draw[-{Stealth[length=6pt]}, line width=1.3pt, xtype] (ANC) -- (NE)
+        node[midway, fill=white, inner sep=1.5pt, rounded corners=2pt, xtype, draw, font=\scriptsize\bfseries] {1};
+      \draw[-{Stealth[length=6pt]}, line width=1.3pt, xtype] (ANC) -- (NW)
+        node[midway, fill=white, inner sep=1.5pt, rounded corners=2pt, xtype, draw, font=\scriptsize\bfseries] {2};
+      \draw[-{Stealth[length=6pt]}, line width=1.3pt, xtype] (ANC) -- (SE)
+        node[midway, fill=white, inner sep=1.5pt, rounded corners=2pt, xtype, draw, font=\scriptsize\bfseries] {3};
+      \draw[-{Stealth[length=6pt]}, line width=1.3pt, xtype] (ANC) -- (SW)
+        node[midway, fill=white, inner sep=1.5pt, rounded corners=2pt, xtype, draw, font=\scriptsize\bfseries] {4};
+
+      \node[below=4pt of SW, xshift=1.3cm, font=\scriptsize] {順序: NE $\to$ NW $\to$ SE $\to$ SW};
+    \end{scope}
+
+    % ---- (b) Z 型プラケット ----
+    \begin{scope}[shift={(5.2,0)}]
+      \node[font=\bfseries] at (0, 2.1) {(b) $Z$ 型プラケット（制御: データ $\to$ 標的: アンシラ）};
+
+      % プラケット背景
+      \filldraw[zplaq] (-1.5,-1.5) rectangle (1.5,1.5);
+
+      % 4つのデータ量子ビット (制御)
+      \node[dataqubit, minimum size=16pt] (NW) at (-1.3, 1.3) {};
+      \node[font=\tiny] at (-1.3, 1.3) {NW};
+      \node[dataqubit, minimum size=16pt] (NE) at ( 1.3, 1.3) {};
+      \node[font=\tiny] at ( 1.3, 1.3) {NE};
+      \node[dataqubit, minimum size=16pt] (SW) at (-1.3,-1.3) {};
+      \node[font=\tiny] at (-1.3,-1.3) {SW};
+      \node[dataqubit, minimum size=16pt] (SE) at ( 1.3,-1.3) {};
+      \node[font=\tiny] at ( 1.3,-1.3) {SE};
+
+      % 中央アンシラ (標的)
+      \node[ancqubit, minimum size=18pt] (ANC) at (0,0) {};
+      \node[font=\tiny\bfseries, text=white] at (0,0) {$A_Z$};
+
+      % CX 矢印 (1: NE, 2: SE, 3: NW, 4: SW)
+      \draw[-{Stealth[length=6pt]}, line width=1.3pt, ztype] (NE) -- (ANC)
+        node[midway, fill=white, inner sep=1.5pt, rounded corners=2pt, ztype, draw, font=\scriptsize\bfseries] {1};
+      \draw[-{Stealth[length=6pt]}, line width=1.3pt, ztype] (SE) -- (ANC)
+        node[midway, fill=white, inner sep=1.5pt, rounded corners=2pt, ztype, draw, font=\scriptsize\bfseries] {2};
+      \draw[-{Stealth[length=6pt]}, line width=1.3pt, ztype] (NW) -- (ANC)
+        node[midway, fill=white, inner sep=1.5pt, rounded corners=2pt, ztype, draw, font=\scriptsize\bfseries] {3};
+      \draw[-{Stealth[length=6pt]}, line width=1.3pt, ztype] (SW) -- (ANC)
+        node[midway, fill=white, inner sep=1.5pt, rounded corners=2pt, ztype, draw, font=\scriptsize\bfseries] {4};
+
+      \node[below=4pt of SW, xshift=1.3cm, font=\scriptsize] {順序: NE $\to$ SE $\to$ NW $\to$ SW};
+    \end{scope}
+  \end{tikzpicture}
+  \caption{シンドローム抽出における 4 ステップの CX スケジュール図。(a) $X$ 型プラケットでは中央の $X$ アンシラ（制御ビット、灰丸）から周囲のデータ量子ビット（白丸）へ、NE $\to$ NW $\to$ SE $\to$ SW（1$\to$2$\to$3$\to$4）の順に CX をかけます。(b) $Z$ 型プラケットでは周囲のデータ量子ビット（制御ビット）から中央の $Z$ アンシラ（標的ビット）へ、NE $\to$ SE $\to$ NW $\to$ SW の順に CX をかけます。この $X$ と $Z$ の非対称な順序付けにより、回路ノイズ起因の hook 誤りが符号距離を損なう方向へ連鎖するのを防ぎます。}
+  \label{fig:ch15_cx_schedule}
+\end{figure}
+
+
+\section{CircuitLevelMerge}\label{sec:cl_merge}
+
+\subsection{GeomMerge との関係}
+
+\texttt{CircuitLevelMerge} は、幾何をすべて \texttt{GeomMerge} に委譲し、測定方法だけを差し替えるという設計になっています。
+
+\begin{lstlisting}[language=Python, caption={\texttt{CircuitLevelMerge} の初期化（\codepath{src/stages/02_circuit_level/src/ftqc/circuit_level_merge.py}）}]
+class CircuitLevelMerge:
+    def __init__(self, kind="ZZ"):
+        self.kind = kind
+        self.g = GeomMerge(kind)
+        self.n = self.g.n
+        self.dcoord = {idx: coord for coord, idx in self.g.data.items()}
+
+        all_cells = [(c, r) for r in range(self.g.H) for c in range(self.g.W)]
+        self.merged_info = self._stabs_with_center(all_cells)
+        self.split_info = (self._stabs_with_center(self.g.A_cells) +
+                           self._stabs_with_center(self.g.B_cells))
+
+        # geom の stabs 並びに整列 (検出器則が index を使うため)
+        self.split_info = self._align(self.split_info, self.g.split_stabs)
+        self.merged_info = self._align(self.merged_info, self.g.merged_stabs)
+\end{lstlisting}
+
+\texttt{self.g}（\texttt{GeomMerge} インスタンス）が、データ量子ビットの配置、split（パッチ A, B 別々）とmerged（結合後）それぞれのスタビライザ集合、joint 演算子の構成インデックス（\texttt{joint\_idx}）、論理演算子の台をすべて保持しています。
+\texttt{CircuitLevelMerge} が新たに行うのは、各スタビライザに\textbf{中心座標付きの情報}（中心座標、型、データ台）を持たせる \texttt{\_stabs\_with\_center} と、その情報を \texttt{GeomMerge} 側のスタビライザ並び順に揃える \texttt{\_align} だけです。
+検出器則は \texttt{GeomMerge.\_compose\_in}（GF2 上のスタビライザ分解）をそのまま流用しており、記録の出自が MPP からアンシラ測定へ変わっただけで、span 合成の論理そのものは変わりません。
+
+中心座標を持たせる理由は、アンシラを一意に割り当てるためです。
+
+\begin{lstlisting}[language=Python, caption={ancilla の一意割当（\codepath{src/stages/02_circuit_level/src/ftqc/circuit_level_merge.py}）}]
+        self.anc_of = {}
+        nid = self.n
+        for info in (self.merged_info, self.split_info):
+            for cx, cy, t, s in info:
+                key = (cx, cy, t, tuple(s))
+                if key not in self.anc_of:
+                    self.anc_of[key] = nid
+                    nid += 1
+        self.n_total = nid
+\end{lstlisting}
+
+一見、中心座標だけで十分に思えますが、seam（継ぎ目）付近では split 時と merged 時とでデータ台が異なるスタビライザが存在します（たとえばパッチ A の上境界と、merge 後にその位置を通る新しいスタビライザ）。
+座標だけで割り当てると、これらが同じアンシラを奪い合ってしまいます。
+そこで、キーを\textbf{（中心座標、型、データ台）}の組にし、データ台まで一致する場合のみ同一アンシラを共有する（＝bulk のスタビライザは split でも merged でも同じアンシラで連続比較できる）ようにしています。
+これは実装時に見つかった不整合の 1 つで、seam の測定を正しく分離するための必須の工夫です。
+
+\subsection{build の入出力}
+
+\texttt{build} は、split → merge → split というスケジュールに沿って回路全体を構築します。
+
+\begin{lstlisting}[language=Python, caption={build のスケジュール構築（\codepath{src/stages/02_circuit_level/src/ftqc/circuit_level_merge.py}）}]
+    def build(self, aone=False, bone=False, merge_rounds=3, split_rounds=2, p=0.005, noise=True):
+        ...
+        mc = [0]
+        rounds = []
+        schedule = ([("split", self.split_info)] * split_rounds +
+                    [("merge", self.merged_info)] * merge_rounds +
+                    [("split", self.split_info)] * split_rounds)
+        for tag, info in schedule:
+            rec = self._round(c, info, pp, mc)
+            rounds.append((tag, info, rec))
+\end{lstlisting}
+
+引数 \texttt{aone}, \texttt{bone} はパッチ A, B の初期状態を $\ket{1}$（あるいは $\ket{-}$）にするフラグ、\texttt{merge\_rounds}, \texttt{split\_rounds} は merge 中・split 中の抽出ラウンド数、\texttt{p} は物理誤り率、\texttt{noise} を \texttt{False} にすると全誤り注入がゼロになります。
+戻り値は \texttt{(c, joint\_recs, drec)} の 3 つ組で、\texttt{c} が \texttt{stim.Circuit}、\texttt{joint\_recs} が joint 測定を構成する測定記録のリスト、\texttt{drec} が各データ量子ビットの最終測定記録への対応表です。
+1 ラウンドの抽出は \texttt{\_round} が担当し、データの脱分極誤り、アンシラの初期化・測定誤り、CX ごとの 2 量子ビット誤りを、\texttt{noise=True} のときだけ挿入します。
+
+\section{joint 測定と基底対応}\label{sec:joint}
+
+\subsection{ZZ/XX}
+
+\texttt{CircuitLevelMerge} は \texttt{kind="ZZ"} と \texttt{kind="XX"} の 2 種類の merge をサポートします。
+\texttt{GeomMerge} の幾何に従い、M\_ZZ はパッチ A, B を縦に積んだ $3\times6$ 構成で $Z_L(A)Z_L(B)$ を測り、M\_XX はパッチ A, B を横に並べた $6\times3$ 構成で $X_L(A)X_L(B)$ を測ります。
+基底の選び方は次のように \texttt{kind} から自動的に決まります。
+
+\begin{lstlisting}[language=Python, caption={基底の対応（\codepath{src/stages/02_circuit_level/src/ftqc/circuit_level_merge.py}）}]
+        zbasis = (self.kind == "ZZ")
+        det0_type = "Z" if zbasis else "X"
+        flip_kind = "X" if zbasis else "Z"   # |0>->|1> は X_L, |+>->|-> は Z_L
+        obs_kind = "Z" if zbasis else "X"
+\end{lstlisting}
+
+\texttt{ZZ} のときはデータ量子ビットを $\ket{0}$ に初期化し、最終測定は \texttt{M}（$Z$ 基底）、観測量は $Z_L$ です。
+\texttt{XX} のときはアダマールで $\ket{+}$ に初期化し、最終測定は \texttt{MX}（$X$ 基底）、観測量は $X_L$ です。
+$\ket{0}\to\ket{1}$ の反転は $X_L$、$\ket{+}\to\ket{-}$ の反転は $Z_L$ で行うため、\texttt{flip\_kind} も基底ごとに切り替わります。
+
+joint 測定は「merge スケジュールの中で最初に来た merge ラウンドの、seam スタビライザの積」として得られます。
+
+\begin{lstlisting}[language=Python, caption={joint 測定記録の抽出（\codepath{src/stages/02_circuit_level/src/ftqc/circuit_level_merge.py}）}]
+        # joint: 最初の merge ラウンドの seam スタビライザ積
+        first_merge = next(rec for tag, info, rec in rounds if tag == "merge")
+        joint_recs = [first_merge[i] for i in self.g.joint_idx]
+\end{lstlisting}
+
+\texttt{self.g.joint\_idx} は \texttt{GeomMerge} が GF2 上の線形代数（\texttt{\_decompose}）で求めた、joint 演算子 $Z_L(A)Z_L(B)$（または $X_L(A)X_L(B)$）を merged スタビライザの積として表すための添字集合です。
+これらのアンシラ測定結果を排他的論理和で足し合わせると、joint 演算子の固有値がそのまま得られます。
+高重みの joint 演算子を 1 回の測定で直接読むのではなく、局所スタビライザの積として間接的に読むこの構造は、第10章の幾何的 lattice surgery で導入した考え方そのものであり、本章はそれを回路レベルに移しただけであることが分かります。
+
+\section{検証（gauge 0・距離 3）}\label{sec:verify_merge}
+
+本節では、\texttt{circuit\_level\_merge.py} の \texttt{demo()} が実際に行っている 3 つの検証を、その意味と併せて確認します。
+
+\subsection*{joint 測定の正しさ}
+
+パッチ A, B の初期状態を計算基底の 4 通り（$\ket{0}\ket{0}$, $\ket{0}\ket{1}$, $\ket{1}\ket{0}$, $\ket{1}\ket{1}$）で用意し、ノイズなしで joint 記録の排他的論理和が期待値 $\mathrm{aone}\oplus\mathrm{bone}$ に一致することを確認します。
+
+\begin{lstlisting}[language=Python, caption={joint 測定の正しさの検証（\codepath{src/stages/02_circuit_level/src/ftqc/circuit_level_merge.py}）}]
+    for aone in (False, True):
+        for bone in (False, True):
+            c, jr, _ = clm.build(aone, bone, noise=False)
+            samp = c.compile_sampler().sample(200)
+            jout = int(np.bitwise_xor.reduce(samp[0, jr].astype(int)))
+            exp = int(aone) ^ int(bone)
+\end{lstlisting}
+
+\subsection*{gauge 0（検出器の決定論性）}
+
+\texttt{noise=False} で回路を構築すると、あらゆる誤りが注入されないため、すべての検出器はノイズなしで決定論的に $0$ となるはずです。
+
+\begin{lstlisting}[language=Python, caption={gauge 0 の検証（\codepath{src/stages/02_circuit_level/src/ftqc/circuit_level_merge.py}）}]
+    c, _, _ = clm.build(aone=True, noise=False)
+    det, _ = c.compile_detector_sampler().sample(300, separate_observables=True)
+    print(f"    検出器数={c.num_detectors}, 全0={not det.any()}")
+\end{lstlisting}
+
+ここで $1$ が立つ検出器があれば、それは「回路の欠陥によって、ノイズがなくても発火してしまう」gauge 検出器であり、設計ミスの兆候です。
+\texttt{CircuitLevelMerge} では検出器数 111 個すべてが全 0 になることが確認されています。
+
+\subsection*{graphlike 上界 3（\texttt{shortest\_graphlike\_error}）}
+
+回路レベルノイズを入れた回路に対して \texttt{shortest\_graphlike\_error()} を呼ぶと、検出器を一切発火させずに論理観測量だけを反転させる、最短の graphlike 誤り経路が得られます。この回路の未分解 DEM には高次誤り機構が含まれるため、ここで得る値は厳密距離ではなく\textbf{回路距離の上界}です。
+
+\begin{lstlisting}[language=Python, caption={graphlike 上界の確認（\codepath{src/stages/02_circuit_level/src/ftqc/circuit_level_merge.py}）}]
+    cdist, _, _ = clm.build(aone=True, noise=True, p=0.005)
+    bound = len(cdist.shortest_graphlike_error(ignore_ungraphlike_errors=True))
+    print(f"DEM 上の最短 graphlike 論理誤り = {bound} (回路距離の上界)")
+\end{lstlisting}
+
+この上界が $3$ であることは、意図したパッチ距離 $d=3$ と\textbf{整合}しますが、それだけで距離保存を証明したことにはなりません。一方、上界が 1 に落ちた場合は、実在する graphlike な 1 誤り経路が見つかったことを意味するため、設計に穴があると断定できます。
+実際、開発の過程では「最終ラウンドの spacelike 境界を閉じる検出器」を追加するまで、この値が $1$ に落ちてしまうという不具合がありました。
+最終データ測定からその基底のスタビライザを再構成し、直前の抽出ラウンドの対応するアンシラ記録と比較する検出器を加えることで、読み出し直前のデータ誤りも捕捉できるようになり、graphlike 上界は $3$ へ回復しています。
+
+\begin{lstlisting}[language=Python, caption={spacelike 境界を閉じる検出器（\codepath{src/stages/02_circuit_level/src/ftqc/circuit_level_merge.py}）}]
+        last_tag, last_info, last_rec = rounds[-1]
+        for si, (cx, cy, t, s) in enumerate(last_info):
+            if t == obs_kind:
+                c.append("DETECTOR", [rr(last_rec[si])] + [rr(drec[d]) for d in s])
+\end{lstlisting}
+
+\section{合否基準での検証}\label{sec:pass_criteria}
+
+本章の合否基準は、プロンプトの定義に従い次の 2 点です。
+
+\begin{itemize}
+  \item \texttt{noise=False} のとき、gauge 検出器がゼロであること（\texttt{compile\_detector\_sampler} でサンプルした全検出器が常に $0$）。
+  \item \texttt{noise=True} のとき、\texttt{shortest\_graphlike\_error} が符号距離 $3$ と一致すること。
+\end{itemize}
+
+これらは \codepath{tests/} が採用している合否基準（gauge 検出器ゼロ、\texttt{shortest\_graphlike\_error = d}）と同じ用語・同じ考え方であり、$d=3$ の特殊ケースに相当します。
+本章の段階で確認できるのはこの 2 点と joint 測定の正しさまでで、\texttt{allow\_gauge\_detectors} を使わずにデコードする、という条件はまだ明示的には検証していません（本章の回路はそもそも gauge 検出器を持たないため、\texttt{allow\_gauge\_detectors} の要否は問題になりません）。
+第19章では、この \texttt{CircuitLevelMerge} を \texttt{ls\_handoff\_shells.py} の \texttt{ShellCircuit}・\texttt{decode\_shell} という統一 API に載せ、\texttt{allow\_gauge\_detectors} を使わないことを明示的な前提として扱うようになります。
+本章の手作業での確認は、その前提が最初から成り立っていることを裏付けるものだと位置づけられます。
+
+\section{まとめ}\label{ch15:summary}
+
+\begin{itemize}
+  \item アンシラを介したシンドローム抽出は、4 個のデータ量子ビットへの CX を 4 ステップに分けて行い、その順序が hook 誤りを避けるかどうかを左右します。
+  \item \texttt{CircuitLevelMerge} は \texttt{GeomMerge} の幾何（データ配置・スタビライザ集合・joint 分解・論理演算子）をそのまま再利用し、局所スタビライザの測定方法だけを MPP からアンシラベースの回路レベル抽出へ置き換えます。
+  \item seam 付近のアンシラは、中心座標だけでなくデータ台まで含めて一意に割り当てる必要があり、これを誤ると split と merge でアンシラを奪い合う不整合が生じます。
+  \item joint 演算子 $Z_L(A)Z_L(B)$（または $X_L(A)X_L(B)$）は、最初の merge ラウンドの seam スタビライザ測定の排他的論理和として読み出されます。
+  \item ノイズなしで gauge 検出器ゼロ、ノイズありで \texttt{shortest\_graphlike\_error}=3 という 2 点を確認することで、アンシラベースの回路レベル merge が幾何的版と同じ符号距離を保っていることが分かります。
+\end{itemize}
+
+次章では、この \texttt{CircuitLevelMerge} を組み合わせ、測定ベースの CNOT をフレーム補正観測量とともに回路レベルで実装します。
+
+\begin{exercise}
+  \begin{enumerate}
+    \item \texttt{\_XSTEP} と \texttt{\_ZSTEP} のテーブルを見比べ、$X$ 型と $Z$ 型でステップの割当がどのように「転置」の関係になっているかを説明しなさい。また、両方を同じ順序にしてしまった場合にどのような問題が起こりうるか、hook 誤りの観点から考えなさい。
+    \item \texttt{CircuitLevelMerge.anc\_of} のキーが \texttt{(cx, cy, t, tuple(s))} という 4 要素の組になっている理由を、seam 付近のスタビライザの split/merge での台の違いに触れて説明しなさい。座標だけをキーにした場合に何が起こるかも述べなさい。
+    \item \texttt{kind="XX"} のときに、初期化がアダマールを伴う理由、最終測定が \texttt{MX} になる理由、観測量が $X_L$ になる理由を、\texttt{kind="ZZ"} の場合との対応をとりながら説明しなさい。
+    \item 最終ラウンドの spacelike 境界を閉じる検出器（\texttt{obs\_kind} 型のスタビライザを最終データ測定から再構成する検出器）を取り除くと \codeinline{shortest_graphlike_error} がどうなるか、実際に \codepath{src/stages/02_circuit_level/src/ftqc/circuit_level_merge.py} を改変して確認し、その理由を説明しなさい。
+  \end{enumerate}
+\end{exercise}

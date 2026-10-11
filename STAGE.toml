@@ -1,0 +1,59 @@
+id = "03"
+name = "d3_integrated"
+display_name = "Stage 03: d=3 Integrated Simulator"
+description = "d=3 固定の統合版（Core 7、イベント計画、トラジェクトリ、tsim、可視化、レポート）"
+logical_chapters = [20, 21, 22, 23, 24, 25]
+current_chapters = [20, 21, 22, 23, 24, 25]
+current_files = [
+  "book/chapter/20.tex",
+  "book/chapter/21.tex",
+  "book/chapter/22.tex",
+  "book/chapter/23.tex",
+  "book/chapter/24.tex",
+  "book/chapter/25.tex"
+]
+source_root = "src/ftqc"
+is_canonical = true
+inherits = "02_circuit_level"
+
+added = [
+  "ftqc_tsim_backend.py",
+  "viz/ftqc_integrated_report.py",
+  "viz/ftqc_run_report.py",
+  "viz/ftqc_run_visualizer.py"
+]
+changed = ["viz/ftqc_mapping_visualizer.py"]
+unchanged = [
+  "__init__.py",
+  "surface_patch.py",
+  "clifford_ft_full.py",
+  "ftqc_toy.py",
+  "transversal_cnot.py",
+  "logical_clifford_ftqc.py",
+  "geom_lattice_surgery.py",
+  "lattice_surgery.py",
+  "t_gate.py",
+  "qpd_backend.py",
+  "circuit_level_merge.py",
+  "ls_cnot_ft.py",
+  "circuit_level_ls.py",
+  "ls_handoff_shells.py",
+  "hybrid_ftqc_runtime.py",
+  "viz/__init__.py",
+  "viz/stim_timeline_visualizer.py",
+  "viz/t_branch_visualizer.py"
+]
+removed = []
+
+forbidden_import_prefixes = [
+  "ref.",
+  "ftqc.core.surface_code_d",
+  "ftqc.runtime.symplectic_frame"
+]
+
+acceptance_tests = [
+  "tests/test_imports.py",
+  "tests/test_smoke.py",
+  "tests/test_boundaries.py",
+  "tests/test_examples.py"
+]

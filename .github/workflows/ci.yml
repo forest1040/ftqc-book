@@ -1,0 +1,124 @@
+name: Public book CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  stage-01-02:
+    runs-on: ubuntu-latest
+    env:
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+      MPLCONFIGDIR: ${{ runner.temp }}/mplconfig
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test isolated Stage 01 and Stage 02 environments
+        run: |
+          mkdir -p "$MPLCONFIGDIR"
+          uv run --directory src/stages/01_mpp --locked pytest -q
+          uv run --directory src/stages/02_circuit_level --locked pytest -q
+
+  stage-03:
+    needs: stage-01-02
+    runs-on: ubuntu-latest
+    env:
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+      MPLCONFIGDIR: ${{ runner.temp }}/mplconfig
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test Stage 03
+        run: |
+          mkdir -p "$MPLCONFIGDIR"
+          uv sync --locked
+          uv run --locked pytest -q tests
+
+  public-contracts:
+    needs: stage-03
+    runs-on: ubuntu-latest
+    env:
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+      MPLCONFIGDIR: ${{ runner.temp }}/mplconfig
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify file and stage contracts
+        run: |
+          mkdir -p "$MPLCONFIGDIR"
+          uv run --locked python tools/check_public_files.py
+          uv run --locked python tools/check_book_code_refs.py --strict --check-code-map
+          uv run --locked python tools/check_stage_lineage.py --verify-files
+          uv run --locked python tools/extract_book_snippets.py --verify
+          uv run --locked pytest -q tests/test_public_contracts.py
+
+  figures:
+    needs: stage-03
+    runs-on: ubuntu-latest
+    env:
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+      MPLCONFIGDIR: ${{ runner.temp }}/mplconfig
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Regenerate Chapter 24 figure
+        run: |
+          mkdir -p "$MPLCONFIGDIR"
+          uv sync --locked --group figures
+          uv run --locked --group figures python book/figures/gen_ch24_timeline.py --pdf
+          test -s book/figures/ch24_stim_timeline.svg
+          test -s book/figures/ch24_stim_timeline.pdf
+
+  book:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: xu-cheng/latex-action@v3
+        with:
+          root_file: main.tex
+          working_directory: book
+          latexmk_use_lualatex: true
+          args: -interaction=nonstopmode -halt-on-error
+      - name: Reject unresolved TeX references and citations
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import re
+          import sys
+          log = pathlib.Path("book/main.log").read_text(encoding="utf-8", errors="replace")
+          unresolved = re.findall(r"(?:Reference|Citation) ['`][^'`]+['`] .* undefined|There were undefined references|No file [^\n]+\.bbl", log)
+          if unresolved:
+              print("\n".join(unresolved), file=sys.stderr)
+              raise SystemExit(1)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: public-book-pdf
+          path: book/main.pdf

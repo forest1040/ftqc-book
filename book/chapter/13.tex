@@ -1,0 +1,382 @@
+% Stage: 01 ／ 説明用コード: src/stages/01\_mpp/src/ftqc
+\chapter{Stage 01 のハイブリッドランタイム}\label{ch:stage_a_runtime}
+
+\begin{chaptergoal}
+  \begin{itemize}
+  \item Stim（安定化器サンプリング）と状態ベクトル（非 Clifford 演算）を \texttt{HybridFTQCRuntime} が 1 本のトラジェクトリとしてどう結合するかを理解します。
+  \item 論理回路をイベント列へ分解する \texttt{plan} の原型を理解します。
+  \item 残差注入が現状 $X_L$ 中心であることと、その正直な限界を理解します。
+  \item 第 9--12 章の要素（生成子追跡・格子手術・シェル・T ゲート 2 経路）がどう組み合わさって universal スケルトンになるかを確認し、Stage 01 の到達点と限界を把握します。
+  \end{itemize}
+\end{chaptergoal}
+
+第9章では生成子追跡による Clifford の完全 FT デコードを、第10--11章では幾何的格子手術とシェルという抽象を、第12章では $T$ ゲートの statevector 経路と QPD 経路を、それぞれ個別の要素技術として見てきました。
+本章はこれらを 1 つのランタイムに束ね、論理回路 $\{X,Y,Z,H,S,S^\dagger,T,T^\dagger,\mathrm{CNOT}\}$ を受け取って、Clifford 部分は Stim の物理 QEC 回路として、非 Clifford 部分は状態ベクトルまたは QPD 分岐として、ノイズありのトラジェクトリを最後まで走らせる \texttt{HybridFTQCRuntime} を説明します。
+これは第 III 部（Stage 01）の総括であり、章末で読了マーカー 01 を宣言したうえで、第 IV 部（Stage 02・回路レベル）への橋渡しを行います。
+
+\begin{notebox}
+  Stage: \textbf{01}。
+  説明用コードは主に \codepath{src/stages/01_mpp/src/ftqc/} を用います。
+\end{notebox}
+
+\section{全体データフロー}\label{sec:dataflow}
+
+\codepath{src/stages/01_mpp/src/ftqc/hybrid_ftqc_runtime.py} の冒頭コメントは、このランタイムがどういう意味で「ハイブリッド」なのかを明示しています。
+
+\begin{lstlisting}[caption={src/stages/01\_mpp/src/ftqc/hybrid\_ftqc\_runtime.py 冒頭のモデル境界の説明}]
+Important modelling boundary
+----------------------------
+Stim is a stabilizer simulator and cannot contain the non-stabilizer magic state
+|A> itself. Therefore the non-Clifford state update is deliberately performed by
+Qulacs/NumPy while Stim supplies the physical syndrome sampling and decoded
+logical residuals around the event. This is a hybrid handoff model, not a single
+all-Stim physical injection circuit.
+\end{lstlisting}
+
+つまり Stim は「安定化器の世界」しか持てないので魔法状態そのものは扱えず、非 Clifford な状態更新は Qulacs/NumPy 側の状態ベクトルが担い、Stim は物理シンドロームのサンプリングと、そこから復号された論理残差だけを供給します。
+各論理量子ビットは rotated surface code $d=3$ パッチ（データ量子ビット 9 個）に対応し、安定化子は多体パウリ測定（MPP）で読み出されます。これは第7章で組み立てた MPP メモリ骨格そのものです。
+
+全体のデータフローは次のようになります。
+
+\begin{lstlisting}[language={}, caption={HybridFTQCRuntime の全体データフロー（README.md の記述に基づく）}]
+論理回路 {Clifford + T}
+       |
+       v
+HybridFTQCRuntime.plan / .run
+  +-- Clifford chunk -> Stim 物理QEC回路 + 検出器 + MWPM/BPOSD
+  +-- T/Tdag -> (statevector 直接適用) or (QPD: I/S/Z 符号付き分岐)
+  |              `- S 分岐 -> LS-S shell（検出器付き Stim 回路）
+  `-- S/Sdag -> statevector 適用 + Stim QEC シェル
+       |
+       v
+論理測定分布 / 論理エラー率 / QPD 復元分布
+\end{lstlisting}
+
+この図の左枝（Clifford chunk）は第9章の \texttt{clifford\_ft\_full.CliffordFTCompiler} が担い、右枝の S 分岐は第11章の \texttt{ls\_handoff\_shells.build\_ls\_s\_shell} が担い、$T$ の 2 経路は第12章の statevector 経路と \texttt{qpd\_backend.py} が担います。
+本章で見る \texttt{HybridFTQCRuntime} は、これらをオーケストレーションする層です。ランタイムを中心とした全体データフローと各コンポーネントの連携を図\ref{fig:ch13_runtime_dataflow}に示します。
+
+\begin{figure}[htbp]
+  \centering
+  \resizebox{0.95\linewidth}{!}{%
+  \begin{tikzpicture}[
+    every node/.style={font=\footnotesize},
+    box/.style={draw, rounded corners=5pt, thick, align=center, inner sep=6pt},
+    runtime/.style={box, fill=blue!8, draw=blue!70!black, font=\bfseries\normalsize},
+    stim/.style={box, fill=red!7, draw=red!70!black},
+    frame/.style={box, fill=orange!10, draw=orange!80!black},
+    statevec/.style={box, fill=green!10, draw=green!60!black},
+    iobox/.style={box, fill=gray!8, draw=gray!50, font=\small},
+    arrow/.style={-{Stealth[length=3mm, width=2.2mm]}, thick},
+    dataarrow/.style={arrow, line width=1.4pt, color=blue!70!black},
+    residualarrow/.style={arrow, line width=1.4pt, color=red!70!black},
+    looparrow/.style={arrow, line width=1.4pt, color=orange!80!black},
+  ]
+
+    % Top: Logical Circuit Input & plan()
+    \node[iobox] (input) at (0, 5.2) {
+      \textbf{論理回路入力} $\{X, Y, Z, H, \mathrm{CNOT}, S, S^\dagger, T, T^\dagger\}$
+    };
+
+    \node[box, fill=purple!8, draw=purple!70!black, minimum width=6.8cm] (plan) at (0, 3.7) {
+      \textbf{\texttt{plan()}} によるイベント列への分解\\
+      \scriptsize \texttt{CliffordChunk}（Clifford 塊） / \texttt{SpecialGate}（$S, S^\dagger, T, T^\dagger$）
+    };
+
+    % Center: HybridFTQCRuntime
+    \node[runtime, minimum width=5.6cm, minimum height=1.3cm] (runtime) at (0, 1.8) {
+      \texttt{HybridFTQCRuntime}\\
+      \scriptsize（オーケストレータ：サンプリングとトラジェクトリ制御）
+    };
+
+    % Left: Stim Shell
+    \node[stim, minimum width=4.2cm] (stim) at (-6.2, -0.3) {
+      \textbf{Stim 物理 QEC シェル}\\
+      \scriptsize \texttt{CliffordFTCompiler}\\
+      \scriptsize \texttt{ls\_handoff\_shells}\\
+      \scriptsize 物理 $d=3$ 表面符号回路サンプリング\\
+      \scriptsize MWPM / BP+OSD 復号\\
+      \scriptsize 観測量 $\mathrm{obs} \oplus$ 予測 $\mathrm{pred}$
+    };
+
+    % Right: SymplecticFrame
+    \node[frame, minimum width=4.2cm] (frame) at (6.2, -0.3) {
+      \textbf{\texttt{SymplecticFrame}}\\
+      \scriptsize（パウリフレーム追跡）\\
+      \scriptsize 論理 Pauli 誤り / 残差保持\\
+      \scriptsize Clifford 共役で更新\\
+      \scriptsize \tiny（Stage 01 では $X_L$ 残差中心の原型）
+    };
+
+    % Bottom: QulacsStateBackend
+    \node[statevec, minimum width=5.8cm] (backend) at (0, -2.4) {
+      \textbf{\texttt{QulacsStateBackend}}\\
+      \scriptsize（論理状態ベクトルバックエンド：Qulacs / NumPy）\\
+      \scriptsize 非 Clifford 演算（$T, T^\dagger$）直接適用 / QPD 分岐評価\\
+      \scriptsize 残差 Pauli 補正の適用
+    };
+
+    % Bottom Output
+    \node[iobox] (output) at (0, -4.1) {
+      \textbf{シミュレーション出力}（論理測定分布 / 論理エラー率 / QPD 期待値）
+    };
+
+    % --- Connections ---
+    % 1. Input -> plan -> runtime
+    \draw[dataarrow] (input) -- (plan);
+    \draw[dataarrow] (plan) -- node[right, font=\scriptsize, text=blue!70!black] {イベント列} (runtime);
+
+    % 2. Runtime -> Stim (QEC dispatch)
+    \draw[dataarrow] (runtime.west) -| node[above, pos=0.35, font=\scriptsize] {物理 QEC 実行指示} (stim.north);
+
+    % 3. Runtime -> Frame (register residuals & frame update)
+    \draw[looparrow] (runtime.east) -| node[above, pos=0.35, font=\scriptsize, text=orange!80!black] {
+      残差登録・フレーム更新
+    } (frame.north);
+
+    % 4. Stim -> Backend (Direct Residual Injection in Stage 01)
+    \draw[residualarrow] (stim.south) |- node[below left, font=\scriptsize, align=right, text=red!70!black] {
+      QEC 残差注入\\
+      \scriptsize（$x = \mathrm{obs} \oplus \mathrm{pred}$ 即時適用）
+    } (backend.west);
+
+    % 5. Frame -> Backend (Pauli correction loop)
+    \draw[looparrow] (frame.south) |- node[below right, font=\scriptsize, align=left, text=orange!80!black] {
+      Pauli 補正適用\\
+      \scriptsize（フレーム解決）
+    } (backend.east);
+
+    % 6. Runtime -> Backend (Gates)
+    \draw[dataarrow] (runtime.south) -- node[fill=white, inner sep=2pt, font=\scriptsize, align=center] {
+      特殊ゲート適用（$T/T^\dagger$）\\
+      Clifford 状態更新
+    } (backend.north);
+
+    % 7. Backend -> Output
+    \draw[dataarrow] (backend.south) -- node[right, font=\scriptsize] {終端 $Z$ 測定} (output);
+
+  \end{tikzpicture}%
+  }
+  \caption{Stage 01 における \texttt{HybridFTQCRuntime} の全体データフロー。論理回路は \texttt{plan()} によって \texttt{CliffordChunk} と \texttt{SpecialGate} のイベント列に分解され、中央の \texttt{HybridFTQCRuntime} がオーケストレーションします。左側の Stim 物理 QEC シェルは物理 $d=3$ 回路のシンドロームサンプリングとデコーダ（MWPM / BP+OSD）により論理残差 $x = \mathrm{obs} \oplus \mathrm{pred}$ を抽出し、状態ベクトルへ残差注入されます。右側の \texttt{SymplecticFrame} は Pauli 補正を古典追跡し、下部の \texttt{QulacsStateBackend}（状態ベクトル）へ反映されます。非 Clifford な $T$ ゲートは状態ベクトル側で直接適用（または QPD 分岐）され、ハイブリッドなトラジェクトリが完成します。}
+  \label{fig:ch13_runtime_dataflow}
+\end{figure}
+
+状態ベクトル側は 1 つのインタフェース（\texttt{apply\_gate}, \texttt{sample\_z} など）を共有する 3 種類のバックエンドから選べます。
+
+\begin{lstlisting}[caption={src/stages/01\_mpp/src/ftqc/hybrid\_ftqc\_runtime.py のバックエンド選択（抜粋・行340--358）}]
+def make_backend(n: int, backend: str = "auto"):
+    backend = backend.lower().replace("-", "_")
+    if backend == "numpy":
+        return NumpyStateBackend(n)
+    if backend == "stim":
+        return StimCliffordBackend(n)
+    if backend in ("stim_auto", "auto_stim"):
+        try:
+            return StimCliffordBackend(n)
+        except Exception:
+            return NumpyStateBackend(n)
+    if backend in ("auto", "qulacs"):
+        try:
+            return QulacsStateBackend(n)
+        except Exception:
+            if backend == "qulacs":
+                raise
+            return NumpyStateBackend(n)
+    raise ValueError("backend must be 'auto', 'qulacs', 'numpy', 'stim', or 'stim_auto'")
+\end{lstlisting}
+
+\texttt{NumpyStateBackend} は依存の少ないフォールバック、\texttt{QulacsStateBackend} は本書冒頭で述べた Qulacs による非 Clifford 状態ベクトル演算、\texttt{StimCliffordBackend} は \texttt{nonclifford\_mode="qpd"} で $T$ をすでに Clifford 分岐へ展開したあとに使う、Stim の \texttt{TableauSimulator} をそのまま論理レベルのバックエンドとして流用する経路です。
+\texttt{StimCliffordBackend.apply\_gate} は真の \texttt{T}/\texttt{T\_DAG} を渡されると例外を出します。これは「QPD 分岐後の Clifford のみのブランチしか扱わない」という境界をコードレベルで強制するためです。
+
+\section{plan の原型}\label{sec:plan_proto}
+
+\texttt{HybridFTQCRuntime.plan} は、論理ゲート列を「Clifford の塊（chunk）」と「特殊ゲート（S/SDG/T/Tdag）」の交互のイベント列に分解します。
+
+\begin{lstlisting}[caption={src/stages/01\_mpp/src/ftqc/hybrid\_ftqc\_runtime.py の plan メソッド（行596--622）}]
+def plan(self, qc_or_gates: Any) -> List[PlanEvent]:
+    gates = parse_qulacs_or_gate_list(qc_or_gates)
+    events: List[PlanEvent] = []
+    chunk: List[Gate] = []
+    chunk_id = 0
+
+    def flush(reason: str) -> None:
+        nonlocal chunk, chunk_id
+        if chunk:
+            events.append(CliffordChunk(gates=chunk, label=f"clifford_chunk_{chunk_id}_{reason}"))
+            chunk = []
+            chunk_id += 1
+
+    for gi, (name, a, b) in enumerate(gates):
+        name = normalize_gate_name(name)
+        if name in CLIFFORD_CHUNK_GATES:
+            chunk.append((name, a, b))
+        elif name in ("S", "SDG"):
+            flush(f"before_{name}_{gi}")
+            events.append(SpecialGate(name=name, target=a, label=f"{name}_{gi}"))
+        elif name in ("T", "T_DAG"):
+            flush(f"before_{name}_{gi}")
+            events.append(SpecialGate(name=name, target=a, label=f"{name}_{gi}"))
+        else:
+            raise ValueError(f"Unsupported gate in hybrid plan: {name}")
+    flush("tail")
+    return events
+\end{lstlisting}
+
+$\{X,Y,Z,H,\mathrm{CNOT}\}$（\texttt{CLIFFORD\_CHUNK\_GATES}）はそのまま \texttt{chunk} に積まれ、$S,S^\dagger,T,T^\dagger$ が現れた瞬間にそれまでの \texttt{chunk} が \texttt{flush} されて \texttt{CliffordChunk} イベントになり、続いてその特殊ゲート自身が \texttt{SpecialGate} イベントとして積まれます。
+最後にもう一度 \texttt{flush("tail")} を呼び、残った Clifford ゲートを取りこぼさないようにしています。
+
+イベントの型は次の 2 つの単純なデータクラスです。
+
+\begin{lstlisting}[caption={src/stages/01\_mpp/src/ftqc/hybrid\_ftqc\_runtime.py のイベント型（行365--376）}]
+@dataclass
+class CliffordChunk:
+    gates: List[Gate]
+    label: str
+
+
+@dataclass
+class SpecialGate:
+    name: str
+    target: int
+    label: str
+\end{lstlisting}
+
+\texttt{label} には \texttt{"clifford\_chunk\_0\_before\_T\_2"} のような、生成された理由（どの特殊ゲートの直前で切られたか）が刻まれます。この \texttt{label} は後段で QEC サンプリング結果を紐付けるキーとしてそのまま使われます。
+この \texttt{plan} は、あくまで「Clifford chunk と特殊ゲートを交互に並べる」という最小限の骨格です。命令計画をより一般的なイベント（\texttt{LSCnotEvent} などの格子手術イベントを含む形）へ拡張し、モード切替まで含めて再整理するのは第21章の主題であり、本章ではその原型だけを確認します。
+
+\section{残差注入の初出}\label{sec:residual_intro}
+
+各 \texttt{CliffordChunk} は、実行時に \texttt{\_sample\_qec\_residuals} によって Stim 上でサンプリング・復号され、論理残差として状態ベクトルへ適用されます。
+
+\begin{lstlisting}[caption={src/stages/01\_mpp/src/ftqc/hybrid\_ftqc\_runtime.py の \_sample\_qec\_residuals（抜粋・行625--667）}]
+def _sample_qec_residuals(
+    self,
+    chunk: CliffordChunk,
+    shots: int,
+    rng: np.random.Generator,
+) -> Tuple[np.ndarray, str, Optional[np.ndarray], str]:
+    """Return decoded residual logical X faults from a Stim Clifford chunk.
+
+    The returned matrix has shape (shots, n_logical), where 1 means a
+    residual X_L fault should be applied to that logical qubit.
+    """
+    import pymatching
+    from clifford_ft_full import CliffordFTCompiler, layer_gates
+
+    comp = CliffordFTCompiler(self.n, p=self.p_phys, tail_rounds=self.tail_rounds)
+    layers = layer_gates(chunk.gates, self.n)
+    circ, _ = comp.compile(layers, noise=True)
+    det, obs = circ.compile_detector_sampler().sample(shots, separate_observables=True)
+    dem = circ.detector_error_model(decompose_errors=True)
+    matcher = pymatching.Matching.from_detector_error_model(dem)
+    pred = matcher.decode_batch(det)
+    x_residuals = (obs ^ pred).astype(np.uint8)
+    ...
+\end{lstlisting}
+
+ここで \texttt{CliffordFTCompiler}（第9章の生成子追跡コンパイラ）が chunk を物理 Stim 回路へコンパイルし、検出器をサンプリングし、\texttt{pymatching}（graphlike でなければ \texttt{stimbposd.BPOSD} へフォールバック）で復号します。観測値 \texttt{obs} と予測 \texttt{pred} の \texttt{XOR} が「復号してもなお残った論理フリップ」＝残差です。
+関数のドキュメント文字列が明言しているとおり、この残差は \textbf{論理 $X_L$ フォールト}として状態ベクトルに適用されます（\texttt{\_apply\_logical\_residuals} が \texttt{state.apply\_gate("X", q)} を呼びます）。
+
+これは正直に述べておくべき制約です。モジュール冒頭のコメントにもあるとおり、
+
+\begin{quote}
+The current Stim compiler exports Z-basis logical observable flips. Those are
+applied to the logical state as decoded residual X\_L faults. Optional mirrored
+Z\_L faults can be enabled for stress testing, but the physically grounded output
+of the existing compiler is the X\_L residual channel.
+\end{quote}
+
+つまり Stim コンパイラが物理的に根拠を持って出力できるのは $Z$ 基底の論理観測量の反転であり、これを $X_L$ 残差として適用する経路だけが「物理的に裏付けられた」経路です。
+\texttt{mirror\_z\_residuals=True} を指定すると、$X_L$ 残差と同じレートで独立な $Z_L$ 残差を近似的に発生させられますが、これはあくまでストレステスト用の近似であり、実際の回路から導出されたものではありません。
+
+\begin{warningbox}
+  Stage 01 で注入される残差は主に $X_L$ 残差であり、$Z_L$ 側は（\texttt{mirror\_z\_residuals} を使わない限り）注入されません。
+  $X$ と $Z$ の両セクタを対称に扱う一般のシンプレクティックパウリフレームは、まだ導入されていません。
+  この本ではこの限界を明示し、以後の一般化は扱いません。中間 $H$ ゲートがある回路では誤り基底も変換されるため、$X_L$ だけの残差モデルを完全な論理誤りモデルと見なすことはできません。
+\end{warningbox}
+
+\section{Stage 01 の到達点と限界}\label{sec:stage_a_marker}
+
+\codepath{src/stages/01_mpp/examples/ch13_mpp_integration.py} は、これまでの要素をすべて 1 本のデモとして通す駆動スクリプトです。
+
+\begin{lstlisting}[caption={src/stages/01\_mpp/examples/ch13\_mpp\_integration.py のデモ本体（抜粋・行40--76）}]
+def main() -> None:
+    logical = build_demo_input()
+    gates = parse_universal(logical)
+    ...
+    qb = QPDBackend(
+        n_logical=2,
+        p_phys=0.005,
+        backend="qpd",
+        qec_mode="optional",
+        route_qpd_s_via_ls=True,
+        seed=7,
+    )
+
+    exact = qb.run_exact_noiseless(gates, keep_branches=False)
+    ...
+    result = qb.run(logical, shots=2000, seed=11)
+\end{lstlisting}
+
+入力は $H, T, H, \mathrm{CNOT}, T, S$ という Clifford+$T$ の混合回路です。\texttt{QPDBackend} は内部で \texttt{HybridFTQCRuntime(nonclifford\_mode="qpd")} に処理を委譲し、$T$ ごとに $I/S/Z$ の符号付き Clifford 分岐へ展開し、$S$ 分岐は \texttt{route\_qpd\_s\_via\_ls=True} により第11章の LS-S シェルへルーティングします。
+\texttt{qb.run\_exact\_noiseless} は \texttt{qpd\_backend.expand\_qpd\_branches} で $3^{\#T}$ 本の Clifford 分岐をすべて列挙し、ノイズなし・Stim 不要の厳密な参照分布を計算します。これと \texttt{qb.run} によるノイズあり・Stim 依存のトラジェクトリ実行を比較できることが、この Stage 01 のデモの検証構造です。
+
+\texttt{qec\_mode="optional"} は、\texttt{stim}/\texttt{pymatching} が利用できない環境でも例外を出さず、その QEC シェルを「スキップ」として記録しながら実行を続ける安全弁です（\texttt{qec\_mode="required"} にすると依存が欠けた時点で例外になります）。これにより、依存環境が薄いマシンでもデモ経路自体が破綻しないことを確認できます。
+
+Stage 01 の到達点は、MPP（多体パウリ測定）による現象論的な表面符号パッチと論理レベル格子手術を中心に、$\{$Clifford$+T\}$ の universal スケルトンを 1 本のハイブリッドランタイムとして動かせることです。
+一方で、物理層はあくまで MPP による理想化されたシンドローム抽出であり、アンシラを介した実際の回路レベル抽出（hook 誤りなどが生じる経路）はまだ扱っていません。この差分は次章（第14章「なぜ回路レベルが必要か」、第 IV 部・\codepath{src/stages/02_circuit_level/src/ftqc})の主題です。
+
+\begin{notebox}
+  \textbf{読了マーカー 01}: MPP だけで動く universal スケルトン（Clifford chunk の Stim QEC サンプリング、$S/S^\dagger$ ハンドオフ、$T/T^\dagger$ の statevector 経路と QPD 経路、QPD の $S$ 分岐の LS-S シェルルーティング）の説明が完了しました。
+  ここから先は、この骨格を回路レベルへ拡張する Stage 02（第 IV 部、\codepath{src/stages/02_circuit_level/src/ftqc}）に入ります。
+\end{notebox}
+
+\section{やること・スコープ外}\label{ch13:scope}
+
+\subsection{やること}
+
+\begin{itemize}
+  \item \texttt{HybridFTQCRuntime.plan} による Clifford chunk / 特殊ゲートへのイベント分解を確認する。
+  \item \texttt{HybridFTQCRuntime.run} が、Clifford chunk を Stim 物理 QEC 回路としてサンプリング・復号し、論理残差として状態ベクトルへ適用する流れを追う。
+  \item $T/T^\dagger$ の statevector 経路（テレポーテーション＋蒸留誤りモデル）と QPD 経路（Clifford 分岐＋LS-S シェル）の両方を、\codepath{src/stages/01_mpp/src/ftqc} の中で一通り動かす。
+  \item \texttt{ftqc\_universal\_hybrid.py} のデモを通じて、mpp で universal スケルトンが最初から最後まで動くことを確認する。
+\end{itemize}
+
+\subsection{スコープ外}
+
+\begin{itemize}
+  \item \textbf{回路レベル距離 3 の保証}: 本章の QEC シェルはあくまで MPP ベースの \texttt{clifford\_ft\_full.CliffordFTCompiler} に依存しており、アンシラを介した実際の抽出回路で符号距離 3 が保たれることの保証（hook 誤りの扱いを含む）は、第 IV 部（第14--19章、\codepath{src/stages/02_circuit_level/src/ftqc}）の主題です。
+  \item \textbf{シンプレクティックフレーム}: 本章の残差注入は $X_L$ 中心です。$X$ と $Z$ の両セクタを対称に扱う相関付きフレーム追跡は本書では実装しません。
+\end{itemize}
+
+\section{まとめ}\label{ch13:summary}
+
+\begin{itemize}
+  \item \texttt{HybridFTQCRuntime} は、Clifford chunk を Stim の物理 QEC 回路としてサンプリング・復号し、$S/S^\dagger/T/T^\dagger$ を状態ベクトルまたは QPD 分岐で処理する、trajectory レベルのハイブリッドシミュレータです。
+  \item \texttt{plan} メソッドは、論理ゲート列を \texttt{CliffordChunk} と \texttt{SpecialGate} の交互のイベント列に分解する原型を提供します。より一般的な命令計画への拡張は第21章で再訪します。
+  \item 残差注入は現状、Stim コンパイラが物理的に裏付けられた形で出力できる $X_L$ フォールトが中心であり、$Z_L$ 側の近似（\texttt{mirror\_z\_residuals}）や、両セクタを対称に扱う相関付きフレームは本書の範囲外です。
+  \item \texttt{ftqc\_universal\_hybrid.py} のデモは、Clifford+$T$ 混合回路に対して厳密な QPD 分岐列挙（ノイズなし）とノイズありトラジェクトリ実行の両方を通し、mpp だけで universal スケルトンが動くことを示します。
+  \item Stage 01 の到達点は MPP・論理格子手術中心の universal スケルトンであり、限界は回路レベル距離保証とシンプレクティックフレームの欠如です。次は回路レベル（第 IV 部）です。
+\end{itemize}
+
+\subsection*{合否基準での検証}
+
+Stage 01 の時点で機械的に確認できるのは、次の範囲にとどまります。
+
+\begin{itemize}
+  \item \texttt{qec\_mode="off"} かつ \texttt{p\_phys=0} 相当のノイズなし経路（あるいは \texttt{run\_exact\_noiseless} による厳密分岐列挙）で、デモ経路がエラーを出さずに完走し、\texttt{ideal\_state} と整合する分布を返すこと。
+  \item \texttt{HybridFTQCRuntime(seed=...)} と \texttt{run(..., seed=...)} に同じ値を与えれば、同じ論理残差列・同じ測定分布が再現されること（\texttt{np.random.default\_rng(seed)} による決定論的な乱数生成）。
+  \item \texttt{ls\_handoff\_shells.decode\_shell} が \texttt{allow\_gauge\_detectors} のような引数を持たず、シェルの検出器をそのまま復号に使えること。
+\end{itemize}
+
+一方で、「ノイズなしで gauge 検出器ゼロ」「\texttt{shortest\_graphlike\_error} が符号距離 $d$ と一致する」といった、本書全体の合否基準の核となる指標は、回路レベルの抽出回路が確定する第 IV 部（Stage 02）以降で初めて意味を持つ検証になります。Stage 01 の MPP ベースの回路は理想化されたシンドローム抽出であり、hook 誤りのような回路レベル特有の非 graphlike 化はまだ現れないためです。この点は次章で正面から扱います。
+
+次章（第14章「なぜ回路レベルが必要か」）では、MPP とアンシラベースの抽出回路の差、および hook 誤りを導入し、Stage 02（\codepath{src/stages/02_circuit_level/src/ftqc}）への移行を準備します。
+
+\begin{exercise}
+  \begin{enumerate}
+    \item \texttt{HybridFTQCRuntime.plan} に $H, T, H, \mathrm{CNOT}, S, T^\dagger$ という論理ゲート列を渡した場合、生成される \texttt{CliffordChunk} と \texttt{SpecialGate} のイベント列を手で書き出しなさい。各 \texttt{CliffordChunk} にどのゲートが入るかも示すこと。
+    \item \texttt{\_sample\_qec\_residuals} が返す残差が「$X_L$ フォールト」として適用される理由を、Stim コンパイラが $Z$ 基底の論理観測量しか輸出しないという事実から説明しなさい。また \texttt{mirror\_z\_residuals=True} で追加される $Z_L$ 残差が、なぜ「物理的に根拠を持つ」とは言えないのかを一文で述べなさい。
+    \item \texttt{nonclifford\_mode="qpd"} で $T$ ゲートを 1 個含む回路を実行するとき、$I, S, Z$ の 3 つの分岐にはそれぞれどの符号付き重みが割り当てられるかを、\texttt{T\_QPD\_TERMS} の値を用いて計算し、その絶対値の和 $\gamma$ が $\sqrt{2}$ になることを確かめなさい。
+    \item Stage 01 の到達点（MPP・論理格子手術中心の universal スケルトン）と限界（回路レベル距離保証・シンプレクティックフレームの欠如）を、それぞれ 1 文で説明しなさい。
+  \end{enumerate}
+\end{exercise}

@@ -1,0 +1,341 @@
+% Stage: 03 ／ 説明用コード: src/ftqc
+\chapter{トラジェクトリ実行と残差注入}\label{ch:trajectory}
+
+\begin{chaptergoal}
+  \begin{itemize}
+  \item Clifford チャンクや LS シェルごとに Stim で検出器サンプリングし、デコードして論理残差ビットを得る手順を理解します。
+  \item shot ごとのトラジェクトリループが、ゲート適用と残差注入を交互に積み重ねて 1 本の状態ベクトルを合成する仕組みを理解します。
+  \item QPD 分岐（T ゲートの符号付き分解）における残差注入と、分岐別シェル経路の読み方を理解します。
+  \item 残差の即時適用が、この段階における「ソフトウェアのパウリフレーム追跡」の実装そのものであることを理解します。
+  \item 残差が主に $X_L$ に限られるという、この段階のモデルの限界と、後段で一般化される方向性を理解します。
+  \end{itemize}
+\end{chaptergoal}
+
+前章（第21章、\ref{ch:plan}）では、\texttt{HybridFTQCRuntime.plan} が論理回路を \texttt{CliffordChunk} / \texttt{SpecialGate} / \texttt{LSCnotEvent} というイベント列へ分解する様子を見ました。
+本章の主題は、その次の段階である \texttt{HybridFTQCRuntime.run} です。
+\texttt{run} は 2 段構成になっています。まず各イベントに対して Stim による物理誤り訂正（QEC）のシンドロームサンプリングとデコードを 1 回だけバッチで行い、イベントラベルごとの\textbf{論理残差}を求めます（22.1 節）。続いて、その残差を使って shot ごとに 1 本の\textbf{トラジェクトリ}（ゲート適用と残差注入を交互に繰り返して合成される状態ベクトルの履歴）を再生します（22.2 節）。
+この「決められたタイミングで決められた論理 Pauli を状態に適用する」という仕組みが、本書全体の目標に挙げた\textbf{ソフトウェアのフレーム追跡}の、この段階での具体的な実装です（22.3 節）。
+最後に、この段階の残差モデルが $X_L$ にほぼ限定されているという限界を確認し、本書の到達範囲の限界として記録します（22.4 節）。
+
+\begin{notebox}
+  Stage: \textbf{03}。説明用コードは主に \codepath{src/ftqc/hybrid_ftqc_runtime.py}（\texttt{run} 周辺）と \codepath{src/ftqc/ls_handoff_shells.py} を用います。
+\end{notebox}
+
+\section{イベントごとの QEC 残差}\label{sec:qec_residual}
+
+\subsection{デコードから論理残差ビットへ}
+
+Clifford チャンクの QEC 残差は \texttt{\_sample\_qec\_residuals} が求めます。
+そこで行われているのは、(1) チャンクを \texttt{CliffordFTCompiler} で物理 $d=3$ 回路にコンパイルし、(2) その回路の検出器サンプラでシンドローム \texttt{det} と真の論理オブザーバブル反転 \texttt{obs} を shot 数だけまとめて取得し、(3) MWPM（失敗時は BP+OSD）でシンドロームから予測 \texttt{pred} を復号し、(4) \texttt{obs} と \texttt{pred} の排他的論理和を残差とする、という 4 段の手順です。
+
+\begin{lstlisting}[language=Python, caption={src/ftqc/hybrid\_ftqc\_runtime.py の \_sample\_qec\_residuals（抜粋・行792--818）}]
+comp = CliffordFTCompiler(self.n, p=self.p_phys, tail_rounds=self.tail_rounds)
+layers = layer_gates(chunk.gates, self.n)
+circ, _ = comp.compile(layers, noise=True)
+stim_seed = int(rng.integers(0, 2 ** 63))
+det, obs = circ.compile_detector_sampler(seed=stim_seed).sample(
+    shots, separate_observables=True)
+dem = circ.detector_error_model(decompose_errors=True)
+matcher = pymatching.Matching.from_detector_error_model(dem)
+pred = matcher.decode_batch(det)
+decoder = "MWPM"
+x_residuals = (obs ^ pred).astype(np.uint8)
+\end{lstlisting}
+
+残差の意味を式で確認しておきます。shot $s$、論理量子ビット $q$ について
+\begin{equation}
+  x^{(s)}_q = \mathrm{obs}^{(s)}_q \oplus \mathrm{pred}^{(s)}_q
+\end{equation}
+です。$\mathrm{obs}$ は「その shot で実際にどれだけ論理 $Z$ オブザーバブルが反転したか」、$\mathrm{pred}$ は「シンドロームだけから復号器が推定した反転」なので、両者が一致すればデコーダは正しく訂正できており $x^{(s)}_q=0$、一致しなければ\textbf{訂正し損なった}分だけ $x^{(s)}_q=1$ になります。
+つまり $x^{(s)}_q$ は物理誤り率そのものではなく、\textbf{デコーダを通り抜けた後に残る}論理誤りビットです。コード中のコメントにあるとおり、この $x$ は「Stim コンパイラが返す $Z$ 基底オブザーバブル反転」を「残差 $X_L$ 故障」として読み替えたものであり、この読み替えの妥当性は 22.4 節で再検討します。シンドローム抽出からデコード、論理残差ビットの算出を経て状態ベクトルへの残差注入に至る 1 イベント分の変遷を図\ref{fig:ch22_residual_injection}に示します。
+
+\begin{figure}[htbp]
+  \centering
+  \resizebox{0.95\linewidth}{!}{%
+  \begin{tikzpicture}[
+    every node/.style={font=\footnotesize},
+    stepbox/.style={draw, rounded corners=5pt, thick, align=center, inner sep=5pt, fill=white},
+    arrow/.style={-{Stealth[length=2.8mm, width=2.0mm]}, thick},
+    callout/.style={draw=black!40, rounded corners=4pt, fill=black!3, font=\scriptsize, align=center, inner sep=5pt},
+  ]
+
+    % Step 1: Stim Physical Sampling
+    \node[stepbox, draw=red!70!black, fill=red!6, minimum width=7.2cm] (step1) at (-1.5, 8.5) {
+      \textbf{① 物理 QEC サンプリング（Stim 回路）}\\
+      \scriptsize Clifford チャンク / 格子手術シェルをサンプリング\\
+      \scriptsize 出力：検出器シンドローム $\mathrm{det}$ と論理反転 $\mathrm{obs}$
+    };
+
+    % Side box for Observable correction
+    \node[callout, draw=purple!60!black, fill=purple!5, minimum width=3.8cm] (obscorr) at (5.2, 8.5) {
+      \textbf{シェル内部補正（§22.3.2）}\\
+      \scriptsize マージ副産物測定を古典 XOR\\
+      \scriptsize $\mathrm{obs} \gets Z_L \oplus m_{zz} \oplus m_{anc}$\\
+      \tiny（コンパイル時にシェル内に埋め込み）
+    };
+    \draw[arrow, dashed, line width=1.2pt, color=purple!70!black] (obscorr.west) -- (step1.east);
+
+    % Step 2: Decoding
+    \node[stepbox, draw=blue!70!black, fill=blue!6, minimum width=7.2cm] (step2) at (-1.5, 6.6) {
+      \textbf{② デコード（エラー推定器）}\\
+      \scriptsize MWPM（PyMatching）または BP+OSD（stimbposd）\\
+      \scriptsize シンドローム $\mathrm{det}$ から反転予測 $\mathrm{pred}$ を復号
+    };
+
+    % Step 3: Residual XOR
+    \node[stepbox, draw=red!80!black, fill=orange!8, minimum width=7.2cm] (step3) at (-1.5, 4.5) {
+      \textbf{③ 論理残差ビットの算出}\\
+      \normalsize $x^{(s)}_q = \mathrm{obs}^{(s)}_q \oplus \mathrm{pred}^{(s)}_q$\\
+      \scriptsize デコーダ通過後の訂正漏れ論理誤りビット（$0$: 正常, $1$: 残差フリップ）\\
+      \tiny（\texttt{mirror\_z\_residuals=True} のときは独立近似 $z^{(s)}_q$ も生成）
+    };
+
+    % Step 4: SymplecticFrame Interpretation
+    \node[stepbox, draw=orange!80!black, fill=orange!12, minimum width=7.2cm] (step4) at (-1.5, 2.5) {
+      \textbf{④ パウリフレーム解釈（\texttt{SymplecticFrame}）}\\
+      \scriptsize 残差ビット $(x, z)$ を論理パウリ演算子 $X_L^x Z_L^z$ として追跡\\
+      \scriptsize 理論模型：古典ビットとして保持し Clifford 共役で更新
+    };
+
+    % Side box for Immediate application
+    \node[callout, draw=blue!70!black, fill=blue!5, minimum width=3.8cm] (immed) at (5.2, 0.5) {
+      \textbf{即時適用という選択（§22.3.1）}\\
+      \scriptsize フレーム解決を後回しにせず\\
+      \scriptsize 状態ベクトルへ直ちに適用\\
+      \tiny（魔法状態欠陥補正 $|A\rangle \to S^\dagger$ とも\\
+      \tiny 共通の「古典フラグ $\to$ 即時 Pauli」配線）
+    };
+
+    % Step 5: Immediate Residual Injection
+    \node[stepbox, draw=green!60!black, fill=green!8, minimum width=7.2cm] (step5) at (-1.5, 0.5) {
+      \textbf{⑤ 残差注入：\texttt{\_apply\_logical\_residuals(state, x, z)}}\\
+      \scriptsize 論理量子ビット $q$ ごとにビット判定：\\
+      \scriptsize $x_q = 1 \implies \texttt{state.apply\_gate("X", q)}$\\
+      \scriptsize $z_q = 1 \implies \texttt{state.apply\_gate("Z", q)}$
+    };
+    \draw[arrow, dashed, line width=1.2pt, color=blue!70!black] (immed.west) -- (step5.east);
+
+    % Step 6: QulacsStateBackend
+    \node[stepbox, draw=green!70!black, fill=green!12, minimum width=7.2cm] (step6) at (-1.5, -1.4) {
+      \textbf{⑥ 状態更新（\texttt{QulacsStateBackend}）}\\
+      \scriptsize 状態ベクトル $|\psi\rangle \longleftarrow X_L^{(q)} |\psi\rangle$\\
+      \scriptsize トラジェクトリが 1 イベント分前進 $\to$ 次のイベントまたは終端測定へ
+    };
+
+    % Arrows between steps with clear midway labels
+    \draw[arrow, color=red!70!black] (step1) -- node[midway, right=4pt, font=\scriptsize, fill=white, inner sep=1pt] {シンドローム $\mathrm{det}$、観測量 $\mathrm{obs}$} (step2);
+    \draw[arrow, color=blue!70!black] (step2) -- node[midway, right=4pt, font=\scriptsize, fill=white, inner sep=1pt] {反転予測 $\mathrm{pred}$} (step3);
+    \draw[arrow, color=orange!80!black] (step3) -- node[midway, right=4pt, font=\scriptsize, fill=white, inner sep=1pt] {残差ビット $x$} (step4);
+    \draw[arrow, color=orange!80!black] (step4) -- node[midway, right=4pt, font=\scriptsize, fill=white, inner sep=1pt] {論理 Pauli 補正} (step5);
+    \draw[arrow, color=green!60!black] (step5) -- node[midway, right=4pt, font=\scriptsize, fill=white, inner sep=1pt] {状態ベクトルへの Pauli 作用} (step6);
+
+  \end{tikzpicture}%
+  }
+  \caption{1 イベント内における残差注入のステップ変遷。Stim による物理 QEC サンプリングから検出器シンドローム $\mathrm{det}$ と観測量 $\mathrm{obs}$（LS シェル時はマージ副産物 $m_{zz} \oplus m_{anc}$ を内部 XOR 補正）が得られ、デコーダ（MWPM / BP+OSD）が推定した反転 $\mathrm{pred}$ との排他的論理和 $x = \mathrm{obs} \oplus \mathrm{pred}$ が論理残差ビットとなります。パウリフレーム（\texttt{SymplecticFrame}）の視点ではこの $x$ は論理 $X_L$ 演算子に対応し、本章の実装選択（§22.3.1）では後回しにせず \texttt{\_apply\_logical\_residuals} により \texttt{QulacsStateBackend} へ直ちに即時適用されます。}
+  \label{fig:ch22_residual_injection}
+\end{figure}
+
+LS シェル（LS-S／LS CNOT／LS-T injection）の残差も同じ思想で、\texttt{ls\_handoff\_shells.decode\_shell} が担います。
+
+\begin{lstlisting}[language=Python, caption={src/ftqc/ls\_handoff\_shells.py の decode\_shell（抜粋・行94--111）}]
+det, obs = circ.compile_detector_sampler(seed=seed).sample(shots, separate_observables=True)
+try:
+    dem = circ.detector_error_model(decompose_errors=True)
+    matcher = pymatching.Matching.from_detector_error_model(dem)
+    pred = matcher.decode_batch(det)
+    decoder = "MWPM"
+except ValueError:
+    from stimbposd import BPOSD
+    dem = circ.detector_error_model(decompose_errors=False)
+    pred = BPOSD(dem, max_bp_iters=40).decode_batch(det)
+    decoder = "BP+OSD"
+residuals = (obs ^ pred).astype(np.uint8)
+\end{lstlisting}
+
+この関数の docstring は「\texttt{allow\_gauge\_detectors} は使わない」ことを明言し、DEM 構築が非決定的検出器エラーで失敗したらそのまま例外を伝播させると書かれています。これは gauge を許容してしまうと符号距離の劣化を隠してしまうための\textbf{正当性ガード}であり、この段階で確認できる合否基準の一部です（詳しくは 22.5 節）。
+
+LS シェルは観測量が複数になることがあるため（例: LS CNOT シェルは control/target の 2 観測量）、\texttt{observable\_to\_logical} で各列を論理量子ビット番号へ写し、$n$ 論理量子ビット分の残差行列に埋め込みます。
+
+\begin{lstlisting}[language=Python, caption={src/ftqc/hybrid\_ftqc\_runtime.py の \_sample\_ls\_cnot\_shell\_residuals（抜粋・行887--892）}]
+decoded = decode_shell(shell, shots=shots, seed=int(rng.integers(0, 2 ** 63)))
+full = np.zeros((shots, self.n), dtype=np.uint8)
+for col, logical_q in enumerate(shell.observable_to_logical):
+    if col < decoded.residuals.shape[1]:
+        full[:, int(logical_q)] ^= decoded.residuals[:, col].astype(np.uint8)
+\end{lstlisting}
+
+\subsection{optional／required の安全策}
+
+QEC サンプリングは Stim・PyMatching・\texttt{clifford\_ft\_full.py} 等の依存に加え、シェル固有の実装が必要です。\texttt{HybridFTQCRuntime} はこれを \texttt{qec\_mode} で制御します。
+
+\begin{itemize}
+  \item \texttt{"required"}: 依存やシェルの不備で例外が起きたら\textbf{そのまま再送出}します。CI や合否判定のように「サンプリングが本当に行われたことを保証したい」場面向けです。
+  \item \texttt{"optional"}: 例外を捕まえ、そのイベントの残差をゼロ（訂正済み扱い）にして \texttt{note} に理由を残したまま処理を継続します。デモや依存が揃わない環境向けの既定値です。
+  \item \texttt{"off"}: 最初から Stim サンプリングを行わず、常にゼロ残差を返します。
+\end{itemize}
+
+実装は次の \texttt{guarded\_qec\_sample} のような小さなラッパで、この三分岐をそのまま反映しています。
+
+\begin{lstlisting}[language=Python, caption={src/ftqc/hybrid\_ftqc\_runtime.py の guarded\_qec\_sample（行1015--1026）}]
+def guarded_qec_sample(chunk: CliffordChunk, kind_note: str) -> Tuple[np.ndarray, str, Optional[np.ndarray], str]:
+    if self.qec_mode == "off":
+        return zero_qec_sample("qec_mode=off; no Stim sampling performed")
+    try:
+        return self._sample_qec_residuals(chunk, shots, rng)
+    except Exception as exc:
+        if self.qec_mode == "required":
+            raise
+        return zero_qec_sample(
+            f"qec_mode=optional; Stim QEC skipped for {kind_note}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+\end{lstlisting}
+
+同じ形の \texttt{guarded\_ls\_s\_sample} / \texttt{guarded\_ls\_cnot\_sample} / \texttt{guarded\_ls\_t\_sample} が、それぞれの LS シェル向けに用意されています。
+どの経路でゼロ残差になったかは \texttt{QECReport.note} に平文で残るため、後から実行結果を読むだけで「本当にサンプリングされたか、スキップされたか」を判別できます。
+
+\section{残差注入と状態ベクトル合成}\label{sec:injection}
+
+\subsection{バッチサンプリングとトラジェクトリ再生の分離}
+
+\texttt{run} はまず前節の手順で、計画に現れる\textbf{イベントラベルごとに} shot 数分の残差をまとめてサンプリングし、\texttt{qec\_samples[label]} という辞書に保存します。
+その後、shot ごとに新しい状態バックエンドを 1 つ用意し、計画イベントを先頭から順に再生しながら、ゲート適用の直後に対応する残差を注入します。これが\textbf{トラジェクトリ}です。1 shot = 1 本のトラジェクトリで、shot をまたいで状態は共有されません。
+
+\begin{lstlisting}[language=Python, caption={src/ftqc/hybrid\_ftqc\_runtime.py の run 内トラジェクトリループ（抜粋・行1252--1268）}]
+for sidx in range(shots):
+    state = make_backend(self.n, self.backend_name)
+    for ev in events:
+        if isinstance(ev, LSCnotEvent):
+            state.apply_gate("CNOT", ev.control, ev.target)
+            x, z = qec_samples[ev.label]
+            self._apply_logical_residuals(state, x[sidx], None if z is None else z[sidx])
+            continue
+        if isinstance(ev, CliffordChunk):
+            self._apply_chunk_to_state(state, ev.gates)
+            x, z = qec_samples[ev.label]
+            self._apply_logical_residuals(state, x[sidx], None if z is None else z[sidx])
+            continue
+\end{lstlisting}
+
+「残差の注入」自体は \texttt{\_apply\_logical\_residuals} という短い静的メソッドが行います。$x$ 残差行のビットが立っている論理量子ビットに $X$ ゲートを、$z$ 残差（\texttt{mirror\_z\_residuals=True} のときのみ有効）が立っているビットに $Z$ ゲートを、それぞれ状態ベクトルへ直接適用するだけです。
+
+\begin{lstlisting}[language=Python, caption={src/ftqc/hybrid\_ftqc\_runtime.py の \_apply\_logical\_residuals（行962--970）}]
+@staticmethod
+def _apply_logical_residuals(state: Any, x_row: np.ndarray, z_row: Optional[np.ndarray] = None) -> None:
+    for q, bit in enumerate(x_row):
+        if int(bit):
+            state.apply_gate("X", q)
+    if z_row is not None:
+        for q, bit in enumerate(z_row):
+            if int(bit):
+                state.apply_gate("Z", q)
+\end{lstlisting}
+
+状態バックエンドは \texttt{make\_backend(self.n, self.backend\_name)} が返す numpy／qulacs／tsim のいずれかで、共通の \texttt{apply\_gate} / \texttt{sample\_z} インタフェースを実装しています。バックエンドの選び方と使い分けは次章（\ref{ch:backends_tsim}）で詳しく扱うので、本章では「\texttt{apply\_gate} を呼べる何らかの状態」として扱えば十分です。
+
+\subsection{QPD 分岐時の残差注入}
+
+\texttt{nonclifford\_mode="qpd"} では T/Tdag を I/S(or SDG)/Z の擬確率分解として扱い、各 shot で分岐と符号付き重みを抽選します。公開 Stage 03 の既定設定 \texttt{route\_qpd\_s\_via\_ls=True} では、I/Z 分岐に汎用 memory シェル、S/SDG 分岐に LS-S シェルを割り当てます。それぞれのシェルを別々にサンプリングし、ショットごとに対応する分岐の残差を注入します。
+
+\begin{lstlisting}[language=Python, caption={QPD 分岐ごとの QEC サンプル選択（src/ftqc/hybrid\_ftqc\_runtime.py の要約）}]
+if term in ("S", "SDG"):
+    shell_label = ev.label + "_qpd_S_ls_s_shell"
+else:  # I / Z
+    shell_label = ev.label + "_qpd_I_Z_stim_qec_shell"
+x, z = qec_samples[shell_label]
+_apply_logical_residuals(state, x[sidx], None if z is None else z[sidx])
+\end{lstlisting}
+
+分岐別に異なるノイズ過程を組み合わせるため、この経路を単一の $T \circ N$ チャネルと見なすことはできません。QPD の符号付き重みと分岐別の QEC 残差をともに含む推定量として解釈し、\texttt{QPDBranchReport} と各 \texttt{QECReport} の \texttt{active\_shots}・\texttt{kind}・\texttt{note} を確認します。\texttt{route\_qpd\_s\_via\_ls=False} を明示した場合は I/Z/S/SDG 分岐を汎用 memory シェルへ送り、単一の経路で評価します。これは既定設定とは異なる選択です。
+
+各分岐の符号付き重み \texttt{trajectory\_weight} は shot をまたいで累積され、最終的に \texttt{HybridRunResult.qpd\_reconstructed\_distribution()} が重み付きカウントから推定値を計算します。トラジェクトリ実行そのものは分岐を状態に適用し、符号の処理は集計側に委ねます。
+
+\section{パウリフレームとオブザーバブル補正}\label{sec:frame}
+
+\subsection{即時適用という実装選択}
+
+一般に\textbf{パウリフレーム追跡}とは、量子状態を物理的に訂正する代わりに「どの Pauli を後で当てるべきか」を古典ビットとして記録し、実際の適用を後回しにする手法です。読み出し直前や、次の非 Clifford ゲートの直前など、記録された Pauli が結果に影響し得る箇所で初めて解決（適用）します。
+
+本章の \texttt{\_apply\_logical\_residuals} は、この考え方の\textbf{最も単純な特殊例}です。残差ビットが決まった瞬間に、状態ベクトルへ $X$／$Z$ ゲートとして\textbf{即時適用}してしまいます。別に \texttt{PauliFrame} のような古典状態オブジェクトを保持しているわけではなく、「トラジェクトリループの中で、決まったタイミングに決まった Pauli ゲート呼び出しを挟む」という制御フローそのものが、この段階のソフトウェアフレームです。これは 22.4 節で見るとおり残差の大半が $X_L$ に限られ、かつ次の非 Clifford イベントまでに必ず解決してよい（先送りする理由がない）という、この段階の単純化のおかげで正当化されています。
+
+同じ即時適用パターンは、魔法状態の欠陥補正にも現れます。$T$ を理想適用した直後、蒸留された $|A\rangle$ が実は $Z|A\rangle$ だった（\texttt{magic\_faults} が立った）場合、$T^\dagger = S^\dagger T$ の関係から $S^\dagger$ を追加適用して補正します。
+
+\begin{lstlisting}[language=Python, caption={src/ftqc/hybrid\_ftqc\_runtime.py の magic-state 補正（抜粋・行1289--1294）}]
+if ev.name == "T":
+    state.apply_gate("T", ev.target)
+    if int(magic_faults[ev.label][sidx]):
+        # Bad distilled |A> = Z|A> makes the corrected gadget apply T^dag.
+        # T^dag = S^dag T, so after ideal T we apply S^dag.
+        state.apply_gate("SDG", ev.target)
+\end{lstlisting}
+
+QEC 残差と魔法状態欠陥補正は起源が異なる古典ビット（デコーダの予測と、独立にサンプリングした欠陥フラグ）ですが、どちらも「古典フラグ $\to$ 決定的な Pauli 補正」という同じ配線で状態に反映されている点は共通です。
+
+\subsection{シェル内部のオブザーバブル補正}
+
+もう 1 種類の補正が、LS シェルの\textbf{内部}に埋め込まれています。LS CNOT シェルの観測量は、target 側単独の $Z_L$ ではなく、マージ測定結果を古典的に XOR したものとして定義されます（\texttt{ls\_handoff\_shells.build\_ls\_cnot\_shell} の docstring より、observable 1 $=Z_L(\mathrm{target}) \oplus m_{zz} \oplus m_{anc}$）。これは \texttt{decode\_shell} が呼ばれる\textbf{前}に \texttt{circuit\_level\_merge}／\texttt{ls\_cnot\_ft} 側で回路に組み込まれる補正であり、本章のトラジェクトリループが行う「実行時の残差注入」とは層が異なります。両者を区別すると、この段階のフレーム的な補正は次の 2 層に分かれていることが分かります。
+
+\begin{itemize}
+  \item \textbf{シェル内部（コンパイル時）}: マージ測定の副産物ビットを観測量に XOR し、シェル自身が正しい論理値を返すようにする補正。
+  \item \textbf{ランタイム（実行時）}: シェルが返した残差ビットを、トラジェクトリの状態ベクトルへ $X$／$Z$ ゲートとして即時適用する、本章の主題である補正。
+\end{itemize}
+
+\section{この段階の限界（\texorpdfstring{$X_L$}{X\_L} 中心）}\label{sec:xl_limit_foreshadow}
+
+\codepath{src/ftqc/hybrid_ftqc_runtime.py} 冒頭のモデル境界の説明は、この段階の残差モデルの前提をそのまま述べています。
+
+\begin{lstlisting}[language={}, caption={src/ftqc/hybrid\_ftqc\_runtime.py 冒頭のモデル境界の説明（該当部分）}]
+The current Stim compiler exports Z-basis logical observable flips. Those are
+applied to the logical state as decoded residual X_L faults. Optional mirrored
+Z_L faults can be enabled for stress testing, but the physically grounded output
+of the existing compiler is the X_L residual channel.
+\end{lstlisting}
+
+つまりこの段階で実際にデコーダから得られる残差は $Z$ 基底オブザーバブルの反転であり、それを「論理 $X_L$ 故障」として状態に適用しています。$Z_L$ 側の残差が欲しい場合、\texttt{mirror\_z\_residuals=True} を指定すると $X_L$ 残差と\textbf{同じ per-qubit 発生率}を持つ独立なチャネルとしてサンプリングしますが、これは実際の相関を再現しない\textbf{近似}であることが \texttt{note} 文字列にも明記されています。
+
+\begin{lstlisting}[language=Python, caption={src/ftqc/hybrid\_ftqc\_runtime.py の mirror\_z\_residuals（抜粋・行812--817）}]
+z_residuals = None
+note = "Stim compiler observable flips are mapped to residual X_L faults."
+if self.mirror_z_residuals:
+    rates = x_residuals.mean(axis=0)
+    z_residuals = (rng.random((shots, self.n)) < rates).astype(np.uint8)
+    note += " mirror_z_residuals=True added approximate independent Z_L faults."
+\end{lstlisting}
+
+この近似は、回路の途中に $H$ ゲートのような $X_L$ と $Z_L$ を入れ替える操作が挟まる場合に問題になります。$X_L$ 残差と $Z_L$ 残差は本来相補的な誤り過程から生じる相関を持ちますが、独立サンプリングではその相関を再現できません。本章のトラジェクトリ実行そのものは「与えられた残差行列を正しいタイミングで注入する」処理として正しく動作していますが、\textbf{与える残差行列自体}がこの段階では $X_L$ 中心という制約を受けています。
+
+中間 $H$ ゲートを含む回路では誤り基底が入れ替わります。そのため独立な $Z_L$ ミラーを加えるだけでは、相関を保った完全な残差モデルにはなりません。本書で扱うのは Stage 03 の範囲であり、この制限を結果の解釈に含めます。
+
+\section{まとめ}\label{ch22:summary}
+
+\begin{itemize}
+  \item イベントごとの QEC 残差は、Stim の検出器サンプリング結果 \texttt{obs} とデコーダの予測 \texttt{pred} の排他的論理和 $x=\mathrm{obs}\oplus\mathrm{pred}$ として得られます。
+  \item \texttt{run} はまずイベントラベルごとに shot 数分の残差をバッチサンプリングし、その後 shot ごとに 1 本のトラジェクトリを再生してゲート適用と残差注入を交互に積み重ねます。
+  \item 残差注入は \texttt{\_apply\_logical\_residuals} による $X$／$Z$ ゲートの即時適用で、これがこの段階のソフトウェアパウリフレーム追跡の実体です。QPD 分岐や magic-state 欠陥補正も同じ「古典フラグ $\to$ 決定的な Pauli」の配線を共有します。
+  \item LS シェルはさらにコンパイル時のオブザーバブル補正（マージ測定副産物の XOR）を内部に持ち、ランタイムの残差注入とは別の層で正しさを保証しています。
+  \item この段階の残差は Stim コンパイラの出力に忠実な $X_L$ 中心モデルであり、\texttt{mirror\_z\_residuals} による $Z_L$ 近似は相関を無視した簡略化です。この限界は本書の対象外です。
+  \item \texttt{qec\_mode}（\texttt{required}／\texttt{optional}／\texttt{off}）が、依存やシェルの不備に対する安全策として、残差サンプリングの失敗時の挙動を明示的に切り分けています。
+\end{itemize}
+
+\subsection*{合否基準での検証}
+
+本章の範囲で機械的に確認できる合否基準は次のとおりです。
+
+\begin{itemize}
+  \item \texttt{ls\_handoff\_shells.decode\_shell} は \texttt{allow\_gauge\_detectors} を使いません。DEM 構築が非決定的検出器で失敗した場合はそのまま例外を伝播させる実装になっており、gauge を握り込んで距離が劣化した状態を検出無しに通過させることを防いでいます。
+  \item シンドロームサンプリングの seed は \texttt{rng.integers(0, 2**63)} によって \texttt{HybridFTQCRuntime} 自身の \texttt{seed}／\texttt{run(seed=...)} から一意に派生するため、同じ seed で \texttt{run} を呼べば残差サンプルの列、したがって最終分布も再現できます。
+  \item 各 \texttt{QECReport} には \texttt{decoder}（\texttt{"MWPM"} または \texttt{"BP+OSD"}）と \texttt{x\_residual\_rate} が残るため、どのイベントでどの復号器が使われ、残差率がどの程度だったかを実行後に追跡できます。
+\end{itemize}
+
+一方、\texttt{shortest\_graphlike\_error = d} や gauge 検出器ゼロといった符号距離そのものの合否基準は、LS シェルの構築時（\texttt{circuit\_level\_merge.py} / \texttt{ls\_cnot\_ft.py}）に既に検証済みという前提の上に本章が乗っている形であり、本章のトラジェクトリ実行はそれを\textbf{壊さずに正しく消費すること}が確認範囲です。また、$Z_L$ 側の相関を保つ完全な論理パウリフレームは本書の実装範囲外です。
+
+次章（第23章 状態ベクトルバックエンドと tsim、\ref{ch:backends_tsim}）では、本章のトラジェクトリループが呼び出す \texttt{make\_backend} の numpy／qulacs／tsim バックエンド選択と、ビット順などの実装上の注意点を詳しく見ていきます。
+
+\begin{exercise}
+  \begin{enumerate}
+    \item \texttt{\_sample\_qec\_residuals} が返す \texttt{x\_residuals = obs \^{} pred} が、物理誤り率ではなく「デコーダを通り抜けた後に残る」論理誤りである理由を、\texttt{obs} と \texttt{pred} それぞれの由来に触れて説明しなさい。
+    \item \texttt{qec\_mode="required"} と \texttt{qec\_mode="optional"} で、\texttt{pymatching} が未インストールの環境で \texttt{run} を呼んだときの挙動がどう変わるかを、\texttt{guarded\_qec\_sample} の実装をもとに説明しなさい。また \texttt{optional} のとき shot 数の整合性がどのように保たれるかも述べなさい。
+    \item 既定の QPD ルーティングで I/Z 分岐と S/SDG 分岐が別の QEC シェルを通る理由を説明し、各レポートの active shot 数の意味を述べなさい。
+    \item 論理回路が「$T$ ゲート $\to$ $H$ ゲート $\to$ $T$ ゲート」という順序を含む場合、\texttt{mirror\_z\_residuals=True} による独立な $Z_L$ サンプリングでは、2 つの $T$ ゲート周りの誤りの何が正しく再現されないかを、22.4 節の議論に基づいて説明しなさい。
+  \end{enumerate}
+\end{exercise}

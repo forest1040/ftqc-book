@@ -1,0 +1,32 @@
+% 付録A — 開発環境セットアップ
+\chapter{開発環境セットアップ}\label{app:setup}
+
+本書のコードは Python 3.12 以降と uv を使います。Stage 01、Stage 02、Stage 03 は同じ \texttt{ftqc} という import 名を持ちますが、依存関係と実装が異なる独立したプロジェクトです。混在を避けるため、それぞれのディレクトリで環境を同期して実行してください。
+
+\section{Stage 01}
+
+リポジトリのルートから次を実行します。
+\begin{lstlisting}[language=bash]
+uv sync --directory src/stages/01_mpp --locked
+uv run --directory src/stages/01_mpp --locked pytest -q
+uv run --directory src/stages/01_mpp --locked python examples/ch06_surface_patch.py
+\end{lstlisting}
+
+\section{Stage 02}
+
+\begin{lstlisting}[language=bash]
+uv sync --directory src/stages/02_circuit_level --locked
+uv run --directory src/stages/02_circuit_level --locked pytest -q
+uv run --directory src/stages/02_circuit_level --locked python examples/ch16_circuit_merge.py
+\end{lstlisting}
+
+\section{Stage 03}
+
+Stage 03 はリポジトリ直下の \texttt{pyproject.toml} と \texttt{uv.lock} を使います。
+\begin{lstlisting}[language=bash]
+uv sync --locked
+uv run --locked pytest -q tests
+uv run --locked python examples/ch25_d3_benchmark.py
+\end{lstlisting}
+
+書籍 PDF を生成する場合は LuaLaTeX と latexmk が必要です。\texttt{book/} で \texttt{latexmk -lualatex main.tex} を実行します。依存パッケージの導入方法は利用する OS の公式手順に従ってください。

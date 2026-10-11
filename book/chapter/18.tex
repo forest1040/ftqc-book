@@ -1,0 +1,394 @@
+% Stage: 02 ／ 説明用コード: src/stages/02\_circuit\_level/src/ftqc
+\chapter{T テレポートの格子手術実装（LS-T）}\label{ch:ls_t}
+
+\begin{chaptergoal}
+  \begin{itemize}
+  \item 4 パッチ構成（$D$/$A_1$/$M$/$A_s$）による LS-T injection の幾何を理解します。
+  \item $M_{ZZ}+M_{XX}+M_{ZZ}(S)$ という測定の連鎖が、ゲートテレポーテーションのどの手順に対応するかを理解します。
+  \item data 残差（$X_L$ チャネル）を観測量に選ぶ理由と、そこから求まる符号距離を理解します。
+  \item magic fault（蒸留の不完全さ）と QEC 残差（回路レベル雑音）という 2 つの誤りモデルが、本実装ではなぜ分離されているかを理解します。
+  \item この分離が本章の段階でどこまで検証済みで、どこが後段（本書の対象外）で強化されるかを把握します。
+  \end{itemize}
+\end{chaptergoal}
+
+第16章・第17章では、格子手術による論理 CNOT を $M_{ZZ}+M_{XX}$ の連鎖として回路レベルで実装し、merge$\to$split で分裂する seam スタビライザの保存量を閉じる後ろ向き閉包検出器によって符号距離 3 を回復しました。
+第12章では、$T$ ゲートが非Clifford であるために魔法状態 $\ket{A}=T\ket{+}$ の蒸留とゲートテレポーテーションが必要になることを、状態ベクトルレベル（Stage 01、\codepath{src/stages/01_mpp/src/ftqc/}）で確認しました。
+本章では、この 2 つを合流させます。
+すなわち、ゲートテレポーテーションの Clifford 骨格——CNOT と補助量子ビットの $Z$ 測定、条件付き $S$ 補正——を、第16章までに確立した回路レベル格子手術の技法で実装し、data 側に残る論理誤りを検証します。
+蒸留そのもの（15-to-1、$\sim35p^3$）の再説明は行わず、必要な範囲でのみ第12章を振り返ります。
+
+\begin{notebox}
+  Stage: \textbf{02}。
+  説明用コードは主に \codepath{src/stages/02_circuit_level/src/ftqc/} を用います。
+  中心となるのは \codepath{src/stages/02_circuit_level/src/ftqc/ls_cnot_ft.py} の \texttt{LSTeleportFT} クラス（\texttt{LSCnotFT} の継承）と、それをシェルとして包む \codepath{src/stages/02_circuit_level/src/ftqc/ls_handoff_shells.py} の \texttt{build\_ls\_t\_injection\_shell} です。
+  魔法状態の忠実度モデルは \codepath{src/stages/02_circuit_level/src/ftqc/t_gate.py} が別に担い、本章では立ち入りません。
+\end{notebox}
+
+\section{4 パッチ構成}\label{sec:four_patch}
+
+\subsection{ゲートテレポーテーションの Clifford 骨格を思い出す}
+
+第12章の \texttt{t\_gate.py} は、$T$ ゲートテレポーテーションを状態ベクトルで次のように検証していました。
+
+\begin{lstlisting}[language=Python, caption={T ゲートテレポーテーションの手順（\codepath{src/stages/02_circuit_level/src/ftqc/t_gate.py}）}]
+def teleport(psi):
+    state = np.kron(psi, A)               # target(0) ⊗ ancilla(1)
+    state = CNOT @ state                  # CNOT(target->ancilla)
+    ...
+    if m == 1:
+        out = S @ out                 # S 補正 (= 既存の LS S ゲート)
+    return results
+\end{lstlisting}
+
+手順を分解すると、(1) データと魔法状態 $\ket{A}$ の間の CNOT、(2) 魔法状態側を $Z$ 基底で測定し測定値 $m$ を得る、(3) $m=1$ のときだけデータに $S$ 補正をかける、という 3 段になります。
+このうち非Clifford なのは魔法状態 $\ket{A}$ そのものであり、CNOT・$Z$ 測定・$S$ 補正はすべて Clifford です。
+本章が回路レベルで実装するのは、まさにこの Clifford 骨格です。
+
+\subsection{4 パッチのレイアウト}
+
+\texttt{ls\_cnot\_ft.py} の \texttt{LSTeleportFT} は、この骨格を 4 つの表面符号パッチで表現します。
+
+\begin{lstlisting}[language=Python, caption={LSTeleportFT の 4 パッチ構成（\codepath{src/stages/02_circuit_level/src/ftqc/ls_cnot_ft.py}）}]
+class LSTeleportFT(LSCnotFT):
+    """実 T テレポートの回路レベル QEC スケルトン。
+    4 パッチ (全て正座標, data を中央に置き2つの ZZ merge を data の上下=対辺に
+    配置して角共有を回避):
+        D (data)   = (7,7)     |0>
+        A1(cnot anc)= (7,1)     |+>   D の上, M_ZZ(D,A1)
+        M (magic)  = (13,1)    |+>   A1 の右, M_XX(A1,M)  (|A> の Clifford 骨格)
+        As(s anc)  = (7,13)    |Y>   D の下, M_ZZ(D,As)   (S 補正; with_s 時のみ)
+    """
+\end{lstlisting}
+
+$D$ はデータ量子ビット、$A_1$ は CNOT を実現するための補助パッチ、$M$ は魔法状態を受け取るパッチ、$A_s$ は $S$ 補正用の補助パッチです。
+第16章の \texttt{LSCnotFT} が採用した L 字レイアウト（control の下に ancilla、その右に target）とは異なり、\texttt{LSTeleportFT} は $D$ を中央に置き、$A_1$ と $A_s$ を $D$ の対辺（上と下）に配置します。
+これは、$D$ の同じ角に 2 つの merge が同時に接すると、第17章で扱った seam 角の縮退（後ろ向き閉包検出器で解消した現象）が別の形で再発しかねないためで、対辺配置によって角の共有そのものを避けています。この 4 パッチの空間配置と境界の型、および各 merge の結合パスを図\ref{fig:ch18_lst_layout}に示します。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[scale=0.92, every node/.style={transform shape}]
+    % 1. A1 (上)
+    \begin{scope}[shift={(0, 3.0)}]
+      \draw[logpatch, fill=black!3] (0,0) rectangle (2.2, 2.2);
+      % X境界 (上下)
+      \draw[xtype, line width=2pt] (0, 2.2) -- (2.2, 2.2);
+      \draw[xtype, line width=2pt] (0, 0) -- (2.2, 0);
+      % Z境界 (左右)
+      \draw[ztype, line width=2pt] (0, 0) -- (0, 2.2);
+      \draw[ztype, line width=2pt] (2.2, 0) -- (2.2, 2.2);
+      % ノード
+      \node[font=\bfseries, align=center] at (1.1, 1.1) {パッチ $A_1$\\ \scriptsize (CNOT 補助)\\ \footnotesize $\ket{+_L}$};
+      \foreach \cx in {0.4, 1.1, 1.8} {
+        \foreach \ry in {0.4, 1.1, 1.8} {
+          \node[dataqubit, minimum size=5pt] at (\cx, \ry) {};
+        }
+      }
+      \node[above, font=\tiny\bfseries, xtype] at (1.1, 2.2) {X 境界};
+      \node[left, font=\tiny\bfseries, ztype] at (0, 1.1) {Z 境界};
+      \node[right, font=\tiny\bfseries, ztype] at (2.2, 1.1) {Z 境界};
+      \node[below, font=\tiny\bfseries, xtype] at (1.1, 0) {X 境界};
+    \end{scope}
+
+    % 2. M (右上)
+    \begin{scope}[shift={(4.4, 3.0)}]
+      \draw[thick, fill=black!3] (0,0) rectangle (2.2, 2.2);
+      % X境界 (上下)
+      \draw[xtype, line width=2pt] (0, 2.2) -- (2.2, 2.2);
+      \draw[xtype, line width=2pt] (0, 0) -- (2.2, 0);
+      % Z境界 (左右)
+      \draw[ztype, line width=2pt] (0, 0) -- (0, 2.2);
+      \draw[ztype, line width=2pt] (2.2, 0) -- (2.2, 2.2);
+      % ノード
+      \node[font=\bfseries, align=center] at (1.1, 1.1) {パッチ $M$\\ \scriptsize (魔法状態受け皿)\\ \footnotesize $\ket{+_L}$};
+      \foreach \cx in {0.4, 1.1, 1.8} {
+        \foreach \ry in {0.4, 1.1, 1.8} {
+          \node[dataqubit, minimum size=5pt] at (\cx, \ry) {};
+        }
+      }
+      \node[above, font=\tiny\bfseries, xtype] at (1.1, 2.2) {X 境界};
+      \node[left, font=\tiny\bfseries, ztype] at (0, 1.1) {Z 境界};
+      \node[right, font=\tiny\bfseries, ztype] at (2.2, 1.1) {Z 境界};
+      \node[below, font=\tiny\bfseries, xtype] at (1.1, 0) {X 境界};
+    \end{scope}
+
+    % 3. D (中央)
+    \begin{scope}[shift={(0, 0)}]
+      \draw[thick, fill=black!3] (0,0) rectangle (2.2, 2.2);
+      % X境界 (上下)
+      \draw[xtype, line width=2pt] (0, 2.2) -- (2.2, 2.2);
+      \draw[xtype, line width=2pt] (0, 0) -- (2.2, 0);
+      % Z境界 (左右)
+      \draw[ztype, line width=2pt] (0, 0) -- (0, 2.2);
+      \draw[ztype, line width=2pt] (2.2, 0) -- (2.2, 2.2);
+      % ノード
+      \node[font=\bfseries, align=center] at (1.1, 1.1) {パッチ $D$\\ \scriptsize (データ)\\ \footnotesize $\ket{0_L}$};
+      \foreach \cx in {0.4, 1.1, 1.8} {
+        \foreach \ry in {0.4, 1.1, 1.8} {
+          \node[dataqubit, minimum size=5pt] at (\cx, \ry) {};
+        }
+      }
+      \node[above, font=\tiny\bfseries, xtype] at (1.1, 2.2) {X 境界};
+      \node[left, font=\tiny\bfseries, ztype] at (0, 1.1) {Z 境界};
+      \node[right, font=\tiny\bfseries, ztype] at (2.2, 1.1) {Z 境界};
+      \node[below, font=\tiny\bfseries, xtype] at (1.1, 0) {X 境界};
+    \end{scope}
+
+    % 4. As (下)
+    \begin{scope}[shift={(0, -3.0)}]
+      \draw[logpatch, fill=black!3] (0,0) rectangle (2.2, 2.2);
+      % X境界 (上下)
+      \draw[xtype, line width=2pt] (0, 2.2) -- (2.2, 2.2);
+      \draw[xtype, line width=2pt] (0, 0) -- (2.2, 0);
+      % Z境界 (左右)
+      \draw[ztype, line width=2pt] (0, 0) -- (0, 2.2);
+      \draw[ztype, line width=2pt] (2.2, 0) -- (2.2, 2.2);
+      % ノード
+      \node[font=\bfseries, align=center] at (1.1, 1.1) {パッチ $A_s$\\ \scriptsize ($S$ 補正補助)\\ \footnotesize $\ket{0_L}$};
+      \foreach \cx in {0.4, 1.1, 1.8} {
+        \foreach \ry in {0.4, 1.1, 1.8} {
+          \node[dataqubit, minimum size=5pt] at (\cx, \ry) {};
+        }
+      }
+      \node[above, font=\tiny\bfseries, xtype] at (1.1, 2.2) {X 境界};
+      \node[left, font=\tiny\bfseries, ztype] at (0, 1.1) {Z 境界};
+      \node[right, font=\tiny\bfseries, ztype] at (2.2, 1.1) {Z 境界};
+      \node[below, font=\tiny\bfseries, xtype] at (1.1, 0) {X 境界};
+    \end{scope}
+
+    % ---- merge 結合パス ----
+    % M_ZZ(D, A1)
+    \draw[fill=purple!15, draw=purple!60, line width=1pt] (-0.2, 2.2) rectangle (2.4, 3.0);
+    \draw[{Stealth[length=5pt]}-{Stealth[length=5pt]}, line width=1.5pt, purple!80!black] (1.1, 2.3) -- (1.1, 2.9);
+    \node[right=2pt, font=\scriptsize\bfseries, text=purple!80!black, align=left] at (2.4, 2.6)
+      {$M_{ZZ}(D, A_1)$ merge\\(上下の X 境界を結合)};
+
+    % M_XX(A1, M)
+    \draw[fill=cyan!15, draw=cyan!60, line width=1pt] (2.2, 3.2) rectangle (4.4, 5.0);
+    \draw[{Stealth[length=5pt]}-{Stealth[length=5pt]}, line width=1.5pt, cyan!80!black] (2.4, 4.1) -- (4.2, 4.1);
+    \node[above=2pt, font=\scriptsize\bfseries, text=cyan!80!black, align=center] at (3.3, 5.0)
+      {$M_{XX}(A_1, M)$ merge\\(左右の Z 境界を結合)};
+
+    % M_ZZ(D, As)
+    \draw[fill=purple!15, draw=purple!60, line width=1pt] (-0.2, -0.8) rectangle (2.4, 0.0);
+    \draw[{Stealth[length=5pt]}-{Stealth[length=5pt]}, line width=1.5pt, purple!80!black] (1.1, -0.7) -- (1.1, -0.1);
+    \node[right=2pt, font=\scriptsize\bfseries, text=purple!80!black, align=left] at (2.4, -0.4)
+      {$M_{ZZ}(D, A_s)$ merge ($S$ 補正時)\\(上下の X 境界を結合)};
+
+    % 凡例
+    \begin{scope}[shift={(4.2, 0.2)}]
+      \node[draw, fill=white, rounded corners=3pt, inner sep=5pt, align=left, font=\scriptsize] at (1.5, 0) {
+        \textbf{凡例}\\[2pt]
+        \tikz[baseline=-2pt]\draw[thick] (0,0) -- (0.5,0); : データ・受け皿パッチ\\
+        \tikz[baseline=-2pt]\draw[logpatch] (0,0) -- (0.5,0); : 論理アンシラパッチ\\
+        \tikz[baseline=-2pt]\draw[xtype, line width=2pt] (0,0) -- (0.5,0); : X 境界（赤）\\
+        \tikz[baseline=-2pt]\draw[ztype, line width=2pt] (0,0) -- (0.5,0); : Z 境界（青）\\
+        \tikz[baseline=-2pt]\node[dataqubit, minimum size=5pt] at (0.25,0) {}; : データ量子ビット
+      };
+    \end{scope}
+  \end{tikzpicture}
+  \caption{LS-T（$T$ ゲートテレポーテーション）の 4 パッチ空間配置図。データパッチ $D$（実線枠）を中央に置き、CNOT 用の論理アンシラパッチ $A_1$（破線枠 \texttt{logpatch}）と $S$ 補正用の論理アンシラパッチ $A_s$（破線枠）を $D$ の上下の対辺に配置しています。パッチ $A_1$ と魔法状態受け皿パッチ $M$ は左右に隣接します。$A_1$–$D$ 間および $D$–$A_s$ 間は X 境界（赤）同士の結合による $M_{ZZ}$ merge、$A_1$–$M$ 間は Z 境界（青）同士の結合による $M_{XX}$ merge を行います。$D$ の対辺に 2 つの $M_{ZZ}$ を逃がすことで、同一の角を 2 つの merge が共有する幾何的縮退を回避しています。}
+  \label{fig:ch18_lst_layout}
+\end{figure}
+
+
+各パッチは 3\texttimes3 個のデータ量子ビットからなる距離 3 の表面符号パッチで、初期化基底は次のとおりです。
+
+\begin{center}
+\begin{tabular}{llll}
+\hline
+パッチ & 役割 & 初期化 & 決定論型（\texttt{init\_basis}） \\
+\hline
+$D$   & データ & $\ket{0_L}$ & $Z$ \\
+$A_1$ & CNOT 用補助 & $\ket{+_L}$ & $X$ \\
+$M$   & 魔法状態の受け皿 & $\ket{+_L}$（Clifford 骨格） & $X$ \\
+$A_s$ & $S$ 補正用補助 & $\ket{0_L}$（論理層で $\ket{Y_L}$ 相当） & $Z$ \\
+\hline
+\end{tabular}
+\end{center}
+
+実際に \texttt{LSTeleportFT} を生成すると、$S$ 補正パッチ $A_s$ を含めるかどうかでデータ量子ビット総数が変わります。
+
+\begin{lstlisting}[language=Python, caption={パッチ数によるデータ量子ビット数の違い（実行結果）}]
+with_s=False: N(data)=27  n_total=57  ancilla=30
+with_s=True : N(data)=36  n_total=77  ancilla=41
+\end{lstlisting}
+
+3 パッチ構成（$D,A_1,M$）ではデータ量子ビットは $27=9\times3$ 個、$S$ 補正パッチ $A_s$ を加える 4 パッチ構成では $36=9\times4$ 個になります。
+魔法状態 $\ket{A_L}=T\ket{+}$ 自体は非スタビライザ状態であり、Stim では準備できません。
+そのためパッチ $M$ は $\ket{+_L}$ を保持する Clifford 骨格として置かれ、$T$ らしさと蒸留の不完全さは第18.4節で述べる別のモデルに委ねられます。
+同様に $A_s$ の「$\ket{Y_L}$ の内容」も論理層の関心事であり、回路レベルでは $\ket{0_L}$ から出発する $S$ 補正 merge のコストだけを負担します（第16章の LS-S と同じ扱いです）。
+
+\section{\texorpdfstring{$M_{ZZ}+M_{XX}+M_{ZZ}(S)$}{M\_ZZ + M\_XX + M\_ZZ(S)} の連鎖}\label{sec:chain}
+
+\subsection{スケジュール}
+
+\texttt{build\_teleport} は、split（各パッチ独立）と merge（2 パッチ結合）を交互に繰り返すスケジュールを組みます。
+
+\begin{lstlisting}[language=Python, caption={LS-T のラウンドスケジュール（\codepath{src/stages/02_circuit_level/src/ftqc/ls_cnot_ft.py}）}]
+schedule = ([("split", self.split_info)] * split_rounds +
+            [("zzc", self.zz_cnot_info)] * merge_rounds +
+            [("split", self.split_info)] * split_rounds +
+            [("xxc", self.xx_cnot_info)] * merge_rounds +
+            [("split", self.split_info)] * split_rounds)
+if self.with_s:
+    schedule += ([("zzs", self.zz_s_info)] * merge_rounds +
+                 [("split", self.split_info)] * split_rounds)
+\end{lstlisting}
+
+前半の \texttt{"zzc"}（$D$ と $A_1$ の $M_{ZZ}$ merge）と \texttt{"xxc"}（$A_1$ と $M$ の $M_{XX}$ merge）が、CNOT$(D\to M)$ を測定ベースで実現する部分です。
+これは第16章で見た $M_{ZZ}+M_{XX}$ の連鎖そのものであり、\texttt{LSTeleportFT} が \texttt{LSCnotFT} を継承している理由もここにあります。
+\texttt{with\_s=True} のときだけ、末尾に \texttt{"zzs"}（$D$ と $A_s$ の $M_{ZZ}$ merge）が追加され、$S$ 補正の merge コストを回路に反映します。
+以上を合わせると、章タイトルにある連鎖
+
+\begin{equation}
+  M_{ZZ}(D,A_1) \;+\; M_{XX}(A_1,M) \;+\; M_{ZZ}(D,A_s)
+\end{equation}
+
+が得られます。
+各 merge の前後には \texttt{split\_rounds} 回の split ラウンドが挟まり、フェーズが変わるたびにアンシラを全リセットします。
+検出器の張り方（\texttt{\_compose\_in} による split$\leftrightarrow$merge 遷移の合成、最終ラウンドの spacelike 境界閉包）は第16章・第17章の \texttt{LSCnotFT.build} と同一のロジックを継承しており、本章で新たに導入するものではありません。
+
+\subsection{スコープの限定：\texorpdfstring{$S$}{S} 補正は常時発生させる}
+
+現在の実装には、重要な単純化が 1 つあります。
+本来のゲートテレポーテーションでは、$S$ 補正は魔法状態側の測定値 $m$ が 1 のときだけ適用される条件付き操作です。
+一方 \texttt{build\_teleport} は、\texttt{with\_s=True} を指定すると \texttt{"zzs"} merge を\textbf{ショットに関わらず常に}回路へ組み込みます。
+これは \texttt{ls\_handoff\_shells.py} のコメントにも明記されている設計判断です。
+
+\begin{lstlisting}[language=Python, caption={常時発生させる S 補正 merge（\codepath{src/stages/02_circuit_level/src/ftqc/ls_handoff_shells.py}）}]
+The S correction commutes with the data Z readout, so it changes only the
+data residual's noise, not its value.
+\end{lstlisting}
+
+$S$ merge はデータの $Z_L$ 読み出し値そのものは変えず、そこに乗る QEC 雑音だけを変えます。
+そのため、条件分岐を持たない常時 on の実装でも、data 残差の$Z_L$統計という観点では代用がききます。
+ただし実際に $m=1$ の場合だけ $S$ を適用するという条件分岐の忠実な実装ではない点は明示しておくべきスコープの限定であり、条件付き分岐そのものは第19章のシェル API やランタイム層（\texttt{hybrid\_ftqc\_runtime.py} の魔法状態モデル）で扱われます。
+
+\section{観測量と距離}\label{sec:orthogonal_obs}
+
+\subsection{data 残差（\texorpdfstring{$X_L$}{X\_L} チャネル）}
+
+\texttt{build\_teleport} が定義する観測量は 1 つだけです。
+
+\begin{lstlisting}[language=Python, caption={観測量は data の Z\_L のみ（\codepath{src/stages/02_circuit_level/src/ftqc/ls_cnot_ft.py}）}]
+# 観測量: obs0 = Z_L(data) (全 merge は Z_L(D) と可換なので保存; 補正不要)。
+# これが residual X_L 故障チャネル。magic(M) の Z 読み出し(=テレポート測定 m)は
+# M=|+> ゆえ非決定論的なので観測量には含めない (m は論理層で別に扱う)。
+c.append("OBSERVABLE_INCLUDE", [rr(drec[q]) for q in self.ZL_D], 0)
+\end{lstlisting}
+
+$M_{ZZ}(D,A_1)$、$M_{XX}(A_1,M)$、$M_{ZZ}(D,A_s)$ の 3 つの merge はいずれも $Z_L(D)$ と可換であり、第16章の LS-CNOT で必要だった $Z_L(T)\oplus m_{zz}\oplus m_{anc}$ のようなフレーム補正は不要です。
+したがって、ノイズなしでは $\text{obs}0=0$（$D$ を $\ket{0_L}$ で初期化した場合）に決定論的に定まり、雑音が乗った場合の反転が data の残差 $X_L$ 故障チャネルとして解釈できます。
+魔法パッチ $M$ の $Z$ 読み出し（テレポーテーション測定 $m$ に相当）は $M=\ket{+_L}$ ゆえ本来非決定論的であるため、観測量には含めません。
+$m$ は論理層（ランタイム側の魔法状態モデル）で別途扱われる量です。
+
+\subsection{距離 3 の検証}
+
+実際に \texttt{build\_ls\_t\_injection\_shell} が返す回路をノイズあり／なしで確認すると、次の結果が得られます。
+
+\begin{lstlisting}[language=Python, caption={LS-T シェルの gauge 検出器数と距離（実行結果）}]
+with_s=False: detectors=288, gauge=0, dist=3
+with_s=True : detectors=544, gauge=0, dist=3
+\end{lstlisting}
+
+ノイズなし回路（\texttt{noise=False}）でサンプリングした検出器はすべて決定論的（\texttt{gauge}検出器数 $=0$）であり、\texttt{allow\_gauge\_detectors} は一度も使われていません。
+ノイズあり回路（\texttt{p=0.005}）の検出器誤りモデルから求めた $\mathrm{shortest\_graphlike\_error}$ は、$S$ 補正の有無にかかわらず 3、すなわちパッチ距離と一致します。
+これは第17章のケーススタディで確立した後ろ向き閉包検出器が、LS-CNOT だけでなく $A_1$・$A_s$ を含む 4 パッチ構成にもそのまま有効であることを示しています。
+\texttt{LSTeleportFT} が \texttt{LSCnotFT} の検出器構築ロジックをそのまま継承している以上、これは狙って作られた性質であり、偶然の一致ではありません。
+
+\section{magic fault と QEC 残差の直交性}\label{sec:orthogonal}
+
+\subsection{2 つの誤りモデルの分離}
+
+本章の LS-T シェルが検証しているのは、あくまで Clifford 骨格に乗る回路レベル雑音の残差です。
+魔法状態 $\ket{A_L}=T\ket{+}$ そのものの品質——15-to-1 蒸留後に残る誤り率 $\sim35p^3$（第12章）——は、この回路には一切含まれていません。
+\texttt{ls\_handoff\_shells.py} は、このモデルの境界を次のように明言しています。
+
+\begin{lstlisting}[language=Python, caption={魔法状態の忠実度は別モデル（\codepath{src/stages/02_circuit_level/src/ftqc/ls_handoff_shells.py}）}]
+The true |A_L> = T|+> is non-stabilizer and cannot be prepared in Stim; the
+magic patch is the Clifford skeleton (|+>) and the non-Clifford T-ness plus
+the magic-state fault are handled at the state-vector / magic layer
+(t_gate.py).
+\end{lstlisting}
+
+つまり、本実装が扱う誤りは次の 2 系統にはっきり分かれます。
+
+\begin{itemize}
+  \item \textbf{QEC 残差}：$D,A_1,M,A_s$ 各パッチの物理雑音（\texttt{DEPOLARIZE1/2}）が回路レベル格子手術の merge を通じて data の $Z_L$ に伝わる分。本章のシェルが \texttt{decode\_shell}（第19章で正式に扱う）でデコードし、$\mathrm{shortest\_graphlike\_error}=3$ を保って検証する対象です。
+  \item \textbf{magic fault}：蒸留後の魔法状態 $\ket{A}$ が理想の $T\ket{+}$ からどれだけずれているかという確率 $p_{\text{magic}}$。\texttt{t\_gate.py} の \texttt{distill} 関数が $\sim35p^3$ の抑圧則として与え、\texttt{hybrid\_ftqc\_runtime.py} が \texttt{\_estimate\_magic\_error} 経由でサンプルします。
+\end{itemize}
+
+\begin{lstlisting}[language=Python, caption={魔法状態誤り率は t\_gate.py の蒸留モデルから推定される（\codepath{src/stages/02_circuit_level/src/ftqc/hybrid_ftqc_runtime.py}）}]
+def _estimate_magic_error(self) -> float:
+    ...
+    from t_gate import build_15to1, distill  # type: ignore
+    ...
+    _, p_magic = distill(HX, HZ, self.p_phys, shots=self.magic_distillation_shots, seed=self.seed)
+    return float(p_magic)
+\end{lstlisting}
+
+この 2 系統は、それぞれ独立な確率変数としてランタイムに現れます。
+QEC 残差は LS-T シェルの \texttt{decode\_shell} が回路レベル雑音 $p$ から決定するのに対し、magic fault は蒸留モデルが別の入力（蒸留段数・postselect の成否）から決定します。
+どちらも $D$ 側の論理状態に影響を与えますが、その発生源（回路の物理雑音／魔法状態の準備品質）と決定するコードパス（\texttt{ls\_handoff\_shells.py}／\texttt{t\_gate.py}）が完全に分かれているという意味で、本実装ではこの 2 つを\textbf{直交した誤りモデル}として扱っています。
+
+\subsection{この段階で確認できる範囲と、後段で強化される点}
+
+現時点で機械的に確認できているのは次の 2 点です。
+
+\begin{itemize}
+  \item LS-T シェルは gauge 検出器ゼロ・$\mathrm{shortest\_graphlike\_error}=3$ を、$S$ 補正の有無にかかわらず満たす（本章第18.3節）。
+  \item 魔法状態誤り率 $p_{\text{magic}}$ は \texttt{t\_gate.py} の蒸留モデルから独立に推定され、LS-T シェルの回路には混入しない。
+\end{itemize}
+
+一方で、この段階の観測量は data の $Z_L$（$X_L$ 故障チャネル）1 本に限られており、真の $\ket{A_L}$ を反映した $X_L$ 側の残差（テレポーテーションで魔法状態から data へ移る誤りの直接的な写像）を回路レベルでデコードしてはいません。
+この直交性は本書のモデル仮定です。$X_L$ チャネルを独立に実デコードして確認した結果としては扱いません。
+本章の段階では、その強化はまだ行われていない、という点を明示しておきます。
+
+\section{やること・スコープ外}\label{sec:ls_t_scope}
+
+\subsection{やること}
+
+\begin{itemize}
+  \item 4 パッチ（$D,A_1,M,A_s$）で LS-T injection の Clifford 骨格を回路レベルで構築する。
+  \item $M_{ZZ}(D,A_1)+M_{XX}(A_1,M)+M_{ZZ}(D,A_s)$ の連鎖を、第16章の LS-CNOT 実装の継承として実現する。
+  \item data 残差（$Z_L(D)$、$X_L$ 故障チャネル）を観測量とし、gauge 検出器ゼロ・距離 3 を検証する。
+  \item magic fault（蒸留モデル）と QEC 残差（回路レベル雑音）を独立なモデルとして分離することを明示する。
+\end{itemize}
+
+\subsection{スコープ外}
+
+\begin{itemize}
+  \item 魔法状態 $\ket{A_L}$ そのものの非スタビライザ的な性質を回路レベルで表現すること（Stim の原理的な限界）。
+  \item 測定値 $m$ に応じた条件付き $S$ 補正の分岐（本章では常時 on の近似で代用、条件分岐はランタイム・第19章側）。
+  \item $X_L$ チャネル（真の magic fault の写像先）の回路レベル実デコードによる、直交性仮定の検証（本書の対象外）。
+  \item シェル API の整理・\texttt{decode\_shell} の詳細・隠蔽フラグの教訓（第19章）。
+\end{itemize}
+
+\section{まとめ}\label{ch18:summary}
+
+\begin{itemize}
+  \item LS-T injection は、data($D$)・CNOT 用補助($A_1$)・魔法状態受け皿($M$)・$S$ 補正用補助($A_s$)の 4 パッチで構成されます。
+  \item $M_{ZZ}(D,A_1)+M_{XX}(A_1,M)$ が CNOT を、$M_{ZZ}(D,A_s)$ が $S$ 補正を測定ベースで実現し、いずれも第16章の \texttt{LSCnotFT} の検出器構築を継承します。
+  \item 観測量は data の $Z_L$（$X_L$ 故障チャネル）のみとし、gauge 検出器ゼロ・$\mathrm{shortest\_graphlike\_error}=3$ を $S$ 補正の有無にかかわらず確認しました。
+  \item 魔法状態そのものの品質（\texttt{t\_gate.py} の蒸留モデル）と、回路レベル QEC 雑音（LS-T シェル）は、発生源とコードパスが分かれた直交する誤りモデルとして扱われています。
+  \item この段階で確認できるのは QEC 残差側の距離・決定論性のみであり、$X_L$ チャネルの実デコードによる直交性の検証は後段で強化されます。
+\end{itemize}
+
+\subsection*{合否基準での検証}
+
+\begin{itemize}
+  \item ノイズなし（\texttt{noise=False}）で全検出器が決定論的（gauge 検出器数 $=0$）であることを、$S$ 補正の有無それぞれで確認しました。
+  \item ノイズあり回路の検出器誤りモデルから求めた $\mathrm{shortest\_graphlike\_error}$ が 3（パッチ距離）と一致することを確認しました。
+  \item いずれの確認も \texttt{allow\_gauge\_detectors} を使わずに行っています。
+\end{itemize}
+
+次章では、本章の \texttt{build\_ls\_t\_injection\_shell} を含む LS-S / LS-CNOT / LS-T のシェル API と \texttt{decode\_shell}、および壊れたシェルを残差ゼロで隠さないための優劣（\texttt{optional}／\texttt{required}）の教訓を整理します。
+
+\begin{exercise}
+  \begin{enumerate}
+    \item \texttt{LSTeleportFT} が $A_1$ と $A_s$ を $D$ の対辺（上下）に配置している理由を、第17章の後ろ向き閉包検出器の議論と結び付けて説明しなさい。
+    \item \texttt{with\_s=False} と \texttt{with\_s=True} で、データ量子ビット総数がそれぞれ 27 個・36 個になることを、パッチ数と 1 パッチあたりの物理量子ビット数（3\texttimes3）から確かめなさい。
+    \item 観測量に魔法パッチ $M$ の $Z$ 読み出しを含めない理由を、$M$ の初期化基底との関係で説明しなさい。
+    \item 本章で言う「magic fault と QEC 残差の直交性」とは何を指しているか、それぞれの誤りがどのコード（\texttt{t\_gate.py} と \texttt{ls\_handoff\_shells.py}）で決定されるかを踏まえて説明しなさい。またこの段階で未検証な点を 1 つ挙げなさい。
+  \end{enumerate}
+\end{exercise}

@@ -1,0 +1,243 @@
+% Stage: 02 ／ 説明用コード: src/stages/02\_circuit\_level/src/ftqc
+\chapter{回路レベル Shell API}\label{ch:shells}
+
+\begin{chaptergoal}
+  \begin{itemize}
+  \item \texttt{build\_ls\_s\_shell} / \texttt{build\_ls\_cnot\_shell} / \texttt{build\_ls\_t\_injection\_shell} が返す \texttt{ShellCircuit} の役割と、それぞれが第15・16・18章のどの構成に対応するかを整理します。
+  \item \texttt{decode\_shell} が MWPM を第一候補、BP+OSD をフォールバックとして使い分ける理由と、\texttt{allow\_gauge\_detectors} を一切使わない正しさのガードを理解します。
+  \item \texttt{allow\_gauge\_detectors=True} と \texttt{qec\_mode="optional"} という 2 つの「隠蔽フラグ」が、壊れたシェルを残差ゼロに見せてしまう危険を具体的に確認します。
+  \item 第 IV 部（Stage 02）の到達点を確認し、読了マーカー 02 を宣言します。
+  \item 第 V 部（Stage 03, \codepath{src/ftqc/}）で \texttt{ls\_handoff\_shells.py} がどの位置に組み込まれるかを見通します。
+  \end{itemize}
+\end{chaptergoal}
+
+第14章から第18章にかけて、私たちは MPP による論理レベルの格子手術シェル（\texttt{lattice\_surgery.py}）を出発点に、ancilla ベースのシンドローム抽出を使う回路レベルの格子手術（\texttt{circuit\_level\_merge.py}、\texttt{ls\_cnot\_ft.py}）を組み上げ、途中で距離 2 に崩れたバグを距離 3 へ直し（第17章）、T テレポーテーションの格子手術実装（第18章）まで到達しました。
+本章はこれらを\textbf{シェル API}という 1 つの窓口にまとめ、外側のランタイム（\texttt{hybrid\_ftqc\_runtime.py}）から見たときの契約を整理します。
+具体的には \codepath{src/stages/02_circuit_level/src/ftqc/ls_handoff_shells.py} を読み、シェルの構築・復号・失敗時の扱いという 3 つの観点から第 IV 部を総括します。
+最後に、この API が第 V 部（Stage 03, \codepath{src/ftqc/}）の統合シミュレータでどのように使われるかへ橋渡しします。
+
+\begin{notebox}
+  Stage: \textbf{02}。
+  説明用コードは主に \codepath{src/stages/02_circuit_level/src/ftqc/} を用います。
+  引用するコードは \codepath{src/stages/02_circuit_level/src/ftqc/ls_handoff_shells.py} と \codepath{src/stages/02_circuit_level/src/ftqc/hybrid_ftqc_runtime.py} で、関数名・パスは実装と一致させています。
+\end{notebox}
+
+\section{シェル API}\label{sec:shell_api}
+
+\subsection{ShellCircuit という統一インターフェース}
+
+\texttt{ls\_handoff\_shells.py} は、第15・16・18章で作った 3 種類の格子手術ハンドオフ（LS-S、LS CNOT、LS-T テレポーテーション）を、すべて同じ形のデータクラスで返すように整理しています。
+
+\begin{lstlisting}[caption={ShellCircuit と ShellDecodeResult（src/stages/02\_circuit\_level/src/ftqc/ls\_handoff\_shells.py）}]
+@dataclass
+class ShellCircuit:
+    """Detector-bearing Stim circuit for a single handoff point."""
+    circuit: object
+    observable_to_logical: List[int]
+    kind: str
+    note: str
+
+
+@dataclass
+class ShellDecodeResult:
+    """Decoded residual logical flip rates from a ShellCircuit."""
+    residuals: np.ndarray
+    decoder: str
+    note: str
+\end{lstlisting}
+
+\texttt{circuit} は検出器とオブザーバブルを備えた \texttt{stim.Circuit} そのもの、\texttt{observable\_to\_logical} はシェル内のオブザーバブル番号を論理量子ビット番号へ写す表、\texttt{note} は後で読める形の自由記述（パラメータや検証済みの性質を文字列で残します）です。
+この統一形式のおかげで、呼び出し側（ランタイム）はシェルの内部実装（マージの回数やパッチ配置）を知らずに、「オブザーバブル 0 は論理量子ビット何番か」だけを見て残差を合成できます。
+
+\subsection{3 つのビルダ}
+
+3 つのビルダはいずれも、前章までで検証済みの回路レベル構成を呼び出すだけの薄いラッパーです。
+
+\begin{itemize}
+  \item \texttt{build\_ls\_s\_shell}：\texttt{circuit\_level\_merge.CircuitLevelMerge("ZZ")}（第15章）を呼び、データパッチとアンシラパッチの $M_{ZZ}$ マージを構築します。オブザーバブル 0 はデータパッチの $Z_L$ で、LS-S ハンドオフによる $X_L$ 残差を捉えます。
+  \item \texttt{build\_ls\_cnot\_shell}：\texttt{ls\_cnot\_ft.LSCnotFT}（第16章）を呼び、制御・アンシラ・対象の 3 パッチによる $M_{ZZ}+M_{XX}$ 構成を組みます。オブザーバブル 0 は制御 $Z_L$、オブザーバブル 1 はフレーム補正済みの対象 $Z_L$（$Z_L(T)\oplus m_{zz}\oplus m_{anc}$）です。
+  \item \texttt{build\_ls\_t\_injection\_shell}：\texttt{ls\_cnot\_ft.LSTeleportFT}（第18章）を呼び、$M_{ZZ}+M_{XX}$（＋\texttt{include\_s\_correction\_shell=True} なら $S$ 補正の $M_{ZZ}$）というゲートテレポーテーションの骨格を構築します。真の非スタビライザ状態 $\ket{A_L}$ の物理は状態ベクトル層（\texttt{t\_gate.py}）が別途担い、ここで作るのは QEC の骨格だけです。
+\end{itemize}
+
+依存関係を図示すると次のようになります。
+
+\begin{lstlisting}[language={}, caption={ls\_handoff\_shells.py の依存（src/stages/02\_circuit\_level/README.md に対応）}]
+ls_handoff_shells.py
+  |-- build_ls_s_shell          -> circuit\_level_merge.CircuitLevelMerge("ZZ")
+  |-- build_ls_cnot_shell       -> ls_cnot_ft.LSCnotFT
+  `-- build_ls_t_injection_shell -> ls_cnot_ft.LSTeleportFT
+\end{lstlisting}
+
+いずれのビルダも、返り値の \texttt{note} に「\texttt{shortest\_graphlike\_error=3}」「gauge 検出器ゼロ」といった、前章までに検証済みの性質を文字列として明記しています。
+これは単なるコメントではなく、後述する \texttt{decode\_shell} の前提（第19.2節）が実際に成り立っていることを、シェルを作った側が自己申告する仕組みでもあります。
+
+\section{decode\_shell と allow\_gauge\_detectors ガード}\label{sec:decode_shell}
+
+\texttt{decode\_shell} は、\texttt{ShellCircuit} を受け取ってサンプリングと復号を行い、\texttt{ShellDecodeResult} を返す関数です。
+
+\begin{lstlisting}[caption={decode\_shell（src/stages/02\_circuit\_level/src/ftqc/ls\_handoff\_shells.py）}]
+def decode_shell(shell: ShellCircuit, shots: int = 1000) -> ShellDecodeResult:
+    import pymatching  # type: ignore
+
+    circ = shell.circuit
+    det, obs = circ.compile_detector_sampler().sample(
+        shots, separate_observables=True)
+    try:
+        dem = circ.detector_error_model(decompose_errors=True)
+        matcher = pymatching.Matching.from_detector_error_model(dem)
+        pred = matcher.decode_batch(det)
+        decoder = "MWPM"
+    except ValueError:
+        from stimbposd import BPOSD  # type: ignore
+        dem = circ.detector_error_model(decompose_errors=False)
+        pred = BPOSD(dem, max_bp_iters=40).decode_batch(det)
+        decoder = "BP+OSD"
+    residuals = (obs ^ pred).astype(np.uint8)
+    if residuals.ndim == 1:
+        residuals = residuals.reshape((shots, 1))
+    return ShellDecodeResult(residuals=residuals, decoder=decoder, note=shell.note)
+\end{lstlisting}
+
+読み方は次のとおりです。
+
+\begin{itemize}
+  \item まず \texttt{decompose\_errors=True} で検出器誤りモデル（DEM）を組み、MWPM（\texttt{pymatching}）で復号します。これは graphlike な検出器誤りモデルを前提とした最短経路マッチングです。
+  \item DEM が graphlike に分解できない場合、\texttt{detector\_error\_model} は \texttt{ValueError} を投げます。この場合のみ \texttt{decompose\_errors=False} で DEM を組み直し、BP+OSD（\texttt{stimbposd.BPOSD}）にフォールバックします。第16・18章で見た多パッチ構成のように、誤りの分解が単純な辺に収まらない場合の受け皿です。
+  \item \textbf{どちらの経路でも \texttt{allow\_gauge\_detectors} は一度も使いません。} 関数のドキュメント文字列にもあるとおり、「ノイズなし回路の検出器がすべて決定論的である」ことをシェル側（第19.1節の 3 ビルダ）が保証している前提に立ち、その前提が崩れて \texttt{detector\_error\_model} が非決定論的検出器エラーを投げたなら、それは復号アルゴリズムの問題ではなくシェルが壊れている（malformed）ことを示す信号として、そのまま呼び出し元に伝播させます。
+\end{itemize}
+
+\begin{notebox}
+  この Stage 02 の \texttt{decode\_shell(shell, shots=1000)} には \texttt{seed} 引数がありません。
+  そのため \texttt{compile\_detector\_sampler()} の乱数は呼び出しごとに独立で、\texttt{\_common.md} が合否基準として挙げる「\texttt{seed} 再現性」はこの段階ではまだ保証されていません。
+  第20章以降で扱う公開 Stage 03 の \codepath{src/ftqc/ls_handoff_shells.py} では \texttt{decode\_shell(shell, shots=1000, seed=None)} として \texttt{compile\_detector\_sampler(seed=seed)} に渡す形へ強化されます。
+  これは Stage 02 のこの時点で確認できる範囲を超える改善なので、ここでは「まだ入っていない」という事実だけを押さえておきます。
+\end{notebox}
+
+\section{隠蔽フラグの教訓}\label{sec:flag_lesson}
+
+第17章のケーススタディでは「距離 2 のバグを距離 3 に直す」という結果だけを扱いました。
+本節では、そのバグがなぜ長く見過ごされたのかという\textbf{手順上の教訓}を、コードに残った記録から確認します。
+教訓は 2 つあり、どちらも「エラーを握りつぶすフラグが、壊れたシェルを『残差ゼロ』という一見正常な結果に見せてしまう」という同じ形をしています。
+
+\subsection{教訓その1：allow\_gauge\_detectors=True で距離崩壊を隠す}
+
+回路レベル格子手術の初期実装 \texttt{circuit\_level\_ls.py} は、現在は非推奨（deprecated）として関数を呼ぶと例外を出すだけのファイルに置き換えられていますが、そのモジュール docstring が教訓をそのまま記録しています。
+
+\begin{lstlisting}[language={}, caption={src/stages/02\_circuit\_level/src/ftqc/circuit\_level\_ls.py（非推奨化された旧実装の docstring より抜粋）}]
+このモジュールは回路レベル lattice surgery (LS CNOT / LS S) の初期実装でしたが、
+検出器則が split<->merge 遷移の _compose_in (GF2 span) 合成を取りこぼすため、
+ノイズなしでも非決定論的検出器が残り、決定論性が崩れていました。当時はそれを
+detector_error_model(..., allow_gauge_detectors=True) で隠して動かしていました
+が、これは距離計算を壊し論理エラー率を不正に押し上げる「隠蔽」であり、修正では
+ありません (allow_gauge_detectors は非決定論検出器を情報なしとして捨てるため、
+seam 角で距離が崩壊する)。
+\end{lstlisting}
+
+\texttt{allow\_gauge\_detectors=True} は、本来「非決定論的な検出器（gauge 検出器）が存在することを知っている上で、それを情報なしとして扱ってよい」という高度な用途向けの許可フラグです。
+しかし split と merge の遷移で本来閉じるべき検出器則を実装が取りこぼしていたケースでは、この許可フラグが単なる\textbf{もみ消し}として使われてしまいました。
+DEM は一応組めて \texttt{decode\_shell} も走りますが、seam の角で距離が実際には縮んでいるため、報告される論理エラー率は不当に高く、しかもその原因は見た目からは分かりません。
+第17章で見た「距離 2 バグを距離 3 に直す」修正の核心は、まさにこの許可フラグを使わずに、\texttt{ls\_cnot\_ft.py} 側で merge→split の閉包検出器を正しく追加したことにあります。
+現行の \texttt{decode\_shell}（第19.2節）が \texttt{allow\_gauge\_detectors} を一度も使わないのは、この失敗を再発させないための直接の結果です。
+
+\subsection{教訓その2：qec\_mode="optional" が例外を丸ごと吸収するリスク}
+
+もう一つの隠蔽は、シェルの外側、ランタイム \texttt{hybrid\_ftqc\_runtime.py} の \texttt{qec\_mode} にあります。
+
+\begin{lstlisting}[caption={qec\_mode によるガード（src/stages/02\_circuit\_level/src/ftqc/hybrid\_ftqc\_runtime.py）}]
+def zero_qec_sample(note: str) -> Tuple[np.ndarray, str, Optional[np.ndarray], str]:
+    x0 = np.zeros((shots, self.n), dtype=np.uint8)
+    return x0, "skipped", None, note
+
+def guarded_qec_sample(chunk, kind_note):
+    if self.qec_mode == "off":
+        return zero_qec_sample("qec_mode=off; no Stim sampling performed")
+    try:
+        return self._sample_qec_residuals(chunk, shots, rng)
+    except Exception as exc:
+        if self.qec_mode == "required":
+            raise
+        return zero_qec_sample(
+            f"qec_mode=optional; Stim QEC skipped for {kind_note}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+\end{lstlisting}
+
+\texttt{qec\_mode="required"} なら例外はそのまま再送出されますが、\texttt{qec\_mode="optional"} は \texttt{except Exception as exc} で\textbf{種類を問わずすべての例外}を捕まえ、残差ゼロの \texttt{skipped} 結果に置き換えます。
+これは Stim や PyMatching が未インストールの環境でもデモが動くようにするための配慮ですが、同時に「シェルが壊れていて \texttt{decode\_shell} が \texttt{ValueError} を投げた」場合まで、同じ経路で残差ゼロに変換してしまうという副作用を持ちます。
+\texttt{note} 文字列には理由が記録されるため完全な無音ではありませんが、\texttt{note} を見ない限り「壊れたシェル」と「依存が入っていないだけ」を区別できません。
+
+この危険性は \codepath{src/ftqc/hybrid_ftqc_runtime.py} で明示的に修正されます。
+公開 Stage 03 の \texttt{guarded\_qec\_sample} も現在は \texttt{except Exception} で例外の種類を区別せず、\texttt{qec\_mode="optional"} では残差ゼロに置き換えます。したがってこの注意は Stage 03 にも当てはまり、依存欠如とシェル異常の識別は公開 snapshot の未解決課題です。
+
+\begin{quote}
+「壊れたシェル → 残差ゼロ → 見かけ上完璧な論理量子ビット」という最も気づきにくい失敗モードを塞ぐ。
+\end{quote}
+
+Stage 02 と公開 Stage 03 の双方でこの区別が実装されていないことを押さえる必要があります。
+\texttt{qec\_mode} という「\texttt{optional} と \texttt{required}」の切り分け自体は正しい設計判断ですが、\textbf{何を optional として許すか}を絞り込まなければ、フラグそのものが第2の隠蔽経路になり得ます。
+\texttt{decode\_shell} が \texttt{allow\_gauge\_detectors} を使わないという設計（教訓その1）と、\texttt{qec\_mode} が例外の種類を区別すべきという設計（教訓その2）は、根が同じです。すなわち\textbf{「壊れている」と「意図的にスキップした」を、システムのどの層でも混同しない}という思想です。
+
+\section{Stage 02 の到達点}\label{sec:stage_b_marker}
+
+第14章から本章まで、私たちは次を積み上げてきました。
+
+\begin{itemize}
+  \item 第14章：MPP による論理レベル抽出と、ancilla ベースの回路レベル抽出の違い、hook 誤りが生じる理由。
+  \item 第15章：\texttt{circuit\_level\_merge.py} による FT な CX スケジュールと、gauge 検出器ゼロ・距離 3 の格子手術マージ。
+  \item 第16章：\texttt{ls\_cnot\_ft.py} による $M_{ZZ}+M_{XX}$ の格子手術 CNOT、フレーム補正観測量、真理値表の一致。
+  \item 第17章：merge→split の閉包検出器を欠いたことで距離が 2 に崩れたバグを見つけ、距離 3 に直したケーススタディ。
+  \item 第18章：\texttt{LSTeleportFT} による T テレポーテーションの格子手術実装と、magic 忠実度誤りと QEC 残差の直交性。
+  \item 第19章（本章）：以上を \texttt{ls\_handoff\_shells.py} の \texttt{ShellCircuit} / \texttt{decode\_shell} という統一 API にまとめ、2 つの隠蔽フラグの教訓を定着させた。
+\end{itemize}
+
+\codepath{src/stages/02_circuit_level/src/ftqc/ls_handoff_shells.py} の \texttt{demo()} 関数は、この到達点を smoke test の形で確認します。
+3 つのシェルそれぞれについて、ノイズなし回路の gauge 検出器数（\texttt{clean.circuit.compile\_detector\_sampler().sample(...)} で全 shot 中に発火した検出器数）が 0 であること、ノイズあり回路が \texttt{allow\_gauge\_detectors} なしで \texttt{detector\_error\_model} を組めること（DEM OK）、そして \texttt{shortest\_graphlike\_error()} の長さが 3 であることを、まとめて表示します。
+
+Stage 02 のこの実装には、次の限界があります。
+
+\begin{itemize}
+  \item \texttt{qec\_mode="optional"} の例外区別が未実装（本章第19.3節）。
+  \item \texttt{decode\_shell} に \texttt{seed} 引数がなく、再現性が保証されない（本章第19.2節）。
+  \item 論理演算子はまだ手動で組んだ 3 パッチ構成に限られ、任意サイズの統合ランタイムには組み込まれていない。
+\end{itemize}
+
+これらの注意点は第 V 部（Stage 03）の実装にも残るため、付録Cで限界として再掲します。
+
+\textbf{読了マーカー 02}：ここまでで、回路レベルの格子手術ハンドオフを検出器ゼロ・距離 3 で構築し、統一されたシェル API 経由で復号できる状態に到達しました。
+
+\section{まとめ}\label{ch19:summary}
+
+\begin{itemize}
+  \item \texttt{ShellCircuit} は \texttt{circuit}・\texttt{observable\_to\_logical}・\texttt{kind}・\texttt{note} を持つ統一データクラスで、LS-S・LS CNOT・LS-T の 3 つのビルダがこの形で回路を返します。
+  \item \texttt{decode\_shell} は MWPM を第一候補、BP+OSD をフォールバックとして使い、\texttt{allow\_gauge\_detectors} を一度も使わないことで「壊れたシェル」を例外としてそのまま表に出します。
+  \item \texttt{allow\_gauge\_detectors=True}（旧 \texttt{circuit\_level\_ls.py}）と \texttt{qec\_mode="optional"} の広い \texttt{except Exception}（\codepath{src/stages/02_circuit_level/src/ftqc/hybrid_ftqc_runtime.py}）は、どちらも「壊れたシェルを残差ゼロに見せる」隠蔽フラグになり得ます。前者は第17章で修正済み、後者は Stage 02 の時点では未修正で、第20章以降で扱う Stage 03 の \codepath{src/ftqc} では、依存欠如とシェル異常を区別するガードが導入されています。
+  \item Stage 02（第14〜19章）で、ancilla ベースの回路レベル格子手術が gauge 検出器ゼロ・距離 3 で組めることを確認しました。
+\end{itemize}
+
+\subsection*{合否基準での検証}
+
+本章の時点で機械的に確認できるのは次の範囲です。
+
+\begin{itemize}
+  \item \texttt{demo()} が示す、3 シェルすべての\textbf{ノイズなし gauge 検出器数 = 0}。
+  \item \texttt{detector\_error\_model(decompose\_errors=True, allow\_gauge\_detectors=False)} が例外なく組めること（DEM OK）。前者は graphlike 分解、後者は非決定論的 detector の拒否を指定する独立した引数である。
+  \item \texttt{shortest\_graphlike\_error()} の長さが符号距離 $d=3$ に一致すること。
+\end{itemize}
+
+本章と公開 Stage 03 の双方で、次の 2 点は未達です。
+
+\begin{itemize}
+  \item malformed なシェル（非決定論的検出器を持つ壊れた回路）を渡したとき、\texttt{qec\_mode="optional"} で例外を握りつぶさないこと。Stage 02 と Stage 03 のガードはいずれも例外の種類を区別しません。
+  \item \texttt{decode\_shell} の \texttt{seed} による再現性。
+\end{itemize}
+
+次章では、公開 Stage 03 のモジュールが \codepath{src/ftqc/} でどのように統合されるかを見ます。
+
+\begin{exercise}
+  \begin{enumerate}
+    \item \texttt{build\_ls\_s\_shell}・\texttt{build\_ls\_cnot\_shell}・\texttt{build\_ls\_t\_injection\_shell} それぞれが内部で呼び出す関数名と、その関数が対応する章（第15・16・18章）を対応表として書きなさい。
+    \item \texttt{decode\_shell} が \texttt{ValueError} を捕まえて BP+OSD へフォールバックする条件と、\texttt{allow\_gauge\_detectors} を使わないことで意図的に\textbf{捕まえない}例外（非決定論的検出器エラー）の違いを説明しなさい。
+    \item \texttt{qec\_mode="optional"} の \texttt{guarded\_qec\_sample} が「依存欠如」と「malformed シェル」のどちらの例外も同じ経路で残差ゼロに変換してしまう理由をコードから指摘し、\codepath{src/ftqc/hybrid_ftqc_runtime.py} の \texttt{\_missing\_dep} がこれをどう区別するかを述べなさい。
+    \item 第17章のケーススタディにおいて \texttt{allow\_gauge\_detectors=True} がなぜ「修正ではなく隠蔽」だったのかを、gauge 検出器の意味（情報なしとして捨てられる非決定論的検出器）に立ち返って説明しなさい。
+  \end{enumerate}
+\end{exercise}

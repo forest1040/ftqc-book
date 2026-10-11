@@ -1,0 +1,253 @@
+% Stage: 03 ／ 説明用コード: src/ftqc
+\chapter{状態ベクトルバックエンドと tsim}\label{ch:backends_tsim}
+
+\begin{chaptergoal}
+  \begin{itemize}
+  \item \texttt{make\_backend} によるバックエンド抽象と、全バックエンドが満たす共通インターフェースを理解します。
+  \item \texttt{NumpyStateBackend} と \texttt{QulacsStateBackend} の用途の違いと、両者のビット順の対応関係を理解します。
+  \item \texttt{TsimStateBackend} と \texttt{run\_tsim} が、試作アダプタとしてランタイムへどう接続されるかを理解します。
+  \item バックエンドを選ぶ際の指針と、選択が結果に影響しないことを確かめる回帰の考え方を理解します。
+  \end{itemize}
+\end{chaptergoal}
+
+前章では、\texttt{HybridFTQCRuntime.run()} がイベント列を 1 ショットずつ再生し、Stim のシェルから得た残差をパウリフレームとして論理状態へ注入する流れを見ました。
+その再生のたびに呼ばれていたのが \texttt{make\_backend(n, backend)} です。
+本章では、通常の \texttt{HybridFTQCRuntime} が使う NumPy／Qulacs 状態ベクトルを説明し、別モジュールの \texttt{tsim} 試作アダプタとの接続方法を確認します。
+可視化やレポート出力は次章の主題であり、本章はバックエンドのコードパスを追うことに専念します。
+
+\begin{notebox}
+  Stage: \textbf{03}。
+  説明用コードは主に \codepath{src/ftqc/hybrid_ftqc_runtime.py} と \codepath{src/ftqc/ftqc_tsim_backend.py} を用います。
+\end{notebox}
+
+\section{バックエンド抽象}\label{sec:backend_abs}
+
+\subsection{make\_backend}
+
+\texttt{HybridFTQCRuntime.run()} は、ショットごとに次の 1 行でその場限りの論理状態バックエンドを生成します。
+
+\begin{lstlisting}[language=Python, caption={バックエンド生成の呼び出し箇所（src/ftqc/hybrid\_ftqc\_runtime.py）}]
+for sidx in range(shots):
+    state = make_backend(self.n, self.backend_name)
+    backend_used = state.name
+    ...
+\end{lstlisting}
+
+\texttt{make\_backend(n, backend)} は文字列 \texttt{backend} を正規化し（大文字化・ハイフンをアンダースコアへ）、対応するバックエンドを 1 個返す小さな工場関数です。
+
+\begin{lstlisting}[language=Python, caption={make\_backend の分岐（src/ftqc/hybrid\_ftqc\_runtime.py）}]
+def make_backend(n: int, backend: str = "auto"):
+    backend = backend.lower().replace("-", "_")
+    if backend == "numpy":
+        return NumpyStateBackend(n)
+    if backend == "stim":
+        return StimCliffordBackend(n)
+    if backend in ("stim_auto", "auto_stim"):
+        try:
+            return StimCliffordBackend(n)
+        except Exception:
+            return NumpyStateBackend(n)
+    if backend in ("auto", "qulacs"):
+        try:
+            return QulacsStateBackend(n)
+        except Exception:
+            if backend == "qulacs":
+                raise
+            return NumpyStateBackend(n)
+    raise ValueError("backend must be auto, qulacs, numpy, stim, or stim_auto")
+\end{lstlisting}
+
+\texttt{"auto"} は Qulacs があればそれを使い、輸入に失敗すれば NumPy へ静かに降格します（\texttt{qulacs} を明示指定した場合は降格せず例外を再送します）。
+\texttt{"stim"} と \texttt{"stim\_auto"} は \texttt{StimCliffordBackend}（クリフォード限定、\texttt{nonclifford\_mode="qpd"} 用）へ振り分けますが、これは本章のスコープ外です。
+通常の runtime は \texttt{numpy}／\texttt{qulacs}（または Clifford 用 Stim）を使います。\texttt{tsim} は通常の \texttt{make\_backend} 分岐ではありません。\texttt{run\_tsim} が一時的なアダプタとして接続します。
+
+\subsection{共通インターフェース}
+
+状態バックエンド（\codeinline{NumpyStateBackend}、\codeinline{QulacsStateBackend}、アダプタ経由の \codeinline{TsimStateBackend}）は、内部実装がまったく異なるにもかかわらず、\texttt{run()} から見ると同じ最小インターフェースを提供します。
+
+\begin{itemize}
+  \item \texttt{name}：バックエンドを識別する文字列属性（結果の \texttt{HybridRunResult.backend} に転記されます）。
+  \item \texttt{\_\_init\_\_(n)}：$n$ 論理量子ビットの $\ket{0}^{\otimes n}$ 相当の初期状態を用意します。
+  \item \texttt{copy()}：状態の独立な複製を返します（QPD 分岐など、状態を分岐させたい呼び出し元のために用意されています）。
+  \item \texttt{apply\_gate(name, a, b=None)}：正規化されたゲート名（\texttt{normalize\_gate\_name} 済み）を 1 個適用します。1 量子ビットゲートは \texttt{b=None}、\texttt{CNOT} は \texttt{a} が制御、\texttt{b} が対象です。
+  \item \texttt{vector()}：単一ショットの診断用に、状態ベクトルを返せるなら返します（\texttt{tsim} は明示的な状態ベクトルを持たないため \texttt{None} を返します）。
+  \item \texttt{sample\_z(rng)}：Z 基底で測定し、長さ $n$ のビット列タプルを返します。タプルの位置 $q$ は常に論理量子ビット $q$ の測定値に対応します。
+\end{itemize}
+
+最後の「タプルの位置 $q$ = 論理量子ビット $q$」という約束が、次節で見るビット順の注意の核心です。
+内部の振幅配列やサンプラの出力順は各バックエンドで異なっても、\texttt{sample\_z} が返すタプルの意味は 3 バックエンドで統一されています。
+
+\section{NumpyStateBackend / QulacsStateBackend}\label{sec:numpy_qulacs}
+
+\subsection{用途と性能}
+
+\texttt{NumpyStateBackend} は、$2^n$ 次元の複素配列を \texttt{numpy} だけで愚直に操作する最小実装です。1 量子ビットゲートは \texttt{np.tensordot}、CNOT は軸の反転で実装されており、外部依存がないためテストやドキュメントのフォールバックに向いています。
+一方で密行列適用は $n$ が増えるほど遅くなり、Qulacs のような専用ライブラリの最適化（ゲート適用のベクトル化、疎な更新則の利用）を持ちません。
+
+\texttt{QulacsStateBackend} は Qulacs の \texttt{QuantumState} / \texttt{QuantumCircuit} を薄くラップしたものです。$S^\dagger$・$T^\dagger$ も含めてすべて \texttt{DenseMatrix} ゲートとして適用しており、Qulacs 側の便利メソッド名の違いに依存しない実装になっています。
+
+\begin{lstlisting}[language=Python, caption={QulacsStateBackend の 1 量子ビットゲート適用（src/ftqc/hybrid\_ftqc\_runtime.py）}]
+def apply_1q(self, U: np.ndarray, q: int) -> None:
+    from qulacs import QuantumCircuit
+    from qulacs.gate import DenseMatrix
+    circ = QuantumCircuit(self.n)
+    circ.add_gate(DenseMatrix(q, U.tolist()))
+    circ.update_quantum_state(self.state)
+\end{lstlisting}
+
+論理量子ビット数 $n$ が本書の対象（数量子ビットの論理回路）程度であれば NumPy でも十分ですが、$n$ を増やして性能を確かめたい場合や、後の章で非クリフォード数を増やす実験をする場合には Qulacs 側の実装が実用的な選択になります。
+\texttt{make\_backend} の既定 \texttt{"auto"} が Qulacs を優先するのもこのためです。
+
+\subsection{ビット順の注意}
+
+2 つのバックエンドは、内部で使う振幅配列のビット順が異なります。
+
+\begin{itemize}
+  \item \texttt{NumpyStateBackend}：状態を \texttt{state.reshape([2]\*n)} という $n$ 階テンソルとして扱い、軸 $q$ が論理量子ビット $q$ に対応します。フラットな添字 \texttt{idx} で見ると、量子ビット $0$ が最上位ビット（MSB）です。
+  \item \texttt{QulacsStateBackend}：Qulacs が返す \texttt{get\_vector()} は、Qulacs 自身の規約により量子ビット $0$ が最下位ビット（LSB）です。
+\end{itemize}
+
+この違いをコード側で吸収しているのが、それぞれの \texttt{sample\_z} です。
+
+\begin{lstlisting}[language=Python, caption={ビット順を揃える sample\_z（src/ftqc/hybrid\_ftqc\_runtime.py）}]
+# NumpyStateBackend: qubit 0 = MSB
+def sample_z(self, rng: np.random.Generator) -> Tuple[int, ...]:
+    idx = int(rng.choice(len(self.state), p=self.probabilities_z()))
+    return tuple((idx >> (self.n - 1 - q)) & 1 for q in range(self.n))
+
+# QulacsStateBackend: qulacs は little-endian (qubit 0 = LSB)。
+# NumPy バックエンド (qubit 0 = MSB) とタプル順を揃えるため
+# bit q を qubit q に対応させる。
+def sample_z(self, rng: np.random.Generator) -> Tuple[int, ...]:
+    p = self.probabilities_z()
+    idx = int(rng.choice(len(p), p=p))
+    return tuple((idx >> q) & 1 for q in range(self.n))
+\end{lstlisting}
+
+どちらも内部の振幅添字からビットを取り出す式は違いますが、結果として返すタプルは「位置 $q$ = 論理量子ビット $q$ の測定値」という同じ意味になります。
+\texttt{apply\_gate} を通じてゲートを適用するだけであれば、呼び出し側（\texttt{run()}）はこの内部差を意識する必要はありません。
+ただし \texttt{vector()} を直接読んで振幅を解釈する場合（デバッグや単発ショットの診断）には、上記の MSB/LSB の違いを踏まえて添字を読む必要があります。
+
+\begin{warningbox}
+  \texttt{vector()} が返す配列を自分で読み解く独自コードを書く場合は、必ずどちらのビット順を仮定しているかを明示してください。
+  \texttt{sample\_z} のタプルだけを使う限り、この章の約束（位置 $q$ = 量子ビット $q$）が常に成り立ちます。
+\end{warningbox}
+
+\section{tsim バックエンド}\label{sec:tsim}
+
+\subsection{ftqc\_tsim\_backend.py}
+
+これまでの 2 バックエンドは、非クリフォードの $T$ ゲートを状態ベクトル層で直接適用していました（\texttt{nonclifford\_mode="statevector"}）。
+\codepath{src/ftqc/ftqc_tsim_backend.py} は、ZX スタビライザランク分解を用いる外部サンプラ \textbf{tsim} を呼ぶ \texttt{TsimStateBackend} と、runtime 用の \texttt{run\_tsim} ラッパーを提供します。
+
+\texttt{TsimStateBackend} は振幅を一切保持しません。代わりに \texttt{apply\_gate} で受け取ったゲートをテキスト回路として蓄積し、\texttt{sample\_z} の呼び出し時にまとめて \texttt{tsim.Circuit} をコンパイルし、そのネイティブサンプラに測定を委ねます。
+
+\begin{lstlisting}[language=Python, caption={TsimStateBackend の骨格（src/ftqc/ftqc\_tsim\_backend.py）}]
+class TsimStateBackend:
+    name = "tsim"
+
+    def __init__(self, n: int):
+        self.n = int(n)
+        self.gates: List[Tuple[str, int, Optional[int]]] = []
+
+    def apply_gate(self, name: str, a: int, b: Optional[int] = None) -> None:
+        from ftqc.hybrid_ftqc_runtime import normalize_gate_name
+        nm = normalize_gate_name(name)
+        if nm == "I":
+            return
+        tnm = _TSIM_NAME.get(nm, nm)
+        self.gates.append((tnm, int(a), None if b is None else int(b)))
+
+    def sample_z(self, rng: np.random.Generator) -> Tuple[int, ...]:
+        import tsim
+        tc = tsim.Circuit(self._circuit_text())
+        seed = int(rng.integers(0, 2 ** 31 - 1))
+        samp = np.asarray(tc.compile_sampler().sample(shots=_BATCH, seed=seed))
+        ...
+        return tuple(int(x) for x in row[:self.n])
+
+    def vector(self) -> Optional[np.ndarray]:
+        return None  # tsim はサンプラなので明示的な状態ベクトルは返さない
+\end{lstlisting}
+
+蓄積された回路の最後には \texttt{"M 0 1 ... n-1"} が付け加えられるので、\texttt{tsim} が返す測定行の列 $q$ はそのまま論理量子ビット $q$ に対応します。前節の MSB/LSB の変換が不要な理由はここにあります。
+また、$T$ ゲート数に対するコストはおよそ $2^{0.4T}$ のスタビライザランクで済み、QPD（第 IV 部）の $\gamma=\sqrt2$ 分岐オーバーヘッドも、状態ベクトルの指数メモリも要りません。
+
+\subsection{run\_tsim による接続}
+
+\texttt{run\_tsim} は runtime の \texttt{backend\_name} を一時的に \texttt{"tsim"} にし、\texttt{hybrid\_ftqc\_runtime.}\allowbreak\texttt{make\_backend} を差し替えて \texttt{TsimStateBackend} を返すようにします。runtime の \texttt{nonclifford\_mode} は \texttt{"statevector"} にして、$T$ ゲートを adapter に渡します。ラッパーは \texttt{try/finally} で工場関数と runtime 設定を元に戻します。これは Stage 03 の通常 API に \texttt{tsim} を追加したものではなく、依存する試作経路です。
+
+\begin{notebox}
+  \textbf{状態の復元}。この試作ラッパーは一時的にモジュール関数を置き換えるため、並列実行には向きません。\texttt{finally} で元の関数と設定へ戻すことを \texttt{tests/test\_runtime\_reproducibility.py} が確認します。
+\end{notebox}
+
+\subsection{依存関係と利用条件}
+
+\texttt{tsim} は本書の必須依存ではありません。\texttt{TsimStateBackend.apply\_gate} は回路をテキストとして蓄積するだけなので \texttt{tsim} を輸入せず、実際に \texttt{import tsim} が実行されるのは \texttt{sample\_z} が呼ばれた瞬間です。
+そのため、\texttt{tsim} が未導入なら \texttt{run\_tsim} 内のサンプリング時に import error になります。Stage 03 の通常環境では任意依存であり、\texttt{make\_backend} は \texttt{tsim} を選択肢として受け付けません。
+
+\section{選択指針と検証}\label{sec:backend_choice}
+
+3 バックエンドの選び方をまとめると次のようになります。
+
+\begin{itemize}
+  \item \textbf{numpy}：依存が最小で読みやすく、テストやドキュメント用の基準実装として使います。
+  \item \textbf{qulacs}（既定の \texttt{"auto"}）：日常的な数値実験で、$T$ を状態ベクトル層に直接適用したいときの実用的な選択です。
+  \item \textbf{tsim 試作}：専用の \texttt{run\_tsim} ラッパーから利用できます。通常 runtime の backend 選択では使えず、\texttt{tsim} の導入が必要です。
+\end{itemize}
+
+バックエンドの選択は、あくまで「同じ論理回路をどう計算するか」の実装上の選択であり、ノイズなし・QEC 残差なしの理想的な入力に対しては、どのバックエンドでも同じ論理分布が得られるべきです。
+これを確認する最小の回帰の考え方は、同一のゲート列に対して複数のバックエンドで理想分布を計算し、全変動距離（TVD）で比較することです。
+
+\begin{lstlisting}[language=Python, caption={バックエンド間の理想分布比較（src/ftqc/ftqc\_tsim\_backend.py の main() から要約）}]
+ideal = tb.z_distribution_from_gates(gates, n)              # statevector 側の理想分布
+tsim_log = tsim_logical_distribution(gates, n, shots=20000)  # tsim 側（QEC なし）
+print("TVD=%.4f" % _tvd(ideal, tsim_log))
+\end{lstlisting}
+
+ここで \texttt{\_tvd(p, q)} は $\mathrm{TVD}(p,q) = \tfrac12\sum_k \lvert p(k) - q(k) \rvert$ を計算する関数です。
+バックエンドを差し替えても TVD が十分小さいままであることは、「\texttt{apply\_gate}/\texttt{sample\_z} という共通インターフェースの意味が、実装をまたいで一致している」ことの直接的な確認になります。
+
+\section{やること・スコープ外}\label{ch23:scope}
+
+\subsection{やること}
+
+\begin{itemize}
+  \item \texttt{make\_backend} の分岐と、\texttt{numpy}／\texttt{qulacs}／\texttt{tsim} 3 バックエンドが満たす共通インターフェース（\texttt{apply\_gate}／\texttt{vector}／\texttt{sample\_z}）を説明する。
+  \item \texttt{NumpyStateBackend} と \texttt{QulacsStateBackend} のビット順（MSB/LSB）の違いと、\texttt{sample\_z} がそれをどう吸収しているかを示す。
+  \item \texttt{run\_tsim} が試作アダプタを接続し、実行後に元の状態へ戻す仕組みを説明する。
+  \item 複数バックエンドの理想分布を比較する回帰の考え方を示す。
+\end{itemize}
+
+\subsection{スコープ外}
+
+\begin{itemize}
+  \item \texttt{tsim} 本体（ZX スタビライザランク分解）の内部アルゴリズムの詳細。本書では \texttt{tsim} を外部のサンプラとして扱い、その計算量やアルゴリズムの導出には踏み込みません。
+  \item StimCliffordBackend と QPD を組み合わせた詳細（第22章）。
+  \item 可視化・レポート出力（\texttt{ftqc\_run\_visualizer.py} 等、第24章）。
+\end{itemize}
+
+\section{まとめ}\label{ch23:summary}
+
+\begin{itemize}
+  \item \texttt{make\_backend(n, backend)} は、\texttt{"numpy"}／\texttt{"qulacs"}（既定 \texttt{"auto"}）と Clifford 用 Stim バックエンドを生成します。\texttt{tsim} は通常の分岐ではありません。
+  \item 3 バックエンドはいずれも \texttt{apply\_gate}／\texttt{vector}／\texttt{sample\_z} という共通インターフェースを持ち、\texttt{sample\_z} が返すタプルの位置 $q$ は常に論理量子ビット $q$ の測定値です。
+  \item \texttt{NumpyStateBackend} は量子ビット $0$ を MSB、\texttt{QulacsStateBackend} は量子ビット $0$ を LSB として振幅を保持しますが、\texttt{sample\_z} の実装がこの差を吸収し、外側の \texttt{run()} には見えません。
+  \item \texttt{TsimStateBackend} は状態ベクトルを持たず、ゲートを蓄積して \texttt{sample\_z} で測定します。試作の \texttt{run\_tsim} は工場関数を一時的に差し替え、finally 節で復元します。
+  \item 複数バックエンドで同一入力の理想分布を比較し、TVD が小さいことを確かめれば、バックエンド選択が結果を変えていないことの回帰確認になります。
+\end{itemize}
+
+\subsection*{合否基準での検証}
+
+この試作経路では、実行中に \texttt{make\_backend} と runtime の設定を一時的に差し替えます。\texttt{tests/test\_runtime\_reproducibility.py} は実行後に元の工場関数と設定へ戻ることを検査し、\texttt{tests/test\_tsim\_ideal.py} は $H,T,H$ の理想分布と T/CNOT を含む Bell 相関を検査します。ここでの結果は試作アダプタの検査であり、通常の \texttt{HybridFTQCRuntime} が \texttt{tsim} を直接選択できることを意味しません。
+
+次章では、本章で見た \codeinline{HybridRunResult} や \codeinline{QECReport} などの中身を、\codeinline{ftqc_mapping_visualizer.py} や \codeinline{ftqc_run_visualizer.py} を使って図やレポートとして可視化します。
+
+\begin{exercise}
+  \begin{enumerate}
+    \item \texttt{make\_backend(2, "auto")} が実際に \texttt{QulacsStateBackend} を返すのはどの条件のときか、また Qulacs が輸入できない場合にどのバックエンドへ降格するかを、本章のコードを引用して説明しなさい。
+    \item $n=2$ の論理状態で、\texttt{NumpyStateBackend} の振幅添字 \texttt{idx=1}（2 進数で \texttt{01}）が、量子ビット $0,1$ のどの測定値の組に対応するかを、本章の \texttt{sample\_z} の式から求めなさい。同じ添字を \texttt{QulacsStateBackend} の \texttt{sample\_z} の式に当てはめた場合の対応と比較しなさい。
+    \item \texttt{TsimStateBackend.sample\_z} が \texttt{ImportError} を投げるのは \texttt{apply\_gate} を呼んだ時点ではなく、なぜ \texttt{sample\_z} を呼んだ時点なのかを、コードの該当箇所を示して説明しなさい。
+    \item \texttt{run\_tsim} が \texttt{make\_backend} を一時的に差し替える理由を説明し、この方式で並列実行時に注意が必要な理由を述べなさい。
+  \end{enumerate}
+\end{exercise}

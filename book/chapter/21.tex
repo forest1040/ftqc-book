@@ -1,0 +1,314 @@
+% Stage: 03 ／ 説明用コード: src/ftqc
+\chapter{命令計画とイベント分解}\label{ch:plan}
+
+\begin{chaptergoal}
+  \begin{itemize}
+  \item \texttt{HybridFTQCRuntime.plan} が論理回路を 3 種類のイベント（\texttt{CliffordChunk} / \texttt{SpecialGate} / \texttt{LSCnotEvent}）へ分解する手順を理解します。
+  \item \texttt{cnot\_mode} と \texttt{t\_qec\_mode} が、それぞれ CNOT と T ゲートの物理的な実現方法をどのように切り替えるかを理解します。
+  \item QPD（quasi-probability decomposition）関連フラグが T ゲートのイベント処理にどう影響するかを理解します。
+  \item \texttt{plan\_summary} と \texttt{QECReport} のログから、どのイベントがどのシェルで処理されたかを読み取れるようになります。
+  \end{itemize}
+\end{chaptergoal}
+
+第20章では、\codepath{src/ftqc/} の 7 ファイルが \texttt{HybridFTQCRuntime} を中心にどう依存し合うかを俯瞰しました。
+本章はその中枢である \texttt{plan} メソッドに立ち止まり、論理回路（Qulacs の量子回路、または \texttt{("H", 0, None)} のようなゲートタプル列）が、どのようにして 3 種類の\textbf{イベント}へ分解されるかを追います。
+イベントへの分解は、続く残差サンプリングとトラジェクトリ実行（第22章）の入力を確定させる、いわば命令計画の段階です。
+分解のされ方は固定ではなく、\texttt{cnot\_mode}・\texttt{t\_qec\_mode}・QPD 関連フラグという複数のモード切替によって変わります。
+どのイベントがどの物理シェルへルーティングされるかを正しく理解しておくことが、次章でトラジェクトリごとの残差注入を追うための前提になります。
+
+\begin{notebox}
+  Stage: \textbf{03}。
+  説明用コードは主に \codepath{src/ftqc/hybrid_ftqc_runtime.py} を用います。
+  実行ループ本体（トラジェクトリごとの状態ベクトル更新）は第22章で扱い、本章は \texttt{plan} が返すイベント列とモード切替に専念します。
+\end{notebox}
+
+\section{イベントへの分解}\label{sec:plan_events}
+
+\subsection{3 つのイベント型}
+
+\texttt{hybrid\_ftqc\_runtime.py} は、論理ゲート列を計画した結果として次の 3 種類のイベントを定義しています。
+
+\begin{lstlisting}[caption={イベント型の定義（src/ftqc/hybrid\_ftqc\_runtime.py）}]
+@dataclass
+class CliffordChunk:
+    gates: List[Gate]
+    label: str
+
+
+@dataclass
+class SpecialGate:
+    name: str
+    target: int
+    label: str
+
+
+@dataclass
+class LSCnotEvent:
+    """A logical CNOT routed through the circuit-level LS CNOT shell."""
+    control: int
+    target: int
+    label: str
+
+
+PlanEvent = Any
+\end{lstlisting}
+
+\begin{itemize}
+  \item \textbf{CliffordChunk}：\texttt{X, Y, Z, H, CNOT} からなる連続したゲート列をまとめて 1 つの物理 Stim 回路にコンパイルする単位です。ゲート集合は \texttt{CLIFFORD\_CHUNK\_GATES = \{"X", "Y", "Z", "H", "CNOT", "CX"\}} で定義されています。
+  \item \textbf{SpecialGate}：\texttt{S, SDG, T, T\_DAG} のように、Clifford チャンクへ折り込まずに単独のハンドオフとして扱うゲートです。
+  \item \textbf{LSCnotEvent}：\texttt{cnot\_mode="lattice\_surgery"} のときだけ生成される、CNOT を格子手術シェルへ単独で回すイベントです。
+\end{itemize}
+
+\texttt{PlanEvent} は型エイリアスに過ぎず、実体はこの 3 つのいずれかです。イベント列 \texttt{List[PlanEvent]} は \texttt{plan} メソッドが返します。
+
+\subsection{plan メソッドの本体}
+
+\texttt{plan} は、まず \texttt{parse\_qulacs\_or\_gate\_list} でゲート列を正規化したタプル列 \texttt{(name, a, b)} に揃え、その後 1 ゲートずつ走査しながらチャンクを積み上げます。
+
+\begin{lstlisting}[caption={plan メソッド（src/ftqc/hybrid\_ftqc\_runtime.py）}]
+def plan(self, qc_or_gates: Any) -> List[PlanEvent]:
+    gates = parse_qulacs_or_gate_list(qc_or_gates)
+    events: List[PlanEvent] = []
+    chunk: List[Gate] = []
+    chunk_id = 0
+
+    def flush(reason: str) -> None:
+        nonlocal chunk, chunk_id
+        if chunk:
+            events.append(CliffordChunk(gates=chunk, label=f"clifford_chunk_{chunk_id}_{reason}"))
+            chunk = []
+            chunk_id += 1
+
+    for gi, (name, a, b) in enumerate(gates):
+        name = normalize_gate_name(name)
+        if name in ("CNOT", "CX") and self.cnot_mode == "lattice_surgery":
+            flush(f"before_CNOT_{gi}")
+            events.append(LSCnotEvent(control=a, target=b, label=f"CNOT_{gi}"))
+        elif name in CLIFFORD_CHUNK_GATES:
+            chunk.append((name, a, b))
+        elif name in ("S", "SDG"):
+            flush(f"before_{name}_{gi}")
+            events.append(SpecialGate(name=name, target=a, label=f"{name}_{gi}"))
+        elif name in ("T", "T_DAG"):
+            flush(f"before_{name}_{gi}")
+            events.append(SpecialGate(name=name, target=a, label=f"{name}_{gi}"))
+        else:
+            raise ValueError(f"Unsupported gate in hybrid plan: {name}")
+    flush("tail")
+    return events
+\end{lstlisting}
+
+読み方のポイントは次の 3 点です。
+
+\begin{itemize}
+  \item \texttt{cnot\_mode="transversal"}（既定）では \texttt{CNOT/CX} も \texttt{CLIFFORD\_CHUNK\_GATES} に含まれるため、直前の \texttt{X, Y, Z, H} と同じ \texttt{CliffordChunk} に折り込まれ、後段で 1 つの物理 Stim 回路としてコンパイルされます。
+  \item \texttt{S, SDG, T, T\_DAG} に到達すると、その直前でチャンクを \texttt{flush} してから単独の \texttt{SpecialGate} を追加します。これは、非 Clifford なゲート（T/Tdag）と S 補正を、Clifford チャンクの物理コンパイルとは別の経路（状態ベクトル層または QPD 分岐）に切り出すためです。
+  \item \texttt{flush} は \texttt{chunk} が空でない場合にのみイベントを生成し、\texttt{chunk\_id} をインクリメントします。空のチャンクに対する \texttt{flush} 呼び出しは何もしません。したがって、ラベル中の連番は「実際にゲートを含んだチャンクの個数」に対応し、必ずしもゲート列中の位置（\texttt{gi}）と一致しません。
+\end{itemize}
+
+サポートされないゲート名（測定命令など）が来ると \texttt{ValueError} で即座に落ちます。\texttt{plan} は純粋な分解ロジックであり、乱数もサンプリングも行いません。同じ回路を渡せば毎回同じイベント列が得られます。
+このイベント分解と各シェルの担当関係を図\ref{fig:ch21_plan_decomposition}に示します。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[
+    scale=0.92,
+    every node/.style={transform shape},
+    box/.style={rectangle, draw=black!70, thick, rounded corners=3pt, align=center, font=\footnotesize},
+    gatebox/.style={box, fill=blue!10, draw=blue!70!black, minimum width=3.3cm, minimum height=1.0cm},
+    eventbox/.style={box, fill=orange!10, draw=orange!70!black, minimum width=3.3cm, minimum height=1.8cm, font=\scriptsize, align=left},
+    physbox/.style={box, fill=green!8, draw=green!60!black, minimum width=3.3cm, minimum height=2.2cm, font=\scriptsize, align=left},
+    arrow/.style={-{Stealth[scale=1.0]}, thick, line width=1.1pt},
+  ]
+    % 最上段: 入力論理ゲート列
+    \node[gatebox] (g0) at (-3.7, 4.3) {\textbf{論理 $H$ ゲート}\\\texttt{("H", 0)}};
+    \node[gatebox] (g1) at (0.0, 4.3) {\textbf{論理 CNOT ゲート}\\\texttt{("CNOT", 0, 1)}};
+    \node[gatebox] (g2) at (3.7, 4.3) {\textbf{論理 $T$ ゲート}\\\texttt{("T", 1)}};
+
+    % 上段の枠線（論理回路）
+    \node[draw=blue!50!black, dashed, rounded corners=4pt, fit=(g0) (g1) (g2), inner sep=6pt, label={[font=\scriptsize\bfseries, text=blue!70!black]above:入力論理回路（ゲートタプル列）}] (circuitbox) {};
+
+    % 中段: plan() により生成される Event
+    \node[eventbox] (e0) at (-3.7, 1.3) {
+      \textbf{\normalsize \texttt{CliffordChunk}}\\[2pt]
+      \textbullet\ \texttt{gates}: \texttt{[("H", 0)]}\\
+      \textbullet\ \texttt{label}:\\
+      \ \, \texttt{"clifford\_chunk\_0..."}
+    };
+
+    \node[eventbox] (e1) at (0.0, 1.3) {
+      \textbf{\normalsize \texttt{LSCnotEvent}}\\[2pt]
+      \textbullet\ \texttt{control}: \texttt{0}\\
+      \textbullet\ \texttt{target}: \texttt{1}\\
+      \textbullet\ \texttt{label}: \texttt{"CNOT\_1"}
+    };
+
+    \node[eventbox] (e2) at (3.7, 1.3) {
+      \textbf{\normalsize \texttt{SpecialGate}}\\[2pt]
+      \textbullet\ \texttt{name}: \texttt{"T"}\\
+      \textbullet\ \texttt{target}: \texttt{1}\\
+      \textbullet\ \texttt{label}: \texttt{"T\_2"}
+    };
+
+    % 中段の枠線（PlanEvent）
+    \node[draw=orange!70!black, dashed, rounded corners=4pt, fit=(e0) (e1) (e2), inner sep=6pt] (eventwrap) {};
+
+    % 下段: 担当シェルと物理処理
+    \node[physbox] (p0) at (-3.7, -1.6) {
+      \textbf{担当シェル:}\\
+      \texttt{CliffordFTCompiler}\\[3pt]
+      \textbf{物理処理内容:}\\
+      \textbullet\ 物理 Stim 回路生成\\
+      \textbullet\ シンドローム反復抽出\\
+      \textbullet\ MWPM / BP+OSD デコード
+    };
+
+    \node[physbox] (p1) at (0.0, -1.6) {
+      \textbf{担当シェル:}\\
+      \texttt{build\_ls\_cnot\_shell}\\[3pt]
+      \textbf{物理処理内容:}\\
+      \textbullet\ 回路レベル格子手術\\
+      \textbullet\ $M_{ZZ}, M_{XX}$ マージ\\
+      \textbullet\ 残差サンプリング
+    };
+
+    \node[physbox] (p2) at (3.7, -1.6) {
+      \textbf{担当シェル／処理:}\\
+      \texttt{build\_ls\_t\_...} / 状態ベクトル\\[3pt]
+      \textbf{物理処理内容:}\\
+      \textbullet\ 魔法状態テレポーテーション\\
+      \textbullet\ 残差 Pauli 注入点\\
+      \textbullet\ QPD 分岐 / 状態更新
+    };
+
+    % 下段の枠線
+    \node[draw=green!60!black, dashed, rounded corners=4pt, fit=(p0) (p1) (p2), inner sep=6pt, label={[font=\scriptsize\bfseries, text=green!60!black]below:各イベントが担当する物理シェル／処理内容}] (physwrap) {};
+
+    % 矢印 (ゲート -> イベント)
+    \draw[arrow, blue!70!black] (g0.south) -- (e0.north);
+    \draw[arrow, blue!70!black] (g1.south) -- node[fill=white, inner sep=2pt, font=\scriptsize\bfseries, text=orange!70!black] {\texttt{plan()} による分解} (e1.north);
+    \draw[arrow, blue!70!black] (g2.south) -- (e2.north);
+
+    % 矢印 (イベント -> 物理シェル)
+    \draw[arrow, orange!70!black] (e0.south) -- (p0.north);
+    \draw[arrow, orange!70!black] (e1.south) -- node[fill=white, inner sep=2pt, font=\scriptsize\bfseries, text=green!60!black] {担当シェルへルーティング} (p1.north);
+    \draw[arrow, orange!70!black] (e2.south) -- (p2.north);
+
+  \end{tikzpicture}
+  \caption{\texttt{plan()} による論理演算のイベント分解と担当シェルの対応図（\texttt{cnot\_mode="lattice\_surgery"} の場合）。入力された論理ゲート列は走査され、連続 Clifford ゲートは \texttt{CliffordChunk} へ、格子手術 CNOT は単独の \texttt{LSCnotEvent} へ、非 Clifford ゲートは \texttt{SpecialGate} へと分解されます。各イベントはそれぞれの物理シェルへルーティングされ、シンドローム反復抽出や残差サンプリングが独立に行われます。}
+  \label{fig:ch21_plan_decomposition}
+\end{figure}
+
+\section{モード切替による振り分け}\label{sec:modes}
+
+イベントへの分解自体は決定的ですが、生成されたイベントが\textbf{どの物理シェルでサンプリングされるか}は、コンストラクタに渡すモードフラグで変わります。
+
+\subsection{cnot\_mode: transversal / lattice\_surgery}
+
+\begin{itemize}
+  \item \texttt{"transversal"}（既定）：CNOT は他の Clifford ゲートと同じ \texttt{CliffordChunk} に含まれ、\texttt{clifford\_ft\_full.CliffordFTCompiler} が生成する 1 つの物理回路として、MWPM または BP+OSD でまとめて復号されます。
+  \item \texttt{"lattice\_surgery"}：CNOT ごとに \texttt{LSCnotEvent} が独立して生成され、\texttt{ls\_handoff\_shells.build\_ls\_cnot\_shell} が組む回路レベルの格子手術 CNOT シェル（\texttt{ls\_cnot\_ft.LSCnotFT}）で個別に処理されます。
+\end{itemize}
+
+\begin{lstlisting}[caption={LSCnotEvent のサンプリング呼び出し（src/ftqc/hybrid\_ftqc\_runtime.py）}]
+def _sample_ls_cnot_shell_residuals(
+    self, label: str, control: int, target: int,
+    shots: int, rng: np.random.Generator,
+) -> Tuple[np.ndarray, str, Optional[np.ndarray], str]:
+    from ls_handoff_shells import build_ls_cnot_shell, decode_shell
+    shell = build_ls_cnot_shell(
+        p=self.p_phys, merge_rounds=self.ls_merge_rounds,
+        noise=True, logical_control=control, logical_target=target,
+    )
+    decoded = decode_shell(shell, shots=shots, seed=int(rng.integers(0, 2 ** 63)))
+    ...
+\end{lstlisting}
+
+\texttt{decode\_shell} は \texttt{allow\_gauge\_detectors} を使わずに復号します。\texttt{build\_ls\_cnot\_shell} が組む回路は gauge 検出器ゼロで、CNOT の真理値表を満たすように構成されています。
+
+\subsection{特殊ゲートの QEC ハンドオフ}
+
+公開版の \texttt{HybridFTQCRuntime} には \texttt{t\_qec\_mode} による T 注入シェル選択はありません。statevector モードでは S/SDG/T/Tdag の状態更新後に汎用 memory シェルを使います。Stage 02 にある \texttt{build\_ls\_t\_injection\_shell} は独立したシェル API であり、Stage 03 runtime の通常経路には接続されていません。
+
+QPD モードでは T/Tdag を I/S(or SDG)/Z の符号付き分岐としてサンプリングします。既定の \texttt{route\_qpd\_s\_via\_ls=True} では、I/Z 分岐に汎用 memory シェル、S/SDG 分岐に LS-S シェルを割り当てます。これは分岐ごとの経路であり、レポートに示す代表回路が各 shot の完全な実行トレースを記録するわけではありません。
+
+\subsection{QPD 関連フラグ}
+
+\texttt{nonclifford\_mode="qpd"} を選ぶと、T/Tdag の \texttt{SpecialGate} はもはや「状態ベクトルへ直接適用してからシェルを通す」経路には入らず、\texttt{plan} が生成した同じ \texttt{SpecialGate} イベントに対して別の分岐処理が \texttt{run} 内で先に判定されます。
+
+\begin{lstlisting}[caption={QPD 分岐の生成（src/ftqc/hybrid\_ftqc\_runtime.py, run 内）}]
+if ev.name in ("T", "T_DAG") and self.nonclifford_mode == "qpd":
+    terms = self._qpd_terms_for_gate(ev.name)          # I / S(or SDG) / Z
+    coeffs = np.array([float(c) for _, c in terms], dtype=float)
+    gamma = float(np.sum(np.abs(coeffs)))
+    probs = np.abs(coeffs) / gamma
+    choice = rng.choice(len(terms), size=shots, p=probs)
+    ...
+\end{lstlisting}
+
+各 shot は $I, S, Z$（Tdag なら $I, S^\dagger, Z$）のいずれかの Clifford 分岐を符号付き確率で選び、\texttt{trajectory\_weight} に係数を積み込みます。QPD 関連フラグは次のように働きます。
+
+\begin{itemize}
+  \item QPD 分岐のシェル割当は I/Z と S/SDG で別です。既定では I/Z が memory、S/SDG が LS-S を通ります。各経路は独立に記録されるため、分岐ごとの residual と active shot 数をレポートで確認します。
+  \item \texttt{route\_qpd\_s\_via\_ls}：S/SDG 分岐を LS-S へ送る設定です。I/Z 分岐は memory shell に送られます。
+  \item \texttt{backend="qpd"} / \texttt{"stim\_qpd"}：便宜 API で、内部的に \texttt{nonclifford\_mode="qpd"} と Stim バックエンド（Clifford 専用の \texttt{StimCliffordBackend}）をまとめて設定します。
+\end{itemize}
+
+\section{計画結果の読み方}\label{sec:reading_plan}
+
+\texttt{run} は最後に、イベント列を人間が読める要約 \texttt{plan\_summary}（\texttt{List[str]}）へ変換します。
+
+\begin{lstlisting}[caption={plan\_summary の生成（src/ftqc/hybrid\_ftqc\_runtime.py, run 内）}]
+plan_summary = []
+for ev in events:
+    if isinstance(ev, LSCnotEvent):
+        plan_summary.append(
+            f"{ev.label}: logical CNOT({ev.control},{ev.target}) via circuit-level LS CNOT shell"
+        )
+    elif isinstance(ev, CliffordChunk):
+        plan_summary.append(f"{ev.label}: Stim Clifford/QEC chunk with {len(ev.gates)} gates")
+    elif isinstance(ev, SpecialGate):
+        if ev.name in ("T", "T_DAG") and self.nonclifford_mode == "qpd":
+            plan_summary.append(
+                f"{ev.label}: {ev.name} via T-QPD Clifford branches; S/SDG branch -> LS-S shell; branch_backend={self.backend_name}"
+            )
+        else:
+            plan_summary.append(f"{ev.label}: {ev.name} via state-vector handoff + Stim QEC shell")
+\end{lstlisting}
+
+デバッグでは、\texttt{QECReport.label}・\texttt{kind}・\texttt{note} と \texttt{active\_shots} を合わせて読みます。QPD では I/Z 用 memory シェルと S/SDG 用 LS-S シェルが別々のレポートになり、各レポートの \texttt{active\_shots} がその経路を通ったショット数を表します。\texttt{plan\_summary} はゲート列の概略であり、QPD の分岐ごとの実行結果を示しません。
+
+\texttt{HybridRunResult.summary\_lines()} を使うと、\texttt{plan\_summary} の件数・\texttt{qec\_reports}／\texttt{magic\_reports}／\texttt{qpd\_reports} の件数・最終分布を 1 度に確認できます。
+
+\section{やること・スコープ外}\label{sec:plan_scope}
+
+\subsection{やること}
+
+\begin{itemize}
+  \item 論理ゲート列を \texttt{CliffordChunk} / \texttt{SpecialGate} / \texttt{LSCnotEvent} に分解する \texttt{plan} の決定的なロジックを追う。
+  \item \texttt{cnot\_mode} と QPD の S 分岐ルーティング設定が、生成済みイベントをどのシェルへ振り分けるかを対応付ける。
+  \item \texttt{plan\_summary} と \texttt{QECReport} のラベル・\texttt{kind}・\texttt{note} から、実際にどの物理過程が使われたかを読み取る。
+\end{itemize}
+
+\subsection{スコープ外}
+
+\begin{itemize}
+  \item 各シェルが実際にどうサンプリング・復号されるか（\texttt{\_sample\_qec\_residuals} 等の内部）と、残差をトラジェクトリの状態ベクトルへ注入する手順は第22章で扱います。
+  \item 状態ベクトルバックエンド（Qulacs/NumPy/Stim/tsim）の切り替えの詳細は第23章で扱います。
+  \item 可視化・レポート生成（\texttt{ftqc\_run\_visualizer.py} 等）は第24章で扱います。
+\end{itemize}
+
+\section{まとめ}\label{ch21:summary}
+
+\begin{itemize}
+  \item \texttt{plan} は論理ゲート列を、乱数を使わない決定的な手続きで \texttt{CliffordChunk} / \texttt{SpecialGate} / \texttt{LSCnotEvent} の列へ分解します。
+  \item \texttt{cnot\_mode} は CNOT を Clifford チャンクに折り込む（transversal）か、単独の格子手術シェルへ回す（lattice\_surgery）かを切り替えます。
+  \item statevector モードの S/SDG/T/Tdag ハンドオフには汎用 memory シェルを使います。QPD モードでは I/Z 分岐と S/SDG 分岐が別の QEC シェルを通ります。
+  \item \texttt{nonclifford\_mode="qpd"} では T/Tdag が符号付き Clifford 分岐に置き換わり、I/Z と S/SDG の経路ごとに QEC レポートが記録されます。
+  \item \texttt{plan\_summary} と \texttt{QECReport} のラベル・\texttt{kind}・\texttt{note} が、計画結果を読み解くための一次情報です。
+\end{itemize}
+
+\subsection*{検証範囲}
+
+Stage 03 runtime では LS-CNOT イベントを回路レベルシェルへ送り、S/SDG/T/Tdag の通常ハンドオフには汎用 memory シェルを使います。QPD の T 分岐では I/Z が memory、S/SDG が LS-S を通ります。独立した LS-T シェル API の存在は、runtime がそれを呼び出すことを意味しません。
+

@@ -1,0 +1,443 @@
+% Stage: 01 ／ 説明用コード: src/stages/01\_mpp/src/ftqc
+\chapter{格子手術の基礎（幾何と GF2 合成）}\label{ch:ls_basics}
+
+\begin{chaptergoal}
+  \begin{itemize}
+  \item code deformation の考え方と、joint 論理演算子を「高重みの多体パウリ測定」で測るか「局所的な継ぎ目（seam）のスタビライザ」で測るかという 2 つの見方を理解します。
+  \item 矩形にレイアウトした表面符号パッチから、merge によって seam に新しいスタビライザが生まれる幾何的な仕組みを理解します。
+  \item GF2 線形代数（\texttt{\_compose\_in}）によって、直前ラウンドのスタビライザ群の span に入るかどうかで検出器を一様に決める規則を理解します。
+  \item 最終的なデータ読み出しと直前のスタビライザラウンドをどのように閉じる必要があるか（境界閉包）、そして本章の実装がどこを単純化しているかを区別します。
+  \item この段階で確認できる合否基準の範囲（gauge 検出器ゼロ、joint 値の真理値表一致）と、後段で厳密化される点を把握します。
+  \end{itemize}
+\end{chaptergoal}
+
+第9章までは、論理演算をトランスバーサル操作、すなわち物理量子ビットへゲートを並列に直接作用させる方法で構成してきました。
+格子手術はこれとは異なる、もう一つの誤り耐性論理演算の実現方法です\cite{horsman2012lattice}。
+2 つの符号パッチを一時的に結合（merge）し、結合後の 1 つの大きな符号のスタビライザとして、joint 論理演算子（たとえば $Z_L(A)Z_L(B)$）を読み出します。
+このとき本当に問いたいことは 2 つあります。
+どのような幾何配置で、どのスタビライザが継ぎ目（seam）に生まれるのか。
+そして、merge・split でスタビライザ集合そのものが変わっていく中で、どうすれば検出器を一様な規則で作れるのか。
+本章はこの 2 つを、\codepath{src/stages/01_mpp/src/ftqc/geom_lattice_surgery.py} の \texttt{GeomMerge} クラスを実際に読みながら確認します。
+論理レベルでの実装（\codepath{src/stages/01_mpp/src/ftqc/lattice_surgery.py}）や、シェル抽象への一般化は第11章に譲り、本章は幾何と GF2 合成という土台に専念します。
+
+\begin{notebox}
+  Stage: \textbf{01}。
+  説明用コードは主に \codepath{src/stages/01_mpp/src/ftqc/} を用います。
+  回路レベル（アンシラを介した CX スケジュール）で符号距離 3 を厳密に達成する議論は第 IV 部（第15章以降）で行います。
+\end{notebox}
+
+\section{code deformation と多体パウリ測定}\label{sec:code_deformation}
+
+joint 演算子を測る最も素朴な方法は、論理演算子の積 $P_L(A)P_L(B)$ を、そのまま 1 回の多体パウリ測定（MPP）で測ることです。
+\codepath{src/stages/01_mpp/src/ftqc/lattice_surgery.py} の \texttt{LatticeSurgery.joint\_measure} はこれを実装しています。
+
+\begin{lstlisting}[caption={joint 演算子の多体パウリ測定（src/stages/01\_mpp/src/ftqc/lattice\_surgery.py）}]
+def joint_measure(self, P, A, B):
+    ops = [(self.base(A) + l, p) for l, p in logical_ops(P)] + \
+          [(self.base(B) + l, p) for l, p in logical_ops(P)]
+    last = None
+    idxs = []
+    for r in range(self.mr):
+        idx = self._mpp(ops)
+        idxs.append(idx)
+        if last is not None:
+            self.detectors.append([idx, last])
+        last = idx
+        self.stab_round([A, B])
+    return idxs[-1]
+\end{lstlisting}
+
+\texttt{logical\_ops(P)} は論理演算子 $X_L,Y_L,Z_L$ をパッチ内の物理量子ビットの台（サポート）として返す関数で、$d=3$ の回転表面符号パッチでは \texttt{XL = [0, 3, 6]}、\texttt{ZL = [0, 1, 2]} という重み 3 の演算子です。
+2 パッチ分を連結すると重み 6 の1つの演算子になり、これを \texttt{self.\_mpp} で一括測定します。
+測定は \texttt{merge\_rounds}（変数 \texttt{self.mr}）回繰り返され、隣り合うラウンドの測定値を比較する検出器（\texttt{self.detectors.append([idx, last])}）を挟むことで、この現象論モデルに入れた測定反転を検出できるようにしています。反復だけで回路レベルの誤り耐性が保証されるわけではなく、実機向けにはアンシラ回路、フック誤りの向き、時空間境界も含めた設計が必要です\cite{horsman2012lattice,fowler2012surface}。
+デモ（\texttt{lattice\_surgery.py} の \texttt{demo()} 内 [C]）では \texttt{merge\_rounds=3} のとき、1 回の joint 測定につき 2 個の反復検出器が生成されることが確認できます。
+
+これが「code deformation」と呼ばれる操作の実体です。
+2 つの独立な符号パッチを、一時的に 1 つの大きな符号として扱い、元は論理演算子だった $P_L(A)P_L(B)$ を、変形後の符号の（測定可能な）安定化子として読み出します。
+しかしこの論理レベルの実装は、重み 6 の演算子を 1 個の MPP でまとめて測っているに過ぎません。
+実機を想定した回路（アンシラを介した CX の列）でこれを素直に翻訳すると、1 回の測定に関わる量子ビット数が符号のサイズとともに大きくなり、局所的な誤り耐性（符号距離）を素直には保てません。
+\codepath{src/stages/01_mpp/src/ftqc/geom_lattice_surgery.py} の冒頭コメントは、この問題意識を次のように述べています。
+
+\begin{lstlisting}[caption={幾何的 LS の狙い（src/stages/01\_mpp/src/ftqc/geom\_lattice\_surgery.py 冒頭コメント）}]
+論理レベル LS が joint 演算子 Z_L(A)Z_L(B) を1つの高重み MPP で測ったのに対し、
+幾何的 LS は2枚のパッチを隣接配置し、継ぎ目(seam)に局所スタビライザを turn on して
+merge する。joint 演算子の値は seam 局所スタビライザの積として読み出される。
+局所測定を距離を保つ時空間スケジュールとして設計し、MWPM でデコードできる形にする(=幾何的版の眼目)。
+\end{lstlisting}
+
+つまり、joint 演算子を「1 個の高重み測定」として得るか、「重みの小さい局所スタビライザの積」として得るかという 2 つの見方があり、後者が本章の主題である幾何的格子手術です。
+次節から \texttt{GeomMerge} クラスを読み、この局所化がどのように実現されているかを確認します。
+
+\section{幾何的 seam スタビライザ}\label{sec:seam}
+
+\texttt{GeomMerge} は、2 枚の $d=3$ 回転表面符号パッチを矩形に並べて 1 個のオブジェクトとして構成します。
+
+\begin{lstlisting}[caption={矩形レイアウトの生成（src/stages/01\_mpp/src/ftqc/geom\_lattice\_surgery.py）}]
+W_H = {"ZZ": (3, 6), "XX": (6, 3)}   # (cols, rows)
+
+def _dtype(cx, cy):
+    return "Z" if ((cx + cy) // 2) % 2 == 0 else "X"
+
+class GeomMerge:
+    def __init__(self, kind="ZZ"):
+        self.kind = kind
+        self.W, self.H = W_H[kind]
+        self.data = {}
+        idx = 0
+        for r in range(self.H):
+            for c in range(self.W):
+                self.data[(2 * c + 1, 2 * r + 1)] = idx
+                idx += 1
+        self.n = idx
+        if kind == "ZZ":
+            self.A_cells = [(c, r) for r in range(3) for c in range(self.W)]
+            self.B_cells = [(c, r) for r in range(3, 6) for c in range(self.W)]
+        else:
+            self.A_cells = [(c, r) for r in range(self.H) for c in range(3)]
+            self.B_cells = [(c, r) for r in range(self.H) for c in range(3, 6)]
+\end{lstlisting}
+
+\texttt{kind="ZZ"} は 3 列 $\times$ 6 行のデータ量子ビットを縦に積み、$0$–$2$ 行目をパッチ $A$、$3$–$5$ 行目をパッチ $B$ とします（$M_{ZZ}$ merge）。
+\texttt{kind="XX"} は 6 列 $\times$ 3 行を横に並べ、列で $A$・$B$ に分けます（$M_{XX}$ merge）。
+データ量子ビットの座標は $(2c+1,\,2r+1)$ という奇数座標に置かれ、スタビライザのプラケット中心はその間の偶数座標 $(cx,cy)$ に対応します。
+\texttt{\_dtype} はプラケット中心の座標からチェッカーボード状に $X$ 型・$Z$ 型を割り当てる、回転表面符号でおなじみの規則です。
+
+パッチ単体のスタビライザは \texttt{\_stabs(cells)} が生成します。
+セル集合の境界ボックス内の偶数座標をプラケット中心として走査し、4 隅のうちデータ量子ビットが存在する頂点の集合から、重み 4（バルク）または重み 2（境界、かつ型と境界方向が対応する場合のみ）のスタビライザを作ります。
+
+\begin{lstlisting}[caption={パッチのスタビライザ生成（src/stages/01\_mpp/src/ftqc/geom\_lattice\_surgery.py）}]
+def _stabs(self, cells):
+    ds = set((2 * c + 1, 2 * r + 1) for (c, r) in cells)
+    xs = [2 * c + 1 for c, r in cells]
+    ys = [2 * r + 1 for c, r in cells]
+    cmin, cmax, rmin, rmax = min(xs) - 1, max(xs) + 1, min(ys) - 1, max(ys) + 1
+    out = []
+    for cx in range(cmin, cmax + 1, 2):
+        for cy in range(rmin, rmax + 1, 2):
+            corners = [(cx - 1, cy - 1), (cx + 1, cy - 1), (cx - 1, cy + 1), (cx + 1, cy + 1)]
+            pres = [p for p in corners if p in ds]
+            if len(pres) == 4:
+                out.append((_dtype(cx, cy), sorted(self.data[p] for p in pres)))
+            elif len(pres) == 2:
+                t = _dtype(cx, cy)
+                on_tb = (cy == rmin or cy == rmax)
+                on_lr = (cx == cmin or cx == cmax)
+                if (on_tb and t == "X") or (on_lr and t == "Z"):
+                    out.append((t, sorted(self.data[p] for p in pres)))
+    return out
+\end{lstlisting}
+
+ここが本章の要です。
+\texttt{self.split\_stabs = self.A\_stabs + self.B\_stabs} は、$A$・$B$ を別々のパッチとして \texttt{\_stabs} を呼んだ場合の生成子（split 状態、すなわち merge 前後）です。
+一方 \texttt{self.merged\_stabs = self.\_stabs(all\_cells)} は、$A\cup B$ をひとまとまりのセル集合として \texttt{\_stabs} を呼んだ場合の生成子（merge 状態）です。
+$A$・$B$ を別々に見ていたときは境界だった継ぎ目の周辺で、\texttt{\_stabs} は 4 隅すべてが揃うようになり、以前は 2 つの重み 2 境界スタビライザだったものが、境界をまたぐ新しいスタビライザへ置き換わります。
+これが「seam スタビライザ」であり、まさに「joint が seam の積」という本章の主題を幾何的に生み出す部分です。
+
+実際に \texttt{GeomMerge("ZZ")} を生成すると、$n=18$ 個のデータ量子ビットに対して $A$・$B$ 単体はそれぞれ 8 個のスタビライザを持ち、split 状態の生成子数は $16$、merge 状態の生成子数は $17$ になります。
+これは偶然ではありません。
+$n$ 個のデータ量子ビットと $k$ 個の論理量子ビットを持つ CSS 符号は、独立なスタビライザ生成子を $n-k$ 個持ちます。
+split（$k=2$、$A,B$ それぞれ 1 論理量子ビット）では $18-2=16$、merge（$k=1$）では $18-1=17$ となり、コードの出力とちょうど一致します。
+この split 状態から merge 状態への幾何的遷移と、seam スタビライザが形成される様子を図\ref{fig:ch10_seam_stabilizer}に示します。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[scale=0.82, every node/.style={transform shape}]
+    % ---- (a) Split 状態 ----
+    \begin{scope}[shift={(0,0)}]
+      \node[font=\bfseries] at (1.0, 0.9) {(a) split 状態（2 パッチ分離）};
+
+      % パッチ A
+      % プラケット
+      \filldraw[zplaq] (0,0) rectangle (1,-1);
+      \filldraw[xplaq] (1,0) rectangle (2,-1);
+      \filldraw[xplaq] (0,-1) rectangle (1,-2);
+      \filldraw[zplaq] (1,-1) rectangle (2,-2);
+      % 境界重み2プラケット
+      \filldraw[xplaq] (0,0) -- (1,0) arc[start angle=180, end angle=0, radius=0.5] -- cycle;
+      \filldraw[zplaq] (0,-1) -- (0,-2) arc[start angle=270, end angle=90, radius=0.5] -- cycle;
+      \filldraw[zplaq] (2,0) -- (2,-1) arc[start angle=90, end angle=-90, radius=0.5] -- cycle;
+      \filldraw[xplaq] (1,-2) -- (2,-2) arc[start angle=0, end angle=-180, radius=0.5] -- cycle;
+
+      % 境界線 (X: 赤, Z: 青)
+      \draw[xtype, very thick] (0,0) -- (2,0) node[midway, above, font=\scriptsize] {X 境界};
+      \draw[xtype, very thick] (0,-2) -- (2,-2) node[midway, below, font=\scriptsize] {X 境界};
+      \draw[ztype, very thick] (0,0) -- (0,-2) node[midway, left, font=\scriptsize] {Z 境界};
+      \draw[ztype, very thick] (2,0) -- (2,-2) node[midway, right, font=\scriptsize] {Z 境界};
+
+      % 論理演算子の弦
+      \draw[ztype, line width=1.5pt, dash pattern=on 2pt off 1.5pt] (0,0.18) -- (2,0.18)
+        node[right, font=\tiny\bfseries] {$Z_L(A)$};
+      \draw[xtype, line width=1.5pt, dash pattern=on 2pt off 1.5pt] (-0.18,0) -- (-0.18,-2)
+        node[below, font=\tiny\bfseries] {$X_L(A)$};
+
+      % データ量子ビット A
+      \foreach \c in {0,1,2} {
+        \foreach \r in {0,1,2} {
+          \pgfmathtruncatemacro{\idx}{\r*3 + \c}
+          \node[dataqubit, minimum size=11pt] (A_\c_\r) at (\c, -\r) {\tiny \idx};
+        }
+      }
+      \node[left=10pt of A_0_1, font=\small\bfseries] {パッチ $A$};
+
+      % パッチ B
+      \begin{scope}[shift={(0,-3.4)}]
+        \filldraw[xplaq] (0,0) rectangle (1,-1);
+        \filldraw[zplaq] (1,0) rectangle (2,-1);
+        \filldraw[zplaq] (0,-1) rectangle (1,-2);
+        \filldraw[xplaq] (1,-1) rectangle (2,-2);
+        % 境界重み2プラケット
+        \filldraw[xplaq] (1,0) -- (2,0) arc[start angle=0, end angle=180, radius=0.5] -- cycle;
+        \filldraw[zplaq] (0,0) -- (0,-1) arc[start angle=90, end angle=270, radius=0.5] -- cycle;
+        \filldraw[zplaq] (2,-1) -- (2,-2) arc[start angle=90, end angle=-90, radius=0.5] -- cycle;
+        \filldraw[xplaq] (0,-2) -- (1,-2) arc[start angle=180, end angle=360, radius=0.5] -- cycle;
+
+        % 境界線
+        \draw[xtype, very thick] (0,0) -- (2,0) node[midway, above, font=\scriptsize] {X 境界};
+        \draw[xtype, very thick] (0,-2) -- (2,-2) node[midway, below, font=\scriptsize] {X 境界};
+        \draw[ztype, very thick] (0,0) -- (0,-2) node[midway, left, font=\scriptsize] {Z 境界};
+        \draw[ztype, very thick] (2,0) -- (2,-2) node[midway, right, font=\scriptsize] {Z 境界};
+
+        \foreach \c in {0,1,2} {
+          \foreach \r in {0,1,2} {
+            \pgfmathtruncatemacro{\idx}{9 + \r*3 + \c}
+            \node[dataqubit, minimum size=11pt] (B_\c_\r) at (\c, -\r) {\tiny \idx};
+          }
+        }
+        \node[left=10pt of B_0_1, font=\small\bfseries] {パッチ $B$};
+      \end{scope}
+    \end{scope}
+
+    % ---- 遷移矢印 ----
+    \draw[-{Stealth[length=6pt, width=6pt]}, line width=1.5pt, gray!60] (3.1, -2.6) -- (4.3, -2.6)
+      node[midway, above=2pt, font=\scriptsize\bfseries, text=black] {merge ($M_{ZZ}$)};
+
+    % ---- (b) Merge 状態 ----
+    \begin{scope}[shift={(5.4,0)}]
+      \node[font=\bfseries] at (1.0, 0.9) {(b) merge 状態（seam 形成）};
+
+      % プラケット (全体: 3x6)
+      % r=0..1
+      \filldraw[zplaq] (0,0) rectangle (1,-1);
+      \filldraw[xplaq] (1,0) rectangle (2,-1);
+      \filldraw[xplaq] (0,-1) rectangle (1,-2);
+      \filldraw[zplaq] (1,-1) rectangle (2,-2);
+
+      % r=2..3: seam プラケット
+      \filldraw[zplaq, line width=1.2pt] (0,-2) rectangle (1,-3);
+      \filldraw[xplaq, line width=1.2pt] (1,-2) rectangle (2,-3);
+      \filldraw[zplaq, line width=1.2pt] (2,-2) -- (2,-3) arc[start angle=270, end angle=90, radius=0.5] -- cycle;
+
+      % r=3..5
+      \filldraw[xplaq] (0,-3) rectangle (1,-4);
+      \filldraw[zplaq] (1,-3) rectangle (2,-4);
+      \filldraw[zplaq] (0,-4) rectangle (1,-5);
+      \filldraw[xplaq] (1,-4) rectangle (2,-5);
+
+      % 外周の重み2プラケット
+      \filldraw[xplaq] (0,0) -- (1,0) arc[start angle=180, end angle=0, radius=0.5] -- cycle;
+      \filldraw[zplaq] (0,-1) -- (0,-2) arc[start angle=270, end angle=90, radius=0.5] -- cycle;
+      \filldraw[zplaq] (2,0) -- (2,-1) arc[start angle=90, end angle=-90, radius=0.5] -- cycle;
+
+      \filldraw[zplaq] (0,-3) -- (0,-4) arc[start angle=90, end angle=270, radius=0.5] -- cycle;
+      \filldraw[zplaq] (2,-4) -- (2,-5) arc[start angle=90, end angle=-90, radius=0.5] -- cycle;
+      \filldraw[xplaq] (0,-5) -- (1,-5) arc[start angle=180, end angle=360, radius=0.5] -- cycle;
+
+      % seam 領域の強調枠
+      \draw[dashed, line width=1pt, black!70] (-0.3, -1.95) rectangle (2.8, -3.05);
+      \node[right=2pt, font=\scriptsize\bfseries, text=black] at (2.8, -2.5) {seam};
+
+      % 境界線 (外周)
+      \draw[xtype, very thick] (0,0) -- (2,0) node[midway, above, font=\scriptsize] {X 境界};
+      \draw[xtype, very thick] (0,-5) -- (2,-5) node[midway, below, font=\scriptsize] {X 境界};
+      \draw[ztype, very thick] (0,0) -- (0,-5);
+      \draw[ztype, very thick] (2,0) -- (2,-5);
+
+      % データ量子ビット (全18個)
+      \foreach \c in {0,1,2} {
+        \foreach \r in {0,1,2,3,4,5} {
+          \pgfmathtruncatemacro{\idx}{\r*3 + \c}
+          \node[dataqubit, minimum size=11pt] (M_\c_\r) at (\c, -\r) {\tiny \idx};
+        }
+      }
+    \end{scope}
+  \end{tikzpicture}
+  \caption{seam スタビライザの形成図。$d=3$ の回転表面符号パッチ2枚（$A, B$）を縦方向に隣接させ、$M_{ZZ}$ merge を行う様子を示します。本書の規約で X 境界（赤）と呼ぶ辺同士を結合すると、境界にあった重み2のスタビライザが、結合境界（seam）をまたぐ重み4のスタビライザ（Z型 $[6,7,9,10]$、X型 $[7,8,10,11]$）および重み2スタビライザ（Z型 $[8,11]$）へと再構成されます。rough/smooth という名称は文献の星・プラケット規約で入れ替わり得るため、ここでは測定する演算子型で境界を呼びます\cite{horsman2012lattice,fowler2012surface}。}
+  \label{fig:ch10_seam_stabilizer}
+\end{figure}
+
+
+joint 演算子は次のように定義されます。
+
+\begin{lstlisting}[caption={joint 演算子と seam スタビライザによる分解（src/stages/01\_mpp/src/ftqc/geom\_lattice\_surgery.py）}]
+def _joint_vec(self):
+    if self.kind == "ZZ":
+        return (self._logical("Z", self.A_cells) + self._logical("Z", self.B_cells)) % 2
+    return (self._logical("X", self.A_cells) + self._logical("X", self.B_cells)) % 2
+
+# __init__ 内
+self.joint = self._joint_vec()
+self.joint_idx = self._decompose(self.joint, self.merged_stabs)
+\end{lstlisting}
+
+\texttt{self.joint} は $Z_L(A)Z_L(B)$（$M_{XX}$ なら $X_L(A)X_L(B)$）を GF2 上のシンプレクティックベクトル（長さ $2n$ の $X$ 成分・$Z$ 成分）として表したものです。
+\texttt{self.\_decompose(self.joint, self.merged\_stabs)} は、この joint 演算子を merge 状態のスタビライザ生成子の積として分解します。
+\texttt{GeomMerge("ZZ")} では \texttt{joint\_idx} は 6 個の merge 状態スタビライザの積として求まります。
+つまり、$Z_L(A)Z_L(B)$ という論理レベルでは重み 6 の演算子が、局所的な seam スタビライザ 6 個の積として得られることが、コード上で確かめられます。
+これにより、joint 演算子を「測る」ために特別な高重み測定を用意する必要はなく、通常のスタビライザ測定（局所測定）だけで joint の値が再現できます。
+これが幾何的格子手術の眼目であり、次節で見る「一様検出器則」の前提になります。
+
+\section{merge／split と遷移検出器（GF2 合成）}\label{sec:transition_det}
+
+前節の \texttt{\_decompose} は、GF2 上のガウス消去によって「あるベクトルが、与えられた生成子集合の span に入るか、入るならどの組み合わせで表せるか」を計算する関数です。
+
+\begin{lstlisting}[caption={GF2 合成: \_decompose と \_compose\_in（src/stages/01\_mpp/src/ftqc/geom\_lattice\_surgery.py）}]
+def _decompose(self, vec, stabs):
+    M = np.array([self._vec(t, s) for t, s in stabs], np.int8)
+    Amat = M.T.copy().astype(np.int8)
+    b = vec.copy().astype(np.int8)
+    rows, cols = Amat.shape
+    r = 0
+    pivcols = []
+    for col in range(cols):
+        piv = next((i for i in range(r, rows) if Amat[i, col]), None)
+        if piv is None:
+            continue
+        Amat[[r, piv]] = Amat[[piv, r]]
+        b[[r, piv]] = b[[piv, r]]
+        for i in range(rows):
+            if i != r and Amat[i, col]:
+                Amat[i] ^= Amat[r]
+                b[i] ^= b[r]
+        pivcols.append(col)
+        r += 1
+    c = np.zeros(cols, np.int8)
+    for ri, col in enumerate(pivcols):
+        c[col] = b[ri]
+    assert np.array_equal((c @ M) % 2, vec), "decomposition failed"
+    return [i for i in range(len(stabs)) if c[i]]
+
+def _compose_in(self, vec, stabs):
+    """vec が stabs の span にあれば構成インデックスを返す, なければ None。"""
+    try:
+        idx = self._decompose(vec, stabs)
+        return idx
+    except AssertionError:
+        return None
+\end{lstlisting}
+
+\texttt{\_decompose} は分解に失敗すると（\texttt{vec} が \texttt{stabs} の span に入らないと）\texttt{assert} で例外を投げます。
+\texttt{\_compose\_in} はこれを捕捉して \texttt{None} を返すラッパーです。
+この 2 つの関数が、\texttt{build} メソッド内の検出器生成をまるごと支えています。
+
+通常の QEC サイクルでは「今ラウンドのスタビライザ」と「直前ラウンドの\emph{同じ}スタビライザ」の測定値を比較して検出器を作ります。
+ところが格子手術では、merge・split の切り替わりでスタビライザ集合そのものが変わるため（split\_stabs $\to$ merged\_stabs、あるいはその逆）、「同じスタビライザ」が直前ラウンドに存在しない場合があります。
+\texttt{build} が採用する一様規則は、「同じ演算子」を探す代わりに「直前ラウンドのスタビライザ群の GF2 span に入るかどうか」を判定します。
+
+\begin{lstlisting}[caption={一様検出器則（src/stages/01\_mpp/src/ftqc/geom\_lattice\_surgery.py build 内）}]
+for ri, (stabs, rec) in enumerate(rounds):
+    if ri == 0:
+        for si, (t, sup) in enumerate(stabs):
+            if t == "Z":
+                detectors.append([rec[si]])
+        continue
+    prev_stabs, prev_rec = rounds[ri - 1]
+    for si, (t, sup) in enumerate(stabs):
+        comp = self._compose_in(self._vec(t, sup), prev_stabs)
+        if comp is None:
+            continue   # 直前 span 外 = 新規測定情報 (joint 成分等) -> 検出器なし
+        d = [rec[si]] + [prev_rec[j] for j in comp]
+        detectors.append(d)
+\end{lstlisting}
+
+規則は次の 2 つに要約できます。
+
+\begin{itemize}
+  \item \textbf{最初のラウンド（$ri=0$）}：全量子ビットを $\ket{0\cdots0}$ にリセットした直後なので、$Z$ 型スタビライザだけが決定論的です。これらは 1 個だけの記録から成る検出器（期待値ゼロの単独チェック）として登録します。
+  \item \textbf{以降のラウンド（$ri>0$）}：今ラウンドの各スタビライザについて、その演算子ベクトルが直前ラウンドのスタビライザ群の span に入るか（\texttt{\_compose\_in}）を調べます。入るなら、今ラウンドの記録と、分解に使った直前ラウンドの記録たちの XOR を検出器にします。入らないなら、その測定値は直前ラウンドの情報からは再現できない\emph{新規の測定結果}であり、比較対象がないので検出器を作りません。
+\end{itemize}
+
+「span 内なら検出器、span 外（joint 成分など）は測定結果」という規則がここに現れています。
+たとえば split から merge へ切り替わった直後のラウンドでは、merge 状態のスタビライザのうち split 状態の span に入るものは検出器になり、joint 演算子の情報を担う成分（split の生成子だけでは表せない成分）は検出器を作らず、そのまま測定結果として使われます。
+実際、\texttt{GeomMerge("ZZ").build()} を \texttt{noise=False} で実行すると、検出器は 103 個生成され、そのすべてがノイズなしで恒等的にゼロになることが確認できます（\texttt{demo()} の出力 [C]）。
+これは、split と merge という異なるスタビライザ集合をまたいでも、一様規則だけで決定論的な（gauge のない）検出器が作れていることを意味します。
+
+\section{最終検出器と境界閉包}\label{sec:closure}
+
+一般に、FT な符号サイクルでは、最後のスタビライザラウンドと最終的なデータ読み出しの間にも整合性が必要です。
+最終読み出しの直前に起きた誤りを検出器がまったく捉えられないと、その誤りは訂正されないまま論理値に直接混入してしまいます。
+これを避けるためには、最終のデータ測定から再構成できるスタビライザ値と、直前ラウンドで測定済みのスタビライザ値とを 1 つの検出器として閉じる必要があります。
+これを本書では境界閉包（spacelike closure）と呼びます。
+
+\texttt{GeomMerge.build} を確認すると、この閉包は明示的には行われていません。
+
+\begin{lstlisting}[caption={最終読み出しと観測量（src/stages/01\_mpp/src/ftqc/geom\_lattice\_surgery.py build 内）}]
+c.append("M", list(range(self.n)))
+drec = {q: mc + q for q in range(self.n)}
+...
+zla_sup = list(np.where(self.ZLA[self.n:])[0])
+zlb_sup = list(np.where(self.ZLB[self.n:])[0])
+c.append("OBSERVABLE_INCLUDE", [rr(drec[int(q)]) for q in zla_sup], 0)
+c.append("OBSERVABLE_INCLUDE", [rr(drec[int(q)]) for q in zlb_sup], 1)
+\end{lstlisting}
+
+観測量 \texttt{OBSERVABLE\_INCLUDE} は、全データ量子ビットを transversal に $Z$ 基底で測定した結果から、パッチ境界の 1 行分（\texttt{ZLA}／\texttt{ZLB} の台）のパリティとして直接定義されています。
+一方で、この最終測定を直前の split ラウンドのスタビライザと結び、閉包検出器として登録する処理は \texttt{build} にはありません。
+現象論モデルではデータ測定そのものが「最後の読み出し」として振る舞うため、この単純化でも検出器はすべて決定論的（第10.3節の確認どおり）で、真理値表・MWPM デコードの検証は成立します。
+しかし、直前ラウンドと最終読み出しを厳密に閉じる後ろ向き閉包（backward closure）を欠くと、最終読み出し直前に生じた誤りを検出器で捉えられない場合が一般には残ります。
+この完全な議論は、回路レベルで距離 2 のバグを距離 3 に直す第17章のケーススタディに委ねます。
+
+符号距離についても、本章では現象論的な振る舞いの確認に留めます。
+\texttt{demo()} の [D] は $p\in\{0.002,0.005,0.01\}$ に対する論理エラー率を、PyMatching による MWPM デコード（\texttt{c.detector\_error\_model(decompose\_errors=True)} から作った検出器誤りモデル）で計算しており、$p$ が小さくなるほど論理エラー率が下がる、という距離を持つ符号らしい振る舞いを確認できます。
+ただしこれは phenomenological ノイズ（\texttt{DEPOLARIZE1} を挟んだ MPP 測定）での確認であり、回路レベル（アンシラ CX を介したシンドローム抽出）で符号距離 3 を厳密に実現する話は第 IV 部（第15章以降）の主題です。
+
+\section{やること・スコープ外}\label{ch10:scope}
+
+\subsection{やること}
+
+\begin{itemize}
+  \item 矩形レイアウトの表面符号パッチから、merge によって seam に生まれるスタビライザを幾何的に導出しました。
+  \item joint 論理演算子が、seam を含む局所スタビライザの GF2 上の積として分解できることを \texttt{\_decompose} で確認しました。
+  \item merge・split でスタビライザ集合が変わっても、「直前ラウンドの span に入るかどうか」という一様規則で検出器を決められることを確認しました。
+\end{itemize}
+
+\subsection{スコープ外}
+
+\begin{itemize}
+  \item アンシラを介した CX スケジュールによる回路レベルのシンドローム抽出。本章のスタビライザ・joint 演算子はすべて \texttt{stim.Circuit.append("MPP", ...)} による直接測定であり、実機の測定回路（フック誤りを含む）は第 IV 部（第15章 \texttt{circuit\_level\_merge.py}）の主題です。
+  \item 最終読み出しと直前ラウンドを厳密に結ぶ後ろ向き閉包の完全な議論。前節で述べたとおり、第17章のケーススタディで扱います。
+  \item 回路レベルで符号距離 3 を厳密に達成する議論。本章は現象論モデルでの振る舞いの確認に留めます。
+\end{itemize}
+
+\section{まとめ}\label{ch10:summary}
+
+\begin{itemize}
+  \item joint 論理演算子は、論理レベルでは 1 回の高重み多体パウリ測定（\texttt{joint\_measure}）として、幾何的には局所的な seam スタビライザの積として得られます。後者が距離を保つ格子手術の核心です。
+  \item \texttt{GeomMerge} は矩形レイアウトのセル集合から \texttt{\_stabs} でスタビライザを生成し、split 状態（$n-k=16$）と merge 状態（$n-k=17$）で生成子集合が変わることを、幾何的に（seam の有無）説明します。
+  \item joint 演算子は \texttt{\_decompose(self.joint, self.merged\_stabs)} により merge 状態スタビライザ 6 個の積として分解され、高重み測定を避けられます。
+  \item merge・split をまたぐ検出器は「今ラウンドのスタビライザが直前ラウンドの span に入るか」（\texttt{\_compose\_in}）で一様に決まり、span 外（joint 成分など）は検出器を作らず測定結果として扱われます。
+  \item 最終読み出しと直前ラウンドの厳密な境界閉包、および回路レベルでの符号距離 3 の達成は、本章では扱わず後段に委ねます。
+\end{itemize}
+
+\subsection*{合否基準での検証}
+
+この段階で機械的に確認できるのは次の点です。
+
+\begin{itemize}
+  \item \textbf{gauge 検出器ゼロ}：\texttt{noise=False} で \texttt{GeomMerge("ZZ").build()} を実行すると、全 103 個の検出器がすべて決定論的（恒等的にゼロ）になります。これは第8章で定義される「ノイズなしで gauge 検出器ゼロ」という合否基準の、merge/split をまたぐ一様検出器則に対する最小の確認です。
+  \item \textbf{joint 値の真理値表一致}：$A,B$ の初期状態（$\ket0/\ket1$）の 4 通りに対し、joint 測定の出力が期待される XOR（$M_{ZZ}$ なら $a\oplus b$）と一致することを確認できます。
+  \item \textbf{graphlike なデコード}：\texttt{detector\_error\_model(decompose\_errors=True)} から作った検出器誤りモデルに対し、PyMatching の MWPM がそのまま適用できます。
+\end{itemize}
+
+一方で、\codepath{src/ftqc} の selftest / \texttt{tests\_review\_fixes.py} が定義する最終的な合否基準（回路レベルでの \texttt{shortest\_graphlike\_error = d}、\texttt{decode\_shell} が \texttt{allow\_gauge\_detectors} を使わずに動作すること）は、本章の現象論モデルでは対象外です。
+これらは回路レベル実装（第 IV 部）以降で強化されます。
+
+次章では、本章で得た幾何的な理解を土台に、論理レベルの \texttt{lattice\_surgery.py}（LS CNOT・LS S）と、それを一般化するシェル（ハンドオフ）抽象へ進みます。
+
+\begin{exercise}
+  \begin{enumerate}
+    \item \texttt{GeomMerge("ZZ")} では \texttt{split\_stabs} が 16 個、\texttt{merged\_stabs} が 17 個です。$n-k$ の関係を使って、split（$k=2$）と merge（$k=1$）のそれぞれで生成子数が 16、17 になることを説明しなさい。
+    \item \texttt{\_compose\_in} が \texttt{None} を返す具体的な状況を、split から merge へ切り替わる遷移ラウンドの中から 1 つ挙げ、なぜその場合に検出器を作らないのが正しいかを説明しなさい。
+    \item 第10.4節で述べたとおり、\texttt{build} は最終のデータ測定を直前の split ラウンドと検出器として結んでいません。この単純化によって、どのタイミングで生じた誤りが検出器に捉えられずに観測量へ混入する可能性があるか、具体的に述べなさい。
+    \item \texttt{kind="XX"} の場合、\texttt{A\_cells}／\texttt{B\_cells} は列方向で分割されます。この分割のもとで joint 演算子が $X_L(A)X_L(B)$ になる理由を、\texttt{\_joint\_vec} の実装と \texttt{kind="ZZ"} の場合との対比で説明しなさい。
+  \end{enumerate}
+\end{exercise}
