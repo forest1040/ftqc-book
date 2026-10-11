@@ -13,7 +13,7 @@ jobs:
     env:
       OPENBLAS_NUM_THREADS: "1"
       OMP_NUM_THREADS: "1"
-      MPLCONFIGDIR: ${{ runner.temp }}/mplconfig
+      MPLCONFIGDIR: /tmp/ftqc-book-mplconfig
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -34,7 +34,7 @@ jobs:
     env:
       OPENBLAS_NUM_THREADS: "1"
       OMP_NUM_THREADS: "1"
-      MPLCONFIGDIR: ${{ runner.temp }}/mplconfig
+      MPLCONFIGDIR: /tmp/ftqc-book-mplconfig
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -55,7 +55,7 @@ jobs:
     env:
       OPENBLAS_NUM_THREADS: "1"
       OMP_NUM_THREADS: "1"
-      MPLCONFIGDIR: ${{ runner.temp }}/mplconfig
+      MPLCONFIGDIR: /tmp/ftqc-book-mplconfig
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -79,7 +79,7 @@ jobs:
     env:
       OPENBLAS_NUM_THREADS: "1"
       OMP_NUM_THREADS: "1"
-      MPLCONFIGDIR: ${{ runner.temp }}/mplconfig
+      MPLCONFIGDIR: /tmp/ftqc-book-mplconfig
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
