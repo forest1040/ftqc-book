@@ -19,6 +19,5 @@ book/*.toc
 book/*.fls
 book/*.fdb_latexmk
 book/*.synctex.gz
-book/main.pdf
 book/figures/ch24_stim_timeline.html
 book/figures/ch24_stim_timeline.json

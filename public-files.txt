@@ -45,6 +45,7 @@ book/figures/ch24_stim_timeline.stim
 book/figures/ch24_stim_timeline.svg
 book/figures/gen_ch24_timeline.py
 book/latexmkrc
+book/main.pdf
 book/main.tex
 book/tex-template/preamble.tex
 docs/architecture.md
