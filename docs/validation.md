@@ -11,6 +11,9 @@
 | 第24章 Stim 図の PDF 再生成 | 成功 |
 | Python wheel と sdist のビルド | 成功 |
 | 書籍本体の PDF ビルド | 成功、278ページ。未解決参照・引用なし |
+| 新規 clone の独立環境 | Stage 01: 15 passed、Stage 02: 13 passed、Stage 03: 38 passed。構成検査も成功 |
+| 配布 wheel の独立環境 | リポジトリ外で import・gate parser・LS-CNOT レポート生成に成功 |
+| GitHub Actions | ワークフローは受理。アカウントの支払い状況または利用上限によりジョブ未開始 |
 
 Stage 03 で追加した4ファイルの12件に絞った検証も、12 passed、4.62秒で合格しています。これは下記の詳細ケースを個別に確認するための対象 suite です。
 
