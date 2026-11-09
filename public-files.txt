@@ -1,5 +1,7 @@
 .github/workflows/ci.yml
+.github/workflows/pages.yml
 .gitignore
+.nojekyll
 .python-version
 CHANGES.md
 CITATION.cff
@@ -62,6 +64,7 @@ examples/ch22_event_scheduling.py
 examples/ch23_backend_switch.py
 examples/ch24_visualization_reports.py
 examples/ch25_d3_benchmark.py
+index.html
 public-files.txt
 pyproject.toml
 src/ftqc/__init__.py
@@ -158,6 +161,7 @@ src/stages/02_circuit_level/tests/test_examples.py
 src/stages/02_circuit_level/tests/test_imports.py
 src/stages/02_circuit_level/tests/test_smoke.py
 src/stages/02_circuit_level/uv.lock
+style.css
 tests/test_boundaries.py
 tests/test_examples.py
 tests/test_imports.py

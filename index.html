@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="『ゼロから作るFTQCシミュレータ』の公式紹介ページ。表面符号・格子手術の理論からd=3統合シミュレータの実装までを25章で学ぶ日本語教科書。PDFを無料公開。">
+  <meta name="theme-color" content="#164d43">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="ゼロから作るFTQCシミュレータ | FTQC教科書">
+  <meta property="og:description" content="表面符号の基礎から回路レベル格子手術、d=3統合シミュレータまで。全278ページの日本語PDFと実行可能なコードを公開。">
+  <meta property="og:url" content="https://forest1040.github.io/ftqc-book/">
+  <link rel="canonical" href="https://forest1040.github.io/ftqc-book/">
+  <title>ゼロから作るFTQCシミュレータ | FTQC教科書</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <a class="skip" href="#main">本文へ移動</a>
+  <header class="site-header wrap">
+    <a class="brand" href="./" aria-label="FTQC 教科書 ホーム"><span class="mark" aria-hidden="true">F</span> FTQC / TEXTBOOK</a>
+    <nav aria-label="メインナビゲーション"><a href="#contents">目次</a><a href="#run">実行</a><a href="https://github.com/forest1040/ftqc-book">GitHub ↗</a></nav>
+  </header>
+  <main id="main">
+    <section class="hero wrap" aria-labelledby="title">
+      <div class="hero-copy">
+        <p class="eyebrow">FAULT-TOLERANT QUANTUM COMPUTATION — FROM SURFACE CODES TO A d=3 SIMULATOR</p>
+        <h1 id="title">ゼロから作る<br><span>FTQCシミュレータ。</span></h1>
+        <p class="subtitle">表面符号の基礎から回路レベル<br>格子手術、d=3 統合実行まで</p>
+        <p class="intro">誤り訂正とは何か、1パッチ9個のデータ量子ビットでどこまで模擬できるのか。<br>表面符号と格子手術の理論を、Stim と Python による段階的な実装で、動くシミュレータまでつなぐ日本語の教科書です。</p>
+        <div class="actions"><a class="button primary" href="book/main.pdf">PDFを読む <span aria-hidden="true">↗</span></a><a class="button secondary" href="book/main.pdf" download>ダウンロード <span aria-hidden="true">↓</span></a></div>
+        <p class="file-info">日本語 / 全278ページ / PDF 約1.81 MiB<br>第1〜25章 + 付録A〜D · 2026年10月11日ビルド</p>
+      </div>
+      <div class="book-area" aria-hidden="true">
+        <div class="book">
+          <div class="book-top">A BUILD-IT-YOURSELF GUIDE TO<br>SURFACE CODES &amp; LATTICE SURGERY</div>
+          <div class="book-title">Fault-Tolerant<br>Quantum<br>Computation</div>
+          <div class="lattice">
+            <span class="seam"></span>
+            <i class="q d"></i><i class="q s"></i><i class="q d"></i>
+            <i class="q s"></i><i class="q d"></i><i class="q s"></i>
+            <i class="q d"></i><i class="q s"></i><i class="q d"></i>
+          </div>
+          <div class="book-bottom">Stim で学ぶ誤り耐性量子計算の実装<span>MPP / LATTICE SURGERY / d=3 INTEGRATED</span></div>
+        </div>
+        <p class="book-caption">THEORY → IMPLEMENTATION → VERIFICATION</p>
+      </div>
+    </section>
+    <section class="stages" aria-labelledby="stages-title">
+      <div class="wrap">
+        <div class="section-heading"><p class="eyebrow">THREE STAGES</p><h2 id="stages-title">3つのStageで、段階的に学ぶ。</h2><p>現象論 MPP、回路レベル、d=3 統合ランタイムを、それぞれ独立した Python 環境の実装例で学びます。</p></div>
+        <div class="stage-grid">
+          <article><span class="number">01 / MPP</span><h3>Stage 01</h3><p class="task">現象論 MPP で論理演算まで</p><p>表面符号パッチと MPP シンドローム、トランスバーサル操作、格子手術、T ゲートと QPD。第6〜13章に対応し、独立した Python 環境で実行できます。</p></article>
+          <article><span class="number">02 / CIRCUIT</span><h3>Stage 02</h3><p class="task">回路レベルへの拡張</p><p>アンシラ回路と hook 誤り、回路レベル merge、格子手術 CNOT と T テレポート、Shell API。第14〜19章で、アンシラを含む回路レベルのモデルを導入します。</p></article>
+          <article><span class="number">03 / INTEGRATED</span><h3>Stage 03</h3><p class="task">d=3 固定の統合シミュレータ</p><p>命令計画とイベント分解、残差注入とトラジェクトリ実行、tsim バックエンド、可視化とベンチマーク。第20〜25章が動くルート環境です。</p></article>
+        </div>
+      </div>
+    </section>
+    <section class="contents wrap" id="contents" aria-labelledby="contents-title">
+      <div class="contents-intro"><p class="eyebrow">INSIDE THE BOOK</p><h2 id="contents-title">基礎から、<br>統合シミュレータまで。</h2><p>量子計算と誤り訂正の理論を出発点に、Stim の道具立て、2つの Stage を経て、d=3 固定の統合シミュレータを組み上げます。</p><p>各章は「やること・スコープ外」と合否基準を明示する構成です。行をクリックすると、PDF の該当ページへ飛びます。</p></div>
+      <ol class="chapters">
+        <li class="part-row"><a href="book/main.pdf#page=9"><span>第I部</span><h3>基礎 — なぜ FTQC シミュレータが必要か</h3><small>p. 1</small></a></li>
+        <li><a href="book/main.pdf#page=10"><span>01</span><div><h3>量子コンピュータ概要</h3><p>量子ビット・ゲート・もつれと、NISQ と FTQC のギャップ</p></div><small>p. 2</small></a></li>
+        <li><a href="book/main.pdf#page=15"><span>02</span><div><h3>FTQC とは</h3><p>論理演算の翻訳・エラー推定グラフ・3大ボトルネック</p></div><small>p. 7</small></a></li>
+        <li><a href="book/main.pdf#page=31"><span>03</span><div><h3>エラー訂正とは</h3><p>シンドローム測定、量子特有の壁、符号距離</p></div><small>p. 23</small></a></li>
+        <li><a href="book/main.pdf#page=40"><span>04</span><div><h3>エラー訂正符号とは</h3><p>スタビライザ形式・CSS 符号・表面符号・[[15,1,3]]</p></div><small>p. 32</small></a></li>
+        <li><a href="book/main.pdf#page=49"><span>05</span><div><h3>エラー訂正フロー</h3><p>パウリフレーム、ゲート分類、デコード遅延とストール</p></div><small>p. 41</small></a></li>
+        <li class="part-row"><a href="book/main.pdf#page=59"><span>第II部</span><h3>道具立て — Stim と最初の論理量子ビット</h3><small>p. 51</small></a></li>
+        <li><a href="book/main.pdf#page=60"><span>06</span><div><h3>Stim の使いかた</h3><p>DETECTOR・DEM・PyMatching・BP+OSD</p></div><small>p. 52</small></a></li>
+        <li><a href="book/main.pdf#page=71"><span>07</span><div><h3>表面符号パッチを作る（MPP）</h3><p>d=3 パッチのスタビライザ、メモリ実験と論理エラー率</p></div><small>p. 63</small></a></li>
+        <li><a href="book/main.pdf#page=81"><span>08</span><div><h3>デコードと評価の基準</h3><p>ノイズモデルの階層、MWPM、本書の合否基準</p></div><small>p. 73</small></a></li>
+        <li class="part-row"><a href="book/main.pdf#page=93"><span>第III部</span><h3>Stage 01 — 現象論 MPP で論理演算まで</h3><small>p. 85</small></a></li>
+        <li><a href="book/main.pdf#page=94"><span>09</span><div><h3>トランスバーサル操作と生成子追跡</h3><p>トランスバーサル CNOT の検証と生成子追跡</p></div><small>p. 86</small></a></li>
+        <li><a href="book/main.pdf#page=106"><span>10</span><div><h3>格子手術の基礎</h3><p>seam スタビライザ・merge/split・GF2 合成</p></div><small>p. 98</small></a></li>
+        <li><a href="book/main.pdf#page=118"><span>11</span><div><h3>論理レベル格子手術と LS ハンドオフ</h3><p>シェルという抽象と mpp 版 ls_handoff_shells</p></div><small>p. 110</small></a></li>
+        <li><a href="book/main.pdf#page=128"><span>12</span><div><h3>T ゲート・蒸留・2 経路</h3><p>ゲートテレポーテーション・魔法状態蒸留・QPD</p></div><small>p. 120</small></a></li>
+        <li><a href="book/main.pdf#page=141"><span>13</span><div><h3>Stage 01 のハイブリッドランタイム</h3><p>データフロー・plan の原型・残差注入の初出</p></div><small>p. 133</small></a></li>
+        <li class="part-row"><a href="book/main.pdf#page=152"><span>第IV部</span><h3>Stage 02 — 回路レベルへの拡張</h3><small>p. 144</small></a></li>
+        <li><a href="book/main.pdf#page=153"><span>14</span><div><h3>なぜ回路レベルが必要か</h3><p>MPP のモデルが落とすものと hook 誤り</p></div><small>p. 145</small></a></li>
+        <li><a href="book/main.pdf#page=162"><span>15</span><div><h3>回路レベル merge を実装する</h3><p>アンシラによるシンドローム抽出と CircuitLevelMerge</p></div><small>p. 154</small></a></li>
+        <li><a href="book/main.pdf#page=172"><span>16</span><div><h3>格子手術 CNOT</h3><p>測定ベース CNOT とフレーム補正観測量</p></div><small>p. 164</small></a></li>
+        <li><a href="book/main.pdf#page=182"><span>17</span><div><h3>ケーススタディ：距離2バグを距離3に直す</h3><p>診断・仮説の棄却・seam の保存量という真因</p></div><small>p. 174</small></a></li>
+        <li><a href="book/main.pdf#page=191"><span>18</span><div><h3>T テレポートの格子手術実装（LS-T）</h3><p>4 パッチ構成と magic fault・QEC 残差の直交性</p></div><small>p. 183</small></a></li>
+        <li><a href="book/main.pdf#page=201"><span>19</span><div><h3>回路レベル Shell API</h3><p>decode_shell と gauge detector ガード</p></div><small>p. 193</small></a></li>
+        <li class="part-row"><a href="book/main.pdf#page=211"><span>第V部</span><h3>Stage 03 — d=3 固定の統合シミュレータ</h3><small>p. 203</small></a></li>
+        <li><a href="book/main.pdf#page=212"><span>20</span><div><h3>アーキテクチャ全体像</h3><p>FTQC アーキテクチャとの対応と実行フロー</p></div><small>p. 204</small></a></li>
+        <li><a href="book/main.pdf#page=221"><span>21</span><div><h3>命令計画とイベント分解</h3><p>イベントへの分解とモード切替による振り分け</p></div><small>p. 213</small></a></li>
+        <li><a href="book/main.pdf#page=230"><span>22</span><div><h3>トラジェクトリ実行と残差注入</h3><p>QEC 残差・状態ベクトル合成・パウリフレーム</p></div><small>p. 222</small></a></li>
+        <li><a href="book/main.pdf#page=241"><span>23</span><div><h3>状態ベクトルバックエンドと tsim</h3><p>Numpy/Qulacs/tsim と選択指針</p></div><small>p. 233</small></a></li>
+        <li><a href="book/main.pdf#page=250"><span>24</span><div><h3>可視化とレポート</h3><p>マッピング・Stim タイムライン・実行レポート</p></div><small>p. 242</small></a></li>
+        <li><a href="book/main.pdf#page=261"><span>25</span><div><h3>テストと性能評価</h3><p>不変条件テスト・統計テストの安定化・誤差収支</p></div><small>p. 253</small></a></li>
+        <li><a href="book/main.pdf#page=271"><span>結び</span><div><h3>結び</h3><p>到達点と、この先へ</p></div><small>p. 263</small></a></li>
+        <li class="part-row"><a href="book/main.pdf#page=272"><span>第VI部</span><h3>付録</h3><small>p. 264</small></a></li>
+        <li><a href="book/main.pdf#page=273"><span>A</span><div><h3>開発環境セットアップ</h3><p>Python・uv・Stim の環境づくり</p></div><small>p. 265</small></a></li>
+        <li><a href="book/main.pdf#page=274"><span>B</span><div><h3>モジュール地図</h3><p>公開パッケージのモジュール対応</p></div><small>p. 266</small></a></li>
+        <li><a href="book/main.pdf#page=275"><span>C</span><div><h3>検証の読み方とモデルの制限</h3><p>検証結果の解釈と適用範囲</p></div><small>p. 267</small></a></li>
+        <li><a href="book/main.pdf#page=276"><span>D</span><div><h3>参考文献</h3><p>理論論文・公式ドキュメント・標準教科書</p></div><small>p. 268</small></a></li>
+      </ol>
+    </section>
+    <section class="run wrap" id="run" aria-labelledby="run-title">
+      <div><p class="eyebrow">FROM READING TO RUNNING</p><h2 id="run-title">読むだけで終わらない。</h2><p>本書は実行可能なリポジトリです。Python 3.12 以降と <a href="https://docs.astral.sh/uv/">uv</a> があれば、ルート環境で Stage 03 のテストとベンチマークをそのまま動かせます。</p><p>アーキテクチャ・ノイズモデル・制限・再現手順などの技術文書は <a href="https://github.com/forest1040/ftqc-book/tree/main/docs">docs/</a> に、章対応の実行例は <a href="https://github.com/forest1040/ftqc-book/tree/main/examples">examples/</a> にあります。</p></div>
+      <div class="terminal"><b>Stage 03 — ルート環境</b><pre><code>uv sync --locked
+uv run --locked pytest -q tests
+uv run --locked python examples/ch25_d3_benchmark.py</code></pre><small>Stage 01・02 は独立した Python 環境として <code>src/stages/</code> に収録しています。</small></div>
+    </section>
+    <section class="notes wrap" aria-labelledby="notes-title"><div><p class="eyebrow">READING NOTES</p><h2 id="notes-title">本書の適用範囲と検証について</h2></div><div><p>公開 Stage 03 は符号距離 d=3・各パッチ9個のデータ量子ビットに固定した模擬環境です。距離の一般化や完全な X/Y/Z 相関残差の実装は含みません。実ハードウェアの性能を示すものではありません。</p><p>検証の範囲は、各章の「やること・スコープ外」とあわせて <a href="https://github.com/forest1040/ftqc-book/blob/main/docs/validation.md">検証記録</a> と <a href="https://github.com/forest1040/ftqc-book/blob/main/docs/limitations.md">適用範囲と制限</a> を参照してください。コードは MIT、本文と教材図は CC BY 4.0 です。</p></div></section>
+    <section class="closing wrap" aria-labelledby="closing-title"><div><p class="eyebrow">START READING</p><h2 id="closing-title">誤り訂正計算の、動く世界へ。</h2><p>全25章・付録・参考文献を、1冊のPDFに。</p></div><a class="button primary" href="book/main.pdf">PDFを読む <span aria-hidden="true">↗</span></a></section>
+  </main>
+  <footer class="wrap"><span>ゼロから作るFTQCシミュレータ — 森 俊夫</span><a href="https://github.com/forest1040/ftqc-book">公開リポジトリ ↗</a></footer>
+</body>
+</html>
