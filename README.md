@@ -4,24 +4,6 @@
 
 ビルド済みの [書籍 PDF（第1〜25章・付録A〜D）](book/main.pdf) を収録しています。
 
-紹介ページの公開先（GitHub Pages）: https://forest1040.github.io/ftqc-book/ — `index.html`・`style.css`・`.nojekyll` と `book/main.pdf` を配信用フォルダに配置します。
-
-## GitHub Pages の公開手順
-
-リポジトリの Settings → Pages → Build and deployment で Source に **GitHub Actions** を選択します。`main` への push または Actions の「GitHub Pages」手動実行で、公開ファイル検査を通過した成果物が配信されます。実行結果と公開 URL は Actions の該当 run で確認できます。
-
-新規ファイルを含むページとワークフローの変更をコミットしてから実行してください。公開方式は [GitHub のカスタムワークフロー手順](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages)に基づきます。
-
-ワークフローは上記の4ファイルだけを `_site/` に組み立てます。リポジトリ全体や `ref/` は配信しません。ページの資産を追加する場合は、`public-files.txt` と `.github/workflows/pages.yml` のコピー対象を更新してください。ローカルでは `python3 tools/check_public_files.py` で追跡ファイルの公開範囲を検査できます。
-
-表示の確認は `index.html` をブラウザで開くか、次のローカルサーバーを使います。
-
-```bash
-python3 -m http.server 8000 --bind 127.0.0.1
-```
-
-ブラウザで http://127.0.0.1:8000/ を開き、PDF の閲覧・ダウンロードと目次リンクを確認します。
-
 ## Stage と章
 
 | 対応章 | Stage | 内容 | Python プロジェクト |
