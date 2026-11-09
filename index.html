@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="『ゼロから作るFTQCシミュレータ』の公式紹介ページ。表面符号・格子手術の理論からd=3統合シミュレータの実装までを25章で学ぶ日本語教科書。PDFを無料公開。">
+  <meta name="description" content="『ゼロから作るFTQCシミュレータ（基礎編）』の公式紹介ページ。表面符号・格子手術の理論からd=3統合シミュレータの実装までを25章で学ぶ日本語教科書。PDFを無料公開。">
   <meta name="theme-color" content="#164d43">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="ゼロから作るFTQCシミュレータ | FTQC教科書">
+  <meta property="og:title" content="ゼロから作るFTQCシミュレータ（基礎編） | FTQC教科書">
   <meta property="og:description" content="表面符号の基礎から回路レベル格子手術、d=3統合シミュレータまで。全278ページの日本語PDFと実行可能なコードを公開。">
   <meta property="og:url" content="https://forest1040.github.io/ftqc-book/">
   <link rel="canonical" href="https://forest1040.github.io/ftqc-book/">
-  <title>ゼロから作るFTQCシミュレータ | FTQC教科書</title>
+  <title>ゼロから作るFTQCシミュレータ（基礎編） | FTQC教科書</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -23,11 +23,11 @@
     <section class="hero wrap" aria-labelledby="title">
       <div class="hero-copy">
         <p class="eyebrow">FAULT-TOLERANT QUANTUM COMPUTATION — FROM SURFACE CODES TO A d=3 SIMULATOR</p>
-        <h1 id="title">ゼロから作る<br><span>FTQCシミュレータ。</span></h1>
+        <h1 id="title">ゼロから作る<br><span>FTQCシミュレータ</span><span class="edition">（基礎編）</span></h1>
         <p class="subtitle">表面符号の基礎から回路レベル<br>格子手術、d=3 統合実行まで</p>
         <p class="intro">誤り訂正とは何か、1パッチ9個のデータ量子ビットでどこまで模擬できるのか。<br>表面符号と格子手術の理論を、Stim と Python による段階的な実装で、動くシミュレータまでつなぐ日本語の教科書です。</p>
         <div class="actions"><a class="button primary" href="book/main.pdf">PDFを読む <span aria-hidden="true">↗</span></a><a class="button secondary" href="book/main.pdf" download>ダウンロード <span aria-hidden="true">↓</span></a></div>
-        <p class="file-info">日本語 / 全278ページ / PDF 約1.81 MiB<br>第1〜25章 + 付録A〜D · 2026年10月11日ビルド</p>
+        <p class="file-info">日本語 / 全278ページ / PDF 約1.81 MiB<br>第1〜25章 + 付録A〜D · 2026年11月9日ビルド</p>
       </div>
       <div class="book-area" aria-hidden="true">
         <div class="book">
@@ -39,7 +39,7 @@
             <i class="q s"></i><i class="q d"></i><i class="q s"></i>
             <i class="q d"></i><i class="q s"></i><i class="q d"></i>
           </div>
-          <div class="book-bottom">Stim で学ぶ誤り耐性量子計算の実装<span>MPP / LATTICE SURGERY / d=3 INTEGRATED</span></div>
+          <div class="book-bottom">Stim で学ぶ誤り耐性量子計算の実装（基礎編）<span>MPP / LATTICE SURGERY / d=3 INTEGRATED</span></div>
         </div>
         <p class="book-caption">THEORY → IMPLEMENTATION → VERIFICATION</p>
       </div>
@@ -104,6 +104,6 @@ uv run --locked python examples/ch25_d3_benchmark.py</code></pre><small>Stage 01
     <section class="notes wrap" aria-labelledby="notes-title"><div><p class="eyebrow">READING NOTES</p><h2 id="notes-title">本書の適用範囲と検証について</h2></div><div><p>公開 Stage 03 は符号距離 d=3・各パッチ9個のデータ量子ビットに固定した模擬環境です。距離の一般化や完全な X/Y/Z 相関残差の実装は含みません。実ハードウェアの性能を示すものではありません。</p><p>検証の範囲は、各章の「やること・スコープ外」とあわせて <a href="https://github.com/forest1040/ftqc-book/blob/main/docs/validation.md">検証記録</a> と <a href="https://github.com/forest1040/ftqc-book/blob/main/docs/limitations.md">適用範囲と制限</a> を参照してください。コードは MIT、本文と教材図は CC BY 4.0 です。</p></div></section>
     <section class="closing wrap" aria-labelledby="closing-title"><div><p class="eyebrow">START READING</p><h2 id="closing-title">誤り訂正計算の、動く世界へ。</h2><p>全25章・付録・参考文献を、1冊のPDFに。</p></div><a class="button primary" href="book/main.pdf">PDFを読む <span aria-hidden="true">↗</span></a></section>
   </main>
-  <footer class="wrap"><span>ゼロから作るFTQCシミュレータ — 森 俊夫</span><a href="https://github.com/forest1040/ftqc-book">公開リポジトリ ↗</a></footer>
+  <footer class="wrap"><span>ゼロから作るFTQCシミュレータ（基礎編） — 森 俊夫</span><a href="https://github.com/forest1040/ftqc-book">公開リポジトリ ↗</a></footer>
 </body>
 </html>

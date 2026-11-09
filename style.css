@@ -44,6 +44,7 @@ nav a { text-decoration: none; }
 .eyebrow { font-size: 10px; letter-spacing: .14em; font-weight: 700; color: var(--green); margin: 0 0 24px; }
 h1 { font-size: clamp(34px, 4.2vw, 54px); line-height: 1.4; letter-spacing: -.04em; margin: 0 0 24px; }
 h1 span { color: var(--green); }
+h1 .edition { display: block; font-size: .55em; margin-top: .35em; }
 .subtitle { font-size: 19px; line-height: 1.8; margin: 0 0 24px; font-weight: 600; }
 .intro { font-size: 14px; color: var(--muted); line-height: 2.1; margin: 0 0 30px; }
 .actions { display: flex; flex-wrap: wrap; gap: 12px; }
